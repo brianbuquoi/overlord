@@ -7,18 +7,21 @@ schema_registry:
   - name: intake_output
     version: "v1"
     path: ../../schemas/intake_output_v1.json
-  - name: process_input
+  - name: review_input
     version: "v1"
-    path: ../../schemas/process_input_v1.json
-  - name: process_output
+    path: ../../schemas/review_input_v1.json
+  - name: review_output
     version: "v1"
-    path: ../../schemas/process_output_v1.json
-  - name: validate_input
+    path: ../../schemas/review_output_v1.json
+  - name: review_aggregate
     version: "v1"
-    path: ../../schemas/validate_input_v1.json
-  - name: validate_output
+    path: ../../schemas/review_aggregate_v1.json
+  - name: summarize_input
     version: "v1"
-    path: ../../schemas/validate_output_v1.json
+    path: ../../schemas/summarize_input_v1.json
+  - name: summarize_output
+    version: "v1"
+    path: ../../schemas/summarize_output_v1.json
 
 pipelines:
   - name: multi-provider-pipeline
@@ -38,56 +41,50 @@ pipelines:
           max_attempts: 3
           backoff: exponential
           base_delay: 1s
-        on_success: review
+        on_success: multi-review
         on_failure: dead-letter
 
-      - id: review
-        agent: gemini-review
+      - id: multi-review
+        fan_out:
+          agents:
+            - id: claude-reviewer
+            - id: gemini-reviewer
+            - id: openai-reviewer
+          mode: gather
+          timeout: 60s
+          require: majority
         input_schema:
-          name: process_input
+          name: review_input
           version: "v1"
         output_schema:
-          name: process_output
+          name: review_output
           version: "v1"
-        timeout: 45s
-        retry:
-          max_attempts: 2
-          backoff: linear
-          base_delay: 2s
-        on_success: implement
-        on_failure: dead-letter
-
-      - id: implement
-        agent: openai-implement
-        input_schema:
-          name: validate_input
-          version: "v1"
-        output_schema:
-          name: validate_output
+        aggregate_schema:
+          name: review_aggregate
           version: "v1"
         timeout: 90s
-        retry:
-          max_attempts: 2
-          backoff: exponential
-          base_delay: 3s
-        on_success: validate
-        on_failure: dead-letter
-
-      - id: validate
-        agent: ollama-validate
-        input_schema:
-          name: validate_input
-          version: "v1"
-        output_schema:
-          name: validate_output
-          version: "v1"
-        timeout: 30s
         retry:
           max_attempts: 1
           backoff: fixed
           base_delay: 1s
+        on_success: judge
+        on_failure: dead-letter
+
+      - id: judge
+        agent: claude-judge
+        input_schema:
+          name: review_aggregate
+          version: "v1"
+        output_schema:
+          name: summarize_output
+          version: "v1"
+        timeout: 45s
+        retry:
+          max_attempts: 2
+          backoff: exponential
+          base_delay: 2s
         on_success: done
-        on_failure: review
+        on_failure: dead-letter
 
 agents:
   - id: claude-intake
@@ -100,33 +97,45 @@ agents:
     max_tokens: 1024
     timeout: 30s
 
-  - id: gemini-review
+  - id: claude-reviewer
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: "You are a code reviewer. Analyze the code changes and provide detailed findings with severity levels."
+    temperature: 0.2
+    max_tokens: 4096
+    timeout: 60s
+
+  - id: gemini-reviewer
     provider: google
     model: gemini-2.0-flash
     auth:
       api_key_env: GEMINI_API_KEY
-    system_prompt: "You are a review agent. Analyze the structured request and produce a detailed review with confidence scores."
+    system_prompt: "You are a code reviewer. Analyze the code changes and provide detailed findings with severity levels."
     temperature: 0.2
     max_tokens: 4096
-    timeout: 45s
+    timeout: 60s
 
-  - id: openai-implement
+  - id: openai-reviewer
     provider: openai
     model: gpt-4o
     auth:
       api_key_env: OPENAI_API_KEY
-    system_prompt: "You are an implementation agent. Generate the implementation based on the reviewed specification."
-    temperature: 0.4
-    max_tokens: 8192
-    timeout: 90s
+    system_prompt: "You are a code reviewer. Analyze the code changes and provide detailed findings with severity levels."
+    temperature: 0.2
+    max_tokens: 4096
+    timeout: 60s
 
-  - id: ollama-validate
-    provider: ollama
-    model: llama3
-    system_prompt: "You are a validation agent. Verify the implementation output meets quality requirements."
-    temperature: 0.0
+  - id: claude-judge
+    provider: anthropic
+    model: claude-opus-4-5-20250514
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: "You are a review judge. Synthesize multiple code review results into a final assessment with an executive summary and actionable recommendations."
+    temperature: 0.1
     max_tokens: 2048
-    timeout: 30s
+    timeout: 45s
 
 stores:
   memory:

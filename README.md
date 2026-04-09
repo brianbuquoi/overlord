@@ -12,22 +12,29 @@ A **pipeline** is a directed graph of **stages**. Each stage binds to an
 **agent** (an LLM adapter) and declares versioned input/output schemas.
 The **broker** routes tasks between stages, validates I/O contracts against
 JSONSchema, wraps agent output in an anti-injection envelope before passing
-it downstream, and handles retries with configurable backoff.
+it downstream, and handles retries with configurable backoff. **Fan-out
+stages** execute multiple agents in parallel and collect results using
+gather (wait for all) or race (first to satisfy) modes with configurable
+require policies (all/any/majority).
 
 ```
-                    ┌──────────┐
-  Submit task ─────>│  intake   │
-                    └────┬─────┘
-                         │ on_success
-                    ┌────▼─────┐
-                    │ process   │
-                    └────┬─────┘
-                         │ on_success
-                    ┌────▼─────┐
-                    │ validate  │──── on_failure ───> process (retry)
-                    └────┬─────┘
-                         │ on_success
-                       DONE
+                       ┌──────────┐
+  Submit task ────────>│  intake   │
+                       └────┬─────┘
+                            │ on_success
+              ┌─────────────┼─────────────┐
+              │             │             │
+         ┌────▼───┐   ┌────▼───┐   ┌────▼───┐
+         │ claude  │   │ gemini │   │  gpt   │   fan-out: gather
+         └────┬───┘   └────┬───┘   └────┬───┘   require: majority
+              │             │             │
+              └─────────────┼─────────────┘
+                            │ aggregate
+                       ┌────▼─────┐
+                       │  judge    │
+                       └────┬─────┘
+                            │ on_success
+                          DONE
 ```
 
 Tasks follow the lifecycle: `PENDING -> ROUTING -> EXECUTING -> VALIDATING -> DONE | FAILED | RETRYING`.
@@ -116,6 +123,75 @@ Key top-level blocks:
 | `pipelines` | Pipeline definitions with stages, routing, retry policies |
 | `agents` | LLM provider bindings with model, auth, and prompt config |
 | `stores` | Backend configuration for memory, Redis, or Postgres |
+| `auth` | API key authentication (disabled by default) |
+
+### Fan-out stages
+
+A fan-out stage executes multiple agents in parallel on the same input.
+Each agent's output is validated against `output_schema` individually, then
+all results are combined into an aggregate payload validated against
+`aggregate_schema` before passing to the next stage.
+
+```yaml
+stages:
+  - id: multi-review
+    fan_out:
+      agents:
+        - id: claude-reviewer
+        - id: gemini-reviewer
+        - id: openai-reviewer
+      mode: gather       # gather | race
+      timeout: 60s
+      require: majority  # all | any | majority
+    input_schema:  { name: review_input,     version: "v1" }
+    output_schema: { name: review_output,    version: "v1" }
+    aggregate_schema:
+      name: review_aggregate
+      version: "v1"
+    timeout: 90s
+    retry: { max_attempts: 1, backoff: fixed, base_delay: 1s }
+    on_success: judge
+    on_failure: dead-letter
+```
+
+**Gather mode** waits for all agents to complete and collects every result.
+**Race mode** cancels remaining agents as soon as the require policy is
+satisfied, returning only the results received so far.
+
+Require policies:
+- **all** — every agent must succeed.
+- **any** — at least one agent must succeed.
+- **majority** — more than half must succeed (rounds up: 2 of 3, 3 of 4).
+
+### Authentication
+
+API key authentication protects all endpoints except `/metrics`. Auth is
+disabled by default for backward compatibility.
+
+```yaml
+auth:
+  enabled: true
+  keys:
+    - name: ci-pipeline
+      key_env: ORCASTRATOR_CI_KEY     # env var holding the plaintext key
+      scopes: [write]
+    - name: monitoring
+      key_env: ORCASTRATOR_MON_KEY
+      scopes: [read]
+    - name: operator
+      key_env: ORCASTRATOR_ADMIN_KEY
+      scopes: [admin]
+```
+
+Keys are hashed with bcrypt (cost 12) at startup and the plaintext is zeroed
+in memory. Key values are always read from environment variables — never
+hardcoded in YAML. Keys must be 72 bytes or fewer (bcrypt limit).
+
+| Scope | Access |
+|-------|--------|
+| `read` | GET endpoints, WebSocket stream |
+| `write` | All read + task submission, dead-letter replay/discard |
+| `admin` | All write + bulk dead-letter operations |
 
 ## Supported LLM providers
 
@@ -131,6 +207,8 @@ Key top-level blocks:
 
 See [`docs/deployment.md`](docs/deployment.md) for complete deployment guidance
 including security hardening (metrics access restriction, Postgres TLS).
+Authentication configuration: see docs/deployment.md for securing the API
+in production environments.
 
 - **Single-instance**: one process with memory, Redis, or Postgres store.
 - **Multi-instance**: multiple processes sharing a Postgres database with
@@ -146,6 +224,32 @@ make check              # tests + go vet + staticcheck
 # Run the code review example pipeline
 make example-code-review
 ```
+
+## Roadmap
+
+The following features are planned for future releases. Build prompts
+for each are available in `.claude/prompts/build/` for contributors
+using Claude Code.
+
+- **Conditional routing** — Route tasks to different next stages
+  based on field values in the agent's output. Supports ==, !=, >,
+  >=, <, <=, and contains operators against output payload fields.
+
+- **Pipeline dashboard** — Single-page web UI served by Orcastrator,
+  showing live pipeline topology, per-stage queue depths, task event
+  feed, and agent health status. No separate build step required.
+
+- **Retry budgets** — Pipeline-level and agent-level caps on total
+  retry attempts within a sliding time window. Prevents runaway API
+  consumption from a single bad task.
+
+- **Dead letter queue management** — Inspect, replay, and discard
+  dead-lettered tasks via the CLI and API. Includes bulk replay and
+  discard with confirmation prompts.
+
+- **Plugin system** — Load custom LLM provider adapters as Go shared
+  libraries without forking Orcastrator. Drop a .so file in the
+  plugins directory and reference the provider name in YAML.
 
 ## Security
 

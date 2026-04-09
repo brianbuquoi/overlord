@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-04-09
+
+### Added
+- Fan-out stage support: execute multiple agents in parallel with
+  gather and race modes, configurable require policies (all/any/majority)
+- API key authentication with Bearer tokens, named keys, and three
+  scope levels (read/write/admin)
+- Brute force protection with per-IP failure tracking and sliding
+  window cleanup
+- Aggregate schema validation for fan-out stage outputs
+- `orcastrator_fanout_agent_results_total` and
+  `orcastrator_fanout_require_policy_failures_total` metrics
+- 72-byte API key length validation with clear startup error
+
+### Security
+- SEC3-002: Non-uniform 401 responses — all auth failures now return
+  identical response body
+- SEC3-003: 403 response scope information leak — forbidden responses
+  no longer reveal scope details
+- Auth timing oracle fixed: full key iteration prevents response
+  time from revealing key count or position
+- BruteForceTracker memory exhaustion fixed: cleanup goroutine
+  sweeps expired entries every 5 minutes
+- API key zeroing improved: unsafe used to zero original backing
+  memory, not just the copied slice
+
 ## [0.1.0] - 2026-04-09
 
 ### Added

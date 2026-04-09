@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/orcastrator/orcastrator/internal/auth"
 	"github.com/orcastrator/orcastrator/internal/broker"
 	"github.com/orcastrator/orcastrator/internal/metrics"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -24,11 +25,20 @@ type Server struct {
 	srv         *http.Server
 	metrics     *metrics.Metrics
 	metricsPath string
+	authKeys    []auth.APIKey
+	bfTracker   *auth.BruteForceTracker
 }
 
 // NewServer creates a new API server. The metricsPath defaults to "/metrics"
-// if empty. Pass nil for m to disable the /metrics endpoint.
-func NewServer(b *broker.Broker, logger *slog.Logger, m *metrics.Metrics, metricsPath string) *Server {
+// if empty. Pass nil for m to disable the /metrics endpoint. Pass nil for
+// authKeys to disable authentication (backward compatible).
+func NewServer(b *broker.Broker, logger *slog.Logger, m *metrics.Metrics, metricsPath string, authKeys ...[]auth.APIKey) *Server {
+	return NewServerWithContext(context.Background(), b, logger, m, metricsPath, authKeys...)
+}
+
+// NewServerWithContext creates a new API server with an explicit context for
+// background goroutine lifecycle (e.g. brute force tracker cleanup).
+func NewServerWithContext(ctx context.Context, b *broker.Broker, logger *slog.Logger, m *metrics.Metrics, metricsPath string, authKeys ...[]auth.APIKey) *Server {
 	if metricsPath == "" {
 		metricsPath = "/metrics"
 	}
@@ -38,6 +48,13 @@ func NewServer(b *broker.Broker, logger *slog.Logger, m *metrics.Metrics, metric
 		logger:      logger,
 		metrics:     m,
 		metricsPath: metricsPath,
+	}
+	if len(authKeys) > 0 && authKeys[0] != nil {
+		s.authKeys = authKeys[0]
+		s.bfTracker = auth.NewBruteForceTracker(10, 60*time.Second,
+			auth.WithCleanup(ctx),
+			auth.WithLogger(logger),
+		)
 	}
 	s.hub = newWSHub(b.EventBus(), logger)
 	s.srv = &http.Server{
@@ -60,10 +77,24 @@ func (s *Server) routes() http.Handler {
 		mux.Handle(s.metricsPath, promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{}))
 	}
 
-	// Apply middleware: rate limit → request ID → mux.
+	// Apply middleware: rate limit → request ID → [auth] → mux.
 	// /metrics is exempt from rate limiting so Prometheus scrapes are never
 	// blocked by attacker traffic. SEC2-002.
+	// /metrics is also exempt from auth per SEC2-NEW-002 (network-level
+	// access control only).
 	var handler http.Handler = mux
+	if s.authKeys != nil {
+		handler = authMiddleware(s.authKeys, s.bfTracker, s.logger, endpointScope)(handler)
+		// Wrap so /metrics bypasses auth.
+		authed := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == s.metricsPath {
+				mux.ServeHTTP(w, r)
+				return
+			}
+			authed.ServeHTTP(w, r)
+		})
+	}
 	handler = requestID(handler)
 	handler = rateLimitMiddleware(s.limiter, s.metricsPath)(handler)
 	return handler

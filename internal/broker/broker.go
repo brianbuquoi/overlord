@@ -446,6 +446,12 @@ func (b *Broker) workerLoop(ctx context.Context, pipelineID string, stageID stri
 // processTask handles a single task through the full stage pipeline:
 // version check → input validation → sanitize → execute → output validation → route.
 func (b *Broker) processTask(ctx context.Context, pipelineID string, stage *config.Stage, task *Task) {
+	// Fan-out stages are handled by a separate code path.
+	if stage.FanOut != nil {
+		b.processFanOutTask(ctx, pipelineID, stage, task)
+		return
+	}
+
 	// Snapshot mutable broker state under read lock for the duration of this task.
 	b.mu.RLock()
 	validator := b.validator
@@ -624,6 +630,94 @@ func (b *Broker) processTask(ctx context.Context, pipelineID string, stage *conf
 
 	// --- Route to next stage ---
 	b.routeSuccess(ctx, pipelineID, stage, task, result.Payload)
+}
+
+// processFanOutTask handles a fan-out stage: version check, input validation,
+// sanitize once, then delegate to FanOutExecutor for parallel agent execution.
+func (b *Broker) processFanOutTask(ctx context.Context, pipelineID string, stage *config.Stage, task *Task) {
+	b.mu.RLock()
+	validator := b.validator
+	agents := b.agents
+	agentCfg := b.agentCfg
+	p := b.pipelines[pipelineID]
+	parentSpan := b.taskSpans[task.ID]
+	m := b.metrics
+	b.mu.RUnlock()
+
+	if parentSpan != nil {
+		ctx = trace.ContextWithSpan(ctx, parentSpan)
+	}
+
+	var stageSpan trace.Span
+	if b.tracer != nil {
+		ctx, stageSpan = b.tracer.StartStageSpan(ctx, stage.ID, "fan-out", task.Attempts)
+		defer stageSpan.End()
+	}
+
+	b.transition(ctx, task, TaskStateRouting)
+
+	if task.Metadata == nil {
+		task.Metadata = make(map[string]any)
+	}
+	history, _ := task.Metadata["stage_history"].([]any)
+	history = append(history, stage.ID)
+	b.mergeMetadata(ctx, task, map[string]any{"stage_history": history})
+
+	// --- Schema version compatibility ---
+	compatible, err := contract.IsCompatible(
+		contract.SchemaVersion(task.InputSchemaVersion),
+		contract.SchemaVersion(stage.InputSchema.Version),
+	)
+	if err != nil || !compatible {
+		msg := "schema version mismatch"
+		if err != nil {
+			msg = err.Error()
+		}
+		b.failTask(ctx, pipelineID, stage, task, msg)
+		return
+	}
+
+	// --- Input contract validation ---
+	if err := validator.ValidateInput(
+		stage.InputSchema.Name,
+		contract.SchemaVersion(task.InputSchemaVersion),
+		contract.SchemaVersion(stage.InputSchema.Version),
+		task.Payload,
+	); err != nil {
+		b.failTask(ctx, pipelineID, stage, task, fmt.Sprintf("input validation: %v", err))
+		return
+	}
+
+	// --- Sanitize prior output (once) ---
+	sanitizedOutput, warnings := sanitize.Sanitize(string(task.Payload))
+	if len(warnings) > 0 {
+		b.mergeMetadata(ctx, task, map[string]any{
+			"sanitizer_warnings": sanitize.WarningsToJSON(warnings),
+		})
+		if m != nil {
+			for _, w := range warnings {
+				m.SanitizerRedactions.WithLabelValues(pipelineID, stage.ID, w.Pattern).Inc()
+			}
+		}
+	}
+
+	isFirstStage := len(p.Stages) > 0 && p.Stages[0].ID == stage.ID
+
+	// --- Execute fan-out ---
+	b.transition(ctx, task, TaskStateExecuting)
+
+	executor := NewFanOutExecutor(agents, agentCfg, validator, m)
+	aggregatePayload, err := executor.Execute(ctx, pipelineID, stage, task, sanitizedOutput, isFirstStage)
+	if err != nil {
+		b.failTask(ctx, pipelineID, stage, task, fmt.Sprintf("fan-out: %v", err))
+		return
+	}
+
+	// --- Validate aggregate ---
+	b.transition(ctx, task, TaskStateValidating)
+
+	// --- Route to next stage ---
+	b.routeSuccess(ctx, pipelineID, stage, task, aggregatePayload)
 }
 
 // handleAgentError inspects the error for retryability and either retries or

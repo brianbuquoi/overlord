@@ -24,6 +24,7 @@ import (
 	"github.com/orcastrator/orcastrator/internal/agent"
 	"github.com/orcastrator/orcastrator/internal/agent/registry"
 	"github.com/orcastrator/orcastrator/internal/api"
+	"github.com/orcastrator/orcastrator/internal/auth"
 	"github.com/orcastrator/orcastrator/internal/broker"
 	"github.com/orcastrator/orcastrator/internal/config"
 	"github.com/orcastrator/orcastrator/internal/contract"
@@ -77,6 +78,8 @@ Quick start:
 		SilenceErrors: true,
 	}
 
+	root.PersistentFlags().String("api-key", "", "API key for authenticated requests (or set ORCASTRATOR_API_KEY)")
+
 	root.AddCommand(runCmd())
 	root.AddCommand(submitCmd())
 	root.AddCommand(statusCmd())
@@ -88,6 +91,17 @@ Quick start:
 	root.AddCommand(completionCmd())
 
 	return root
+}
+
+// resolveAPIKey returns the API key from --api-key flag or ORCASTRATOR_API_KEY env var.
+// Used by CLI commands that make authenticated HTTP requests to the API.
+var _ = resolveAPIKey
+
+func resolveAPIKey(cmd *cobra.Command) string {
+	if key, _ := cmd.Flags().GetString("api-key"); key != "" {
+		return key
+	}
+	return os.Getenv("ORCASTRATOR_API_KEY")
 }
 
 // --- Shared helpers ---
@@ -292,9 +306,19 @@ func runCmd() *cobra.Command {
 				b.Run(ctx)
 			}()
 
+			// Load auth keys if auth is enabled.
+			var authKeys []auth.APIKey
+			if cfg.Auth.Enabled {
+				authKeys, err = auth.LoadKeys(cfg.Auth.Keys)
+				if err != nil {
+					return fmt.Errorf("auth: %w", err)
+				}
+				logger.Info("API authentication enabled", "keys", len(authKeys))
+			}
+
 			// Start HTTP/WS API.
 			metricsPath := cfg.Observability.MetricsPath
-			srv := api.NewServer(b, logger, m, metricsPath)
+			srv := api.NewServerWithContext(ctx, b, logger, m, metricsPath, authKeys)
 			ln, err := net.Listen("tcp", ":"+port)
 			if err != nil {
 				cancel()

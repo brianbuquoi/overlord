@@ -25,6 +25,7 @@ internal/store/         → State store interface
   redis/                → Redis backend
   postgres/             → Postgres backend
   memory/               → In-memory backend (dev/test)
+internal/auth/          → API key authentication (bcrypt, brute force protection)
 internal/api/           → HTTP REST + WebSocket for pipeline observation
 internal/metrics/       → Prometheus instrumentation
 internal/tracing/       → OpenTelemetry tracing (Tracer type with ForceFlush)
@@ -143,11 +144,20 @@ pipelines:
     store: string              # redis | postgres | memory
     stages:
       - id: string
-        agent: string          # references agents[].id
+        agent: string          # references agents[].id (mutually exclusive with fan_out)
+        fan_out:               # parallel agent execution (mutually exclusive with agent)
+          agents:
+            - id: string       # references agents[].id
+          mode: gather | race
+          timeout: duration
+          require: all | any | majority
         input_schema:
           name: string         # references schema_registry[].name
           version: string      # must match a registered version exactly
         output_schema:
+          name: string
+          version: string
+        aggregate_schema:      # required for fan_out stages, forbidden otherwise
           name: string
           version: string
         timeout: duration
@@ -168,6 +178,14 @@ agents:
     temperature: float
     max_tokens: int
     timeout: duration
+
+auth:
+  enabled: bool              # default: false (backward compatible)
+  keys:
+    - name: string           # unique key identifier
+      key_env: string        # env var holding the plaintext key (max 72 bytes)
+      scopes:                # read | write | admin (write implies read, admin implies all)
+        - string
 
 stores:
   redis:
@@ -220,10 +238,9 @@ ORCASTRATOR_PORT      # default: 8080
 - Unit test the sanitizer with adversarial inputs
 - Integration tests tagged `//go:build integration` requiring real env vars
 
-## Known Gaps (from integration testing)
+## Known Gaps
 
-See KNOWN_GAPS.md for a full list of tracked issues deferred from initial
-implementation. All Critical/High items from integration testing are resolved.
+See KNOWN_GAPS.md for the full list. All Critical/High items are resolved.
 Remaining open items from security audits:
 
 - SEC-010: Predictable envelope delimiters (Medium — open)
@@ -232,6 +249,7 @@ Remaining open items from security audits:
 - SEC-014: Token bucket cleanup goroutine leak (Low — open)
 - SEC2-003: cancel command TOCTOU race (Medium — open)
 - SEC2-005: Migration lacks live broker guard (Medium — open)
+- SEC3-001: RecordSuccess resets brute force window (Medium — open)
 
 KNOWN_GAPS.md also includes a **Deployment Hardening** section (SEC2-NEW-002)
 documenting that `/metrics` shares the API port and should be restricted at
@@ -247,3 +265,5 @@ the reverse proxy or firewall level in production.
 - Do not skip contract validation "for performance"
 - Do not use goroutines without proper context cancellation
 - Do not use os.Exit() inside cobra RunE — return errors instead
+- Do not bypass AuthMiddleware for new routes without explicit
+  justification and a corresponding test

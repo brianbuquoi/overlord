@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "agent_id": { "type": "string" },
+          "output": {},
+          "duration_ms": { "type": "integer" },
+          "succeeded": { "type": "boolean" }
+        },
+        "required": ["agent_id", "duration_ms", "succeeded"]
+      }
+    },
+    "succeeded_count": { "type": "integer" },
+    "failed_count": { "type": "integer" },
+    "mode": {
+      "type": "string",
+      "enum": ["gather", "race"]
+    }
+  },
+  "required": ["results", "succeeded_count", "failed_count", "mode"]
+}

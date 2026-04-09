@@ -13,6 +13,21 @@ type Config struct {
 	Agents         []Agent             `yaml:"agents"`
 	Stores         StoreConfig         `yaml:"stores"`
 	Observability  ObservabilityConfig `yaml:"observability"`
+	Auth           APIAuthConfig       `yaml:"auth"`
+}
+
+// APIAuthConfig holds top-level authentication settings for the HTTP API.
+type APIAuthConfig struct {
+	Enabled bool            `yaml:"enabled"`
+	Keys    []AuthKeyConfig `yaml:"keys"`
+}
+
+// AuthKeyConfig declares an API key in the YAML config. The actual key value
+// is read from the environment variable named by KeyEnv at startup.
+type AuthKeyConfig struct {
+	Name   string   `yaml:"name"`
+	KeyEnv string   `yaml:"key_env"`
+	Scopes []string `yaml:"scopes"`
 }
 
 // ObservabilityConfig holds metrics and tracing settings.
@@ -45,16 +60,51 @@ type Pipeline struct {
 	Stages      []Stage `yaml:"stages"`
 }
 
-// Stage is a single step in a pipeline.
+// Stage is a single step in a pipeline. A stage is either a single-agent
+// stage (Agent is set) or a fan-out stage (FanOut is set). They are mutually
+// exclusive.
 type Stage struct {
-	ID           string         `yaml:"id"`
-	Agent        string         `yaml:"agent"`
-	InputSchema  StageSchemaRef `yaml:"input_schema"`
-	OutputSchema StageSchemaRef `yaml:"output_schema"`
-	Timeout      Duration       `yaml:"timeout"`
-	Retry        RetryPolicy    `yaml:"retry"`
-	OnSuccess    string         `yaml:"on_success"`
-	OnFailure    string         `yaml:"on_failure"`
+	ID              string          `yaml:"id"`
+	Agent           string          `yaml:"agent,omitempty"`
+	FanOut          *FanOutConfig   `yaml:"fan_out,omitempty"`
+	InputSchema     StageSchemaRef  `yaml:"input_schema"`
+	OutputSchema    StageSchemaRef  `yaml:"output_schema"`
+	AggregateSchema *StageSchemaRef `yaml:"aggregate_schema,omitempty"`
+	Timeout         Duration        `yaml:"timeout"`
+	Retry           RetryPolicy     `yaml:"retry"`
+	OnSuccess       string          `yaml:"on_success"`
+	OnFailure       string          `yaml:"on_failure"`
+}
+
+// FanOutMode determines how fan-out agents are executed.
+type FanOutMode string
+
+const (
+	FanOutModeGather FanOutMode = "gather"
+	FanOutModeRace   FanOutMode = "race"
+)
+
+// RequirePolicy determines how many agents must succeed.
+type RequirePolicy string
+
+const (
+	RequirePolicyAll      RequirePolicy = "all"
+	RequirePolicyAny      RequirePolicy = "any"
+	RequirePolicyMajority RequirePolicy = "majority"
+)
+
+// FanOutConfig configures parallel agent execution for a stage.
+type FanOutConfig struct {
+	Agents  []FanOutAgent `yaml:"agents"`
+	Mode    FanOutMode    `yaml:"mode"`
+	Timeout Duration      `yaml:"timeout"`
+	Require RequirePolicy `yaml:"require"`
+}
+
+// FanOutAgent references an agent to include in a fan-out stage.
+type FanOutAgent struct {
+	ID     string `yaml:"id"`
+	Weight int    `yaml:"weight,omitempty"`
 }
 
 // StageSchemaRef references a schema_registry entry by name+version.

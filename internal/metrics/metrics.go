@@ -19,6 +19,10 @@ type Metrics struct {
 	TasksDeadLettered    *prometheus.CounterVec
 	SanitizerRedactions  *prometheus.CounterVec
 	QueueDepth           *prometheus.GaugeVec
+
+	// Fan-out metrics.
+	FanOutAgentResults          *prometheus.CounterVec
+	FanOutRequirePolicyFailures *prometheus.CounterVec
 }
 
 // New creates a Metrics instance with its own prometheus.Registry.
@@ -69,6 +73,16 @@ func New() *Metrics {
 			Name: "orcastrator_queue_depth",
 			Help: "Current tasks waiting in each stage queue.",
 		}, []string{"pipeline_id", "stage_id"}),
+
+		FanOutAgentResults: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "orcastrator_fanout_agent_results_total",
+			Help: "Per-agent results in fan-out executions.",
+		}, []string{"pipeline_id", "stage_id", "agent_id", "result"}),
+
+		FanOutRequirePolicyFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "orcastrator_fanout_require_policy_failures_total",
+			Help: "Fan-out executions where require policy was not met.",
+		}, []string{"pipeline_id", "stage_id", "require_policy"}),
 	}
 
 	reg.MustRegister(
@@ -80,6 +94,8 @@ func New() *Metrics {
 		m.TasksDeadLettered,
 		m.SanitizerRedactions,
 		m.QueueDepth,
+		m.FanOutAgentResults,
+		m.FanOutRequirePolicyFailures,
 	)
 
 	return m

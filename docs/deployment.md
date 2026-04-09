@@ -310,6 +310,80 @@ volumes:
 }
 ```
 
+## Authentication
+
+### Enabling auth
+
+Add an `auth` block to your YAML config. Auth is disabled by default so
+existing deployments and local development are unaffected.
+
+```yaml
+auth:
+  enabled: true
+  keys:
+    - name: ci-pipeline
+      key_env: ORCASTRATOR_CI_KEY
+      scopes: [write]
+    - name: monitoring
+      key_env: ORCASTRATOR_MON_KEY
+      scopes: [read]
+```
+
+When `auth.enabled` is `true`, all API endpoints except `/metrics` require a
+valid Bearer token. At least one key must be configured.
+
+### Generating API keys
+
+Generate a 64-character key (well under the 72-byte bcrypt limit):
+
+```bash
+openssl rand -base64 48 | tr -d '=' | head -c 64
+```
+
+**Important:** bcrypt truncates inputs longer than 72 bytes. Keys exceeding
+this limit are rejected at startup with a clear error message. Always use
+keys of 72 bytes or fewer.
+
+### Scope reference table
+
+| Scope | Endpoints |
+|-------|-----------|
+| read  | GET /v1/tasks, GET /v1/tasks/{id}, GET /v1/pipelines, GET /v1/health, WS /v1/stream, GET /v1/dead-letter |
+| write | All read endpoints + POST /v1/pipelines/{id}/tasks, POST /v1/dead-letter/{id}/replay, POST /v1/dead-letter/{id}/discard |
+| admin | All write endpoints + POST /v1/dead-letter/replay-all, POST /v1/dead-letter/discard-all |
+
+Write scope implies read. Admin scope implies all.
+
+### CLI usage
+
+Pass the API key via the `--api-key` flag or the `ORCASTRATOR_API_KEY`
+environment variable:
+
+```bash
+# Environment variable (recommended)
+ORCASTRATOR_API_KEY=your-key-here orcastrator submit \
+  --config config.yaml --pipeline hello \
+  --payload '{"request": "Say hello"}'
+
+# Flag
+orcastrator submit --api-key your-key-here \
+  --config config.yaml --pipeline hello \
+  --payload '{"request": "Say hello"}'
+```
+
+### Multi-instance auth
+
+All instances authenticate independently — key lists are not shared via the
+store. Configure every instance with the same keys (or a superset). If
+instance A has keys [ci, mon] and instance B has only [ci], requests with
+the mon key will succeed on A but fail on B.
+
+### Metrics endpoint
+
+`/metrics` is exempt from authentication per SEC2-NEW-002. Restrict access
+to `/metrics` at the network or reverse proxy level in production. See the
+[Security Hardening](#security-hardening) section below.
+
 ## Security Hardening
 
 ### Restrict access to /metrics

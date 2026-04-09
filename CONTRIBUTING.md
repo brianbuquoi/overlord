@@ -47,6 +47,13 @@ All code must pass:
    (localhost is exempt for testing)
 7. Update `CLAUDE.md` architecture section and the README provider table
 
+### Adding a fan-out pipeline
+
+Fan-out stages require an `aggregate_schema` that validates the combined
+output from all agents. The `output_schema` validates each individual agent's
+output, while `aggregate_schema` validates the merged result passed to the
+next stage.
+
 ## Reporting bugs
 
 Use [GitHub Issues](../../issues) with the bug report template.

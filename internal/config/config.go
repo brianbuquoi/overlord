@@ -29,6 +29,11 @@ func validateID(kind, id string) error {
 	return nil
 }
 
+// ValidateIDExported is the exported version of validateID for testing.
+func ValidateIDExported(kind, id string) error {
+	return validateID(kind, id)
+}
+
 // Load reads a YAML config file and returns a validated Config.
 func Load(path string) (*Config, error) {
 	// SEC2-NEW-001: Reject symlinks and non-regular files to prevent
@@ -78,6 +83,10 @@ func validate(cfg *Config) error {
 
 	schemaIndex, err := collectSchemaRegistry(cfg.SchemaRegistry)
 	if err != nil {
+		return err
+	}
+
+	if err := validateAuth(cfg.Auth); err != nil {
 		return err
 	}
 
@@ -160,8 +169,34 @@ func validatePipeline(p Pipeline, agentIDs map[string]bool, schemaIndex map[stri
 	}
 
 	for _, s := range p.Stages {
-		if !agentIDs[s.Agent] {
-			return fmt.Errorf("stage %q references unknown agent: %q", s.ID, s.Agent)
+		// A stage must have exactly one of: agent or fan_out.
+		hasAgent := s.Agent != ""
+		hasFanOut := s.FanOut != nil
+		if hasAgent && hasFanOut {
+			return fmt.Errorf("stage %q: must have either agent or fan_out, not both", s.ID)
+		}
+		if !hasAgent && !hasFanOut {
+			return fmt.Errorf("stage %q: must have either agent or fan_out", s.ID)
+		}
+
+		if hasAgent {
+			if !agentIDs[s.Agent] {
+				return fmt.Errorf("stage %q references unknown agent: %q", s.ID, s.Agent)
+			}
+		}
+
+		if hasFanOut {
+			if err := validateFanOut(s.ID, s.FanOut, agentIDs); err != nil {
+				return fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+		}
+
+		// aggregate_schema is required when fan_out is present, forbidden otherwise.
+		if hasFanOut && s.AggregateSchema == nil {
+			return fmt.Errorf("stage %q: aggregate_schema is required when fan_out is present", s.ID)
+		}
+		if !hasFanOut && s.AggregateSchema != nil {
+			return fmt.Errorf("stage %q: aggregate_schema is only allowed with fan_out stages", s.ID)
 		}
 
 		if err := validateSchemaRef("input_schema", s.InputSchema, schemaIndex); err != nil {
@@ -170,6 +205,11 @@ func validatePipeline(p Pipeline, agentIDs map[string]bool, schemaIndex map[stri
 		if err := validateSchemaRef("output_schema", s.OutputSchema, schemaIndex); err != nil {
 			return fmt.Errorf("stage %q: %w", s.ID, err)
 		}
+		if s.AggregateSchema != nil {
+			if err := validateSchemaRef("aggregate_schema", *s.AggregateSchema, schemaIndex); err != nil {
+				return fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+		}
 
 		if err := validateStageTarget("on_success", s.OnSuccess, stageIDs); err != nil {
 			return fmt.Errorf("stage %q: %w", s.ID, err)
@@ -177,6 +217,42 @@ func validatePipeline(p Pipeline, agentIDs map[string]bool, schemaIndex map[stri
 		if err := validateStageTarget("on_failure", s.OnFailure, stageIDs); err != nil {
 			return fmt.Errorf("stage %q: %w", s.ID, err)
 		}
+	}
+
+	return nil
+}
+
+func validateFanOut(stageID string, fo *FanOutConfig, agentIDs map[string]bool) error {
+	if len(fo.Agents) < 2 {
+		return fmt.Errorf("fan_out must have at least 2 agents, got %d", len(fo.Agents))
+	}
+
+	seen := make(map[string]bool, len(fo.Agents))
+	for _, a := range fo.Agents {
+		if a.ID == "" {
+			return fmt.Errorf("fan_out agent ID must not be empty")
+		}
+		if seen[a.ID] {
+			return fmt.Errorf("fan_out contains duplicate agent ID: %q", a.ID)
+		}
+		seen[a.ID] = true
+		if !agentIDs[a.ID] {
+			return fmt.Errorf("fan_out references unknown agent: %q", a.ID)
+		}
+	}
+
+	switch fo.Mode {
+	case FanOutModeGather, FanOutModeRace:
+		// valid
+	default:
+		return fmt.Errorf("fan_out mode must be %q or %q, got %q", FanOutModeGather, FanOutModeRace, fo.Mode)
+	}
+
+	switch fo.Require {
+	case RequirePolicyAll, RequirePolicyAny, RequirePolicyMajority:
+		// valid
+	default:
+		return fmt.Errorf("fan_out require must be %q, %q, or %q, got %q", RequirePolicyAll, RequirePolicyAny, RequirePolicyMajority, fo.Require)
 	}
 
 	return nil
@@ -212,6 +288,48 @@ func validateStageTarget(field, target string, stageIDs map[string]bool) error {
 	}
 	if !stageIDs[target] {
 		return fmt.Errorf("%s references unknown stage: %q", field, target)
+	}
+	return nil
+}
+
+// validScopes defines the allowed scope strings for API key authentication.
+var validScopes = map[string]bool{
+	"read":  true,
+	"write": true,
+	"admin": true,
+}
+
+func validateAuth(auth APIAuthConfig) error {
+	if !auth.Enabled {
+		return nil
+	}
+
+	if len(auth.Keys) == 0 {
+		return fmt.Errorf("auth.enabled is true but auth.keys is empty — at least one key is required")
+	}
+
+	names := make(map[string]bool, len(auth.Keys))
+	for i, k := range auth.Keys {
+		if k.Name == "" {
+			return fmt.Errorf("auth.keys[%d]: name is required", i)
+		}
+		if names[k.Name] {
+			return fmt.Errorf("auth.keys: duplicate key name %q", k.Name)
+		}
+		names[k.Name] = true
+
+		if k.KeyEnv == "" {
+			return fmt.Errorf("auth.keys[%d] (%s): key_env is required", i, k.Name)
+		}
+
+		if len(k.Scopes) == 0 {
+			return fmt.Errorf("auth.keys[%d] (%s): at least one scope is required", i, k.Name)
+		}
+		for _, s := range k.Scopes {
+			if !validScopes[s] {
+				return fmt.Errorf("auth.keys[%d] (%s): invalid scope %q (valid: read, write, admin)", i, k.Name, s)
+			}
+		}
 	}
 	return nil
 }

@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/orcastrator/orcastrator/internal/auth"
 	"github.com/orcastrator/orcastrator/internal/broker"
 	"github.com/orcastrator/orcastrator/internal/config"
 	"github.com/orcastrator/orcastrator/internal/contract"
+	"github.com/orcastrator/orcastrator/internal/metrics"
 	"github.com/orcastrator/orcastrator/internal/store/memory"
 )
 
@@ -644,5 +646,153 @@ func TestGracefulShutdown_WebSocketCloses(t *testing.T) {
 	_, _, err = conn.ReadMessage()
 	if err == nil {
 		t.Fatal("expected error after shutdown, got nil")
+	}
+}
+
+// --- Auth integration tests via full routes() ---
+
+// newTestServerWithAuth creates a Server with auth enabled using the given keys.
+func newTestServerWithAuth(t *testing.T, keys []auth.APIKey, m *metrics.Metrics) *Server {
+	t.Helper()
+	cfg := testConfig()
+	st := memory.New()
+	agents := map[string]broker.Agent{
+		"agent-1": &stubAgent{id: "agent-1", provider: "anthropic", healthy: true},
+		"agent-2": &stubAgent{id: "agent-2", provider: "openai", healthy: true},
+	}
+	reg, _ := contract.NewRegistry(nil, "")
+	logger := slog.Default()
+	b := broker.New(cfg, st, agents, reg, logger, nil, nil)
+	srv := NewServer(b, logger, m, "", keys)
+	return srv
+}
+
+func TestRoutes_HealthEndpointAuthEnforced(t *testing.T) {
+	// Test 5: Verify the auth middleware is actually wired to the health
+	// route in server.go, not just tested in middleware isolation.
+
+	t.Setenv("HEALTH_READ_KEY", "health-read-key-value")
+	keys, err := auth.LoadKeys([]config.AuthKeyConfig{
+		{Name: "reader", KeyEnv: "HEALTH_READ_KEY", Scopes: []string{"read"}},
+	})
+	if err != nil {
+		t.Fatalf("LoadKeys: %v", err)
+	}
+
+	srv := newTestServerWithAuth(t, keys, nil)
+	defer srv.Shutdown(context.Background())
+
+	handler := srv.Handler()
+
+	// No Authorization header → 401.
+	t.Run("no_auth", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/health", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 with no auth, got %d", rec.Code)
+		}
+	})
+
+	// Read-scoped key → 200.
+	t.Run("read_key", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/health", nil)
+		req.Header.Set("Authorization", "Bearer health-read-key-value")
+		req.RemoteAddr = "127.0.0.1:12345"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200 with read key, got %d", rec.Code)
+		}
+	})
+
+	// Invalid key → 401.
+	t.Run("invalid_key", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/health", nil)
+		req.Header.Set("Authorization", "Bearer totally-wrong-key")
+		req.RemoteAddr = "127.0.0.1:12345"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 with invalid key, got %d", rec.Code)
+		}
+	})
+}
+
+func TestRoutes_MetricsAuthBypass(t *testing.T) {
+	// Test 6: Verify /metrics bypasses auth while /v1/tasks enforces it.
+	// Both assertions in the same test prove the bypass is selective
+	// (metrics only) and not a global auth disable.
+
+	t.Setenv("METRICS_READ_KEY", "metrics-read-key-value")
+	keys, err := auth.LoadKeys([]config.AuthKeyConfig{
+		{Name: "reader", KeyEnv: "METRICS_READ_KEY", Scopes: []string{"read"}},
+	})
+	if err != nil {
+		t.Fatalf("LoadKeys: %v", err)
+	}
+
+	// Create server with metrics enabled so /metrics is registered.
+	m := metrics.New()
+	srv := newTestServerWithAuth(t, keys, m)
+	defer srv.Shutdown(context.Background())
+
+	handler := srv.Handler()
+
+	// GET /metrics with no auth → 200 (auth bypassed for metrics).
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /metrics without auth: expected 200 (auth bypassed), got %d", rec.Code)
+	}
+
+	// GET /v1/tasks with no auth → 401 (auth enforced for API routes).
+	req = httptest.NewRequest("GET", "/v1/tasks", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /v1/tasks without auth: expected 401, got %d", rec.Code)
+	}
+}
+
+func TestAuthDisabled_AllRequestsPass_FullServer(t *testing.T) {
+	// Test 10: Verify auth disabled works via the full routes() code path,
+	// not just a bare handler. When auth.enabled = false (no authKeys passed),
+	// all registered routes should return non-401 responses.
+
+	srv, _ := newTestServer(t) // newTestServer creates without auth
+	defer srv.Shutdown(context.Background())
+
+	handler := srv.Handler()
+
+	endpoints := []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/v1/tasks"},
+		{"GET", "/v1/health"},
+		{"GET", "/v1/pipelines/"},
+	}
+
+	for _, ep := range endpoints {
+		t.Run(ep.method+" "+ep.path, func(t *testing.T) {
+			req := httptest.NewRequest(ep.method, ep.path, nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code == http.StatusUnauthorized {
+				t.Errorf("%s %s returned 401 with auth disabled — auth middleware should not be active", ep.method, ep.path)
+			}
+		})
 	}
 }
