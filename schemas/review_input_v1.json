@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "summary": {
+      "type": "string"
+    },
+    "areas_of_concern": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["files_changed", "summary", "areas_of_concern"],
+  "additionalProperties": false
+}

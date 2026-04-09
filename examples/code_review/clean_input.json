@@ -1,0 +1,5 @@
+{
+  "diff": "diff --git a/README.md b/README.md\nindex 1234567..abcdefg 100644\n--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,5 @@\n # My Project\n \n-A simple project.\n+A simple project for demonstration purposes.\n+\n+## Getting Started\n",
+  "pr_title": "Update README with getting started section",
+  "pr_description": "Minor documentation improvement: adds a getting started header and clarifies the project description."
+}

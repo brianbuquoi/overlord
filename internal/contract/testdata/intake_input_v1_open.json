@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "task_description": { "type": "string" },
+    "priority": { "type": "integer", "minimum": 1, "maximum": 5 }
+  },
+  "required": ["task_description", "priority"]
+}

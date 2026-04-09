@@ -1,0 +1,33 @@
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# Build output
+/bin/
+/dist/
+/orcastrator
+
+# Test artifacts
+coverage.out
+coverage.html
+*.test
+/tmp/
+
+# Claude Code — internal prompts and tooling (not needed to run the project)
+.claude/
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Go workspace (local development overrides — must not be committed)
+go.work
+go.work.sum
+
+# Integration test containers (local overrides)
+docker-compose.override.yml

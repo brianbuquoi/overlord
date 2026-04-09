@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "diff": {
+      "type": "string",
+      "description": "The raw git diff content"
+    },
+    "pr_title": {
+      "type": "string",
+      "description": "Pull request title"
+    },
+    "pr_description": {
+      "type": "string",
+      "description": "Pull request description"
+    }
+  },
+  "required": ["diff", "pr_title", "pr_description"],
+  "additionalProperties": false
+}

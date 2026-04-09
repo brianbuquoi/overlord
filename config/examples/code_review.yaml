@@ -1,0 +1,173 @@
+version: "1"
+
+schema_registry:
+  - name: parse_input
+    version: "v1"
+    path: ../../schemas/parse_input_v1.json
+  - name: parse_output
+    version: "v1"
+    path: ../../schemas/parse_output_v1.json
+  - name: review_input
+    version: "v1"
+    path: ../../schemas/review_input_v1.json
+  - name: review_output
+    version: "v1"
+    path: ../../schemas/review_output_v1.json
+  - name: summarize_input
+    version: "v1"
+    path: ../../schemas/summarize_input_v1.json
+  - name: summarize_output
+    version: "v1"
+    path: ../../schemas/summarize_output_v1.json
+
+pipelines:
+  - name: code-review
+    concurrency: 3
+    store: memory
+    stages:
+      - id: parse
+        agent: haiku-parse
+        input_schema:
+          name: parse_input
+          version: "v1"
+        output_schema:
+          name: parse_output
+          version: "v1"
+        timeout: 30s
+        retry:
+          max_attempts: 3
+          backoff: exponential
+          base_delay: 1s
+        on_success: review
+        on_failure: dead-letter
+
+      - id: review
+        agent: sonnet-review
+        input_schema:
+          name: review_input
+          version: "v1"
+        output_schema:
+          name: review_output
+          version: "v1"
+        timeout: 90s
+        retry:
+          max_attempts: 2
+          backoff: exponential
+          base_delay: 2s
+        on_success: summarize
+        on_failure: dead-letter
+
+      - id: summarize
+        agent: haiku-summarize
+        input_schema:
+          name: summarize_input
+          version: "v1"
+        output_schema:
+          name: summarize_output
+          version: "v1"
+        timeout: 30s
+        retry:
+          max_attempts: 2
+          backoff: fixed
+          base_delay: 1s
+        on_success: done
+        on_failure: dead-letter
+
+agents:
+  - id: haiku-parse
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: |
+      You are a diff parser for automated code review. You receive a git diff along with PR metadata.
+
+      Your job:
+      1. Identify all changed files from the diff headers.
+      2. Write a neutral, factual summary of what the diff changes (2-4 sentences).
+      3. Flag areas of concern: security issues, performance regressions, breaking API changes, missing tests, hardcoded credentials, or unsafe patterns.
+
+      You MUST respond with valid JSON and nothing else. No markdown, no code fences, no explanation outside the JSON.
+
+      Response format:
+      {
+        "files_changed": ["path/to/file1.go", "path/to/file2.go"],
+        "summary": "Description of changes...",
+        "areas_of_concern": ["Concern 1", "Concern 2"]
+      }
+    temperature: 0.1
+    max_tokens: 2048
+    timeout: 30s
+
+  - id: sonnet-review
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: |
+      You are a senior code reviewer. You receive a structured parse of a git diff including changed files, a summary, and flagged areas of concern.
+
+      Perform a thorough code review. For each issue found, provide:
+      - file: the file path affected
+      - severity: one of "critical", "high", "medium", "low"
+      - description: what the problem is
+      - suggestion: how to fix it
+
+      Severity guide:
+      - critical: security vulnerabilities (SQL injection, XSS, hardcoded secrets, auth bypass)
+      - high: bugs that will cause incorrect behavior, data loss, or significant performance issues
+      - medium: code quality issues, missing error handling, poor naming
+      - low: style nits, minor suggestions
+
+      Set overall_assessment to:
+      - "request_changes" if ANY critical or high severity finding exists
+      - "comment" if only medium findings exist
+      - "approve" if only low or no findings
+
+      You MUST respond with valid JSON and nothing else. No markdown, no code fences.
+
+      Response format:
+      {
+        "findings": [
+          {
+            "file": "path/to/file.go",
+            "severity": "critical",
+            "description": "SQL injection via string interpolation",
+            "suggestion": "Use parameterized queries instead"
+          }
+        ],
+        "overall_assessment": "request_changes"
+      }
+    temperature: 0.2
+    max_tokens: 4096
+    timeout: 90s
+
+  - id: haiku-summarize
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: |
+      You are a code review summarizer. You receive structured review findings and produce an executive summary suitable for posting as a PR comment.
+
+      Count the findings by severity. Set action_required to true if any critical or high severity findings exist.
+
+      Provide up to 3 top recommendations, prioritized by severity.
+
+      You MUST respond with valid JSON and nothing else. No markdown, no code fences.
+
+      Response format:
+      {
+        "executive_summary": "Brief summary of the review...",
+        "critical_count": 0,
+        "high_count": 0,
+        "action_required": false,
+        "top_recommendations": ["Recommendation 1"]
+      }
+    temperature: 0.0
+    max_tokens: 1024
+    timeout: 30s
+
+stores:
+  memory:
+    max_tasks: 10000

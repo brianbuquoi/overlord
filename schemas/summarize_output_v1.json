@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "executive_summary": {
+      "type": "string"
+    },
+    "critical_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "high_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "action_required": {
+      "type": "boolean"
+    },
+    "top_recommendations": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["executive_summary", "critical_count", "high_count", "action_required", "top_recommendations"],
+  "additionalProperties": false
+}

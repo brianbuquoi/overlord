@@ -1,0 +1,133 @@
+version: "1"
+
+schema_registry:
+  - name: intake_input
+    version: "v1"
+    path: ../../schemas/intake_input_v1.json
+  - name: intake_output
+    version: "v1"
+    path: ../../schemas/intake_output_v1.json
+  - name: process_input
+    version: "v1"
+    path: ../../schemas/process_input_v1.json
+  - name: process_output
+    version: "v1"
+    path: ../../schemas/process_output_v1.json
+  - name: validate_input
+    version: "v1"
+    path: ../../schemas/validate_input_v1.json
+  - name: validate_output
+    version: "v1"
+    path: ../../schemas/validate_output_v1.json
+
+pipelines:
+  - name: multi-provider-pipeline
+    concurrency: 3
+    store: memory
+    stages:
+      - id: intake
+        agent: claude-intake
+        input_schema:
+          name: intake_input
+          version: "v1"
+        output_schema:
+          name: intake_output
+          version: "v1"
+        timeout: 30s
+        retry:
+          max_attempts: 3
+          backoff: exponential
+          base_delay: 1s
+        on_success: review
+        on_failure: dead-letter
+
+      - id: review
+        agent: gemini-review
+        input_schema:
+          name: process_input
+          version: "v1"
+        output_schema:
+          name: process_output
+          version: "v1"
+        timeout: 45s
+        retry:
+          max_attempts: 2
+          backoff: linear
+          base_delay: 2s
+        on_success: implement
+        on_failure: dead-letter
+
+      - id: implement
+        agent: openai-implement
+        input_schema:
+          name: validate_input
+          version: "v1"
+        output_schema:
+          name: validate_output
+          version: "v1"
+        timeout: 90s
+        retry:
+          max_attempts: 2
+          backoff: exponential
+          base_delay: 3s
+        on_success: validate
+        on_failure: dead-letter
+
+      - id: validate
+        agent: ollama-validate
+        input_schema:
+          name: validate_input
+          version: "v1"
+        output_schema:
+          name: validate_output
+          version: "v1"
+        timeout: 30s
+        retry:
+          max_attempts: 1
+          backoff: fixed
+          base_delay: 1s
+        on_success: done
+        on_failure: review
+
+agents:
+  - id: claude-intake
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: "You are an intake classifier. Categorize and structure the incoming request."
+    temperature: 0.1
+    max_tokens: 1024
+    timeout: 30s
+
+  - id: gemini-review
+    provider: google
+    model: gemini-2.0-flash
+    auth:
+      api_key_env: GEMINI_API_KEY
+    system_prompt: "You are a review agent. Analyze the structured request and produce a detailed review with confidence scores."
+    temperature: 0.2
+    max_tokens: 4096
+    timeout: 45s
+
+  - id: openai-implement
+    provider: openai
+    model: gpt-4o
+    auth:
+      api_key_env: OPENAI_API_KEY
+    system_prompt: "You are an implementation agent. Generate the implementation based on the reviewed specification."
+    temperature: 0.4
+    max_tokens: 8192
+    timeout: 90s
+
+  - id: ollama-validate
+    provider: ollama
+    model: llama3
+    system_prompt: "You are a validation agent. Verify the implementation output meets quality requirements."
+    temperature: 0.0
+    max_tokens: 2048
+    timeout: 30s
+
+stores:
+  memory:
+    max_tasks: 10000
