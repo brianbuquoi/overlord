@@ -19,7 +19,24 @@ import (
 )
 
 // bcryptCost is the bcrypt cost factor for hashing API keys.
-const bcryptCost = 12
+// Tests can override this via SetCostForTesting to avoid slow CI runs.
+var bcryptCost = 12
+
+// SetCostForTesting overrides the bcrypt cost factor and returns a restore
+// function. It is NOT safe for concurrent use — call it from TestMain or
+// before any parallel subtests start.
+func SetCostForTesting(cost int) func() {
+	prev := bcryptCost
+	bcryptCost = cost
+	// Regenerate the dummy hash at the new cost so timing stays consistent.
+	h, _ := bcrypt.GenerateFromPassword([]byte("orcastrator-dummy-key-for-timing"), cost)
+	oldDummy := dummyHash
+	dummyHash = h
+	return func() {
+		bcryptCost = prev
+		dummyHash = oldDummy
+	}
+}
 
 // Scope represents an API permission scope.
 type Scope string

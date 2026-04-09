@@ -2,16 +2,25 @@ package api
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/orcastrator/orcastrator/internal/auth"
 	"github.com/orcastrator/orcastrator/internal/config"
 
-	"log/slog"
+	"golang.org/x/crypto/bcrypt"
 )
+
+func TestMain(m *testing.M) {
+	restore := auth.SetCostForTesting(bcrypt.MinCost)
+	code := m.Run()
+	restore()
+	os.Exit(code)
+}
 
 // setupAuthKeys creates test API keys with known plaintext values.
 func setupAuthKeys(t *testing.T) ([]auth.APIKey, map[string]string) {

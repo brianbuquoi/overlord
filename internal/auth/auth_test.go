@@ -131,8 +131,10 @@ func TestAuthenticate_NoKeys(t *testing.T) {
 	if err != ErrUnauthorized {
 		t.Errorf("expected ErrUnauthorized, got %v", err)
 	}
-	// bcrypt at cost 12 should take >50ms.
-	if elapsed < 50*time.Millisecond {
+	// bcrypt at cost 12 should take >50ms. Skip this check when running
+	// with a reduced test cost (e.g. MinCost) since the assertion is about
+	// production-cost timing behaviour.
+	if bcryptCost >= 12 && elapsed < 50*time.Millisecond {
 		t.Errorf("empty key list returned too fast (%v), timing oracle possible", elapsed)
 	}
 }
