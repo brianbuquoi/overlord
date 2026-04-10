@@ -55,22 +55,116 @@ processed with the wrong schema version.
 **Recommendation:** Document that `migrate run` should target quiesced pipelines, or add
 `--require-state DONE,FAILED` filter to only migrate terminal tasks.
 
-### SEC3-001: RecordSuccess resets brute force window indefinitely
+### SEC4-003: WebSocket connections lack ping/pong keepalive
+**Location:** `internal/api/websocket.go` — `readPump()`
+**Severity:** Medium
+**Description:** No `SetReadDeadline`, `PingHandler`, or `PongHandler` configured on
+WebSocket connections. Zombie connections (client disconnects ungracefully) persist
+indefinitely, consuming a goroutine and send buffer per connection. Combined with
+SEC-013 (unbounded client count), this creates a resource exhaustion path.
+**Recommendation:** Add ping/pong with 60s deadline. Close connections that miss
+2 consecutive pong responses.
+
+### SEC4-006: No config-level size limit on system_prompt
+**Location:** `internal/config/types.go` — `Agent.SystemPrompt`
+**Severity:** Medium
+**Description:** System prompts can be arbitrarily large in YAML config. A very
+large prompt (100MB+) would be loaded, concatenated with envelope-wrapped output,
+and sent to the LLM API without any guardrail.
+**Recommendation:** Enforce max system_prompt length (e.g., 512KB) during config
+validation.
+
+### SEC4-007: Plugin file paths not validated against directory traversal
+**Location:** `internal/plugin/loader.go` — `resolvePaths()`
+**Severity:** Medium
+**Description:** Plugin `files:` list entries are passed to `os.Stat()` and
+`plugin.Open()` without validating against `../` sequences. Requires config file
+access (trusted), but defense-in-depth gap.
+**Recommendation:** Reject paths containing `..` or resolve to absolute and verify
+within an allowed directory.
+
+### SEC4-008: Replay dead-letter TOCTOU race
+**Location:** `internal/api/handlers.go` — `handleReplayDeadLetter()`
+**Severity:** Medium
+**Description:** GetTask → state check → Submit is not atomic. A concurrent discard
+between check and submit could result in replaying a task that was just discarded.
+**Recommendation:** Use atomic compare-and-swap or lock the task during replay.
+
+### SEC4-010: IPv6 brute force tracking per /128 (not /64)
+**Location:** `internal/auth/auth.go` — `RecordFailure()`, `internal/api/middleware.go` — `clientIP()`
+**Severity:** Medium
+**Description:** BruteForceTracker tracks IPv6 addresses as full /128 strings. An
+attacker with a /64 block has 2^64 distinct IPs. At 100k IP cap, the tracker
+overflows quickly, after which new IPs fail open.
+**Recommendation:** Normalize IPv6 to /64 prefix before tracking.
+
+### SEC3-001: RecordSuccess resets brute force window indefinitely — RESOLVED
 **Location:** `internal/auth/auth.go` — `RecordSuccess()` method
 **Severity:** Medium
-**Description:** `RecordSuccess` calls `delete(t.failures, ip)`, fully resetting
-the failure counter to 0. An attacker who possesses one valid API key can reset
-their own brute force window indefinitely by authenticating successfully every
-N-1 attempts (where N is the failure threshold). This allows unlimited password
-guessing against other keys from the same IP as long as the attacker has one
-valid credential.
-**Recommendation:** Replace the full delete with a decrement or partial reset.
-Alternatively, track success and failure counts separately so that success
-reduces but does not eliminate the failure history.
+**Status:** Resolved in v0.2.0
+**Description:** `RecordSuccess` previously called `delete(t.failures, ip)`, fully
+resetting the failure counter to 0.
+**Resolution:** `RecordSuccess` is now a no-op. Failures accumulate in a sliding
+window regardless of intervening successes and expire naturally. The middleware
+no longer calls `RecordSuccess` on successful auth. 429 responses now include
+`Retry-After` and `X-RateLimit-Reset` headers so legitimate users know when
+to retry.
 
 ---
 
 ## Informational (no action required)
+
+### SEC4-004: No maximum length on path parameters
+**Location:** `internal/api/handlers.go` — `pathParam()`
+**Description:** Path parameters (pipelineID, taskID) have no length limit. Go's
+HTTP server enforces URL length limits (~8KB) which caps this in practice.
+**Status:** Accepted — implicit limit from HTTP layer is sufficient.
+
+### SEC4-005: No length limit on query filter parameters
+**Location:** `internal/api/handlers.go` — `handleListTasks()`
+**Description:** `pipeline_id` and `stage_id` query parameters have no length
+validation. Used for equality filtering only, not interpolated.
+**Status:** Accepted — bounded by HTTP URL length limits.
+
+### SEC4-009: UpdateTask allows arbitrary state transitions
+**Location:** `internal/store/memory/memory.go`, `internal/store/postgres/postgres.go`
+**Description:** Store implementations accept any state value without validating
+it's a legal transition. Currently safe because only the broker (not API) calls
+UpdateTask with hardcoded valid transitions.
+**Status:** Accepted — defensive gap, not exploitable with current API surface.
+
+### SEC4-011: CI build does not use -trimpath flag
+**Location:** `.github/workflows/ci.yml`
+**Description:** Builds embed the CI machine's filesystem paths. Prevents
+reproducible builds and leaks minor path information.
+**Status:** Accepted — low risk, improve opportunistically.
+
+### SEC4-012: Agent API keys not zeroed after initialization
+**Location:** `internal/agent/registry/registry.go`, agent adapter constructors
+**Description:** LLM provider API keys persist in memory as plaintext in agent
+structs. Unlike auth keys (which are zeroed), these must remain available for
+each API call, so zeroing is not feasible.
+**Status:** Accepted — inherent to the design; keys must be sent on each request.
+
+### SEC4-013: math/rand/v2 used for retry jitter
+**Location:** `internal/broker/broker.go`
+**Description:** Non-cryptographic randomness used for ±10% backoff jitter.
+Appropriate — jitter timing is not security-sensitive.
+**Status:** Accepted — correct use of non-cryptographic randomness.
+
+### SEC4-014: Single-tenant by design
+**Location:** Architecture-wide
+**Description:** Any authenticated write-scoped key can submit tasks to any
+pipeline. No per-pipeline ACLs or ownership model. Deliberate single-operator
+design.
+**Status:** Accepted architectural decision — document in deployment guide if
+multi-tenant requirements arise.
+
+### SEC4-015: Database connection error may leak credentials
+**Location:** `cmd/orcastrator/main.go`
+**Description:** Connection failures use `%w` wrapping of driver errors. If pgx
+or go-redis include the DSN in error messages, credentials could appear in logs.
+**Status:** Accepted — driver-dependent; monitor if DSN leakage is observed.
 
 ### SEC-015: No JSON DisallowUnknownFields on task submission
 **Location:** `internal/api/handlers.go` — `handleSubmitTask()`
@@ -112,7 +206,20 @@ enhancement could add a separate `--metrics-port` flag.
 | SEC2-003 | cancel command TOCTOU race | Medium | Open |
 | SEC2-005 | Migration lacks live broker guard | Medium | Open |
 | SEC2-NEW-002 | Metrics endpoint on shared port | Informational | Informational |
-| SEC3-001 | RecordSuccess resets brute force window | Medium | Open |
+| SEC3-001 | RecordSuccess resets brute force window | Medium | Resolved |
+| SEC4-003 | WebSocket lacks ping/pong keepalive | Medium | Open |
+| SEC4-004 | No max length on path parameters | Low | Accepted |
+| SEC4-005 | No length limit on query filter params | Low | Accepted |
+| SEC4-006 | No config-level system_prompt size limit | Medium | Open |
+| SEC4-007 | Plugin paths not traversal-checked | Medium | Open |
+| SEC4-008 | Replay dead-letter TOCTOU race | Medium | Open |
+| SEC4-009 | UpdateTask allows arbitrary state transitions | Low | Accepted |
+| SEC4-010 | IPv6 brute force tracking per /128 | Medium | Open |
+| SEC4-011 | CI build missing -trimpath | Low | Accepted |
+| SEC4-012 | Agent API keys not zeroed | Low | Accepted |
+| SEC4-013 | math/rand/v2 for retry jitter | Informational | Accepted |
+| SEC4-014 | Single-tenant by design | Informational | Accepted |
+| SEC4-015 | DB connection error may leak creds | Low | Accepted |
 
 ---
 
@@ -154,9 +261,17 @@ Items below were resolved and verified in the codebase. Kept for audit trail.
 | SEC2-006 | sslmode=disable in compose example | Medium | Annotated with network safety guidance |
 | SEC2-NEW-001 | YAML parse error leaks file content | Low-Medium | Symlinks rejected; error messages sanitized |
 
+### Fourth Security Audit (SEC4-)
+
+| # | Title | Severity | Resolution |
+|---|-------|----------|------------|
+| SEC4-001 | Missing HTTP security headers | High | Added `securityHeaders` middleware (X-Content-Type-Options, X-Frame-Options, Referrer-Policy) |
+| SEC4-002 | No CSP on dashboard | High | Added Content-Security-Policy header to dashboard responses |
+
 ### Third Security Audit (SEC3-)
 
 | # | Title | Severity | Resolution |
 |---|-------|----------|------------|
+| SEC3-001 | RecordSuccess resets brute force window | Medium | `RecordSuccess` is now a no-op; failures expire via sliding window; Retry-After header on 429 |
 | SEC3-002 | Non-uniform 401 responses | Medium | All auth failures return identical `UNAUTHORIZED` body |
 | SEC3-003 | 403 reveals scope information | Low | Forbidden responses return generic `FORBIDDEN` body |

@@ -61,7 +61,7 @@ func testConfigMultiPipeline() *config.Config {
 						OutputSchema: config.StageSchemaRef{
 							Name: "intake_output", Version: "v1",
 						},
-						OnSuccess: "done",
+						OnSuccess: config.StaticOnSuccess("done"),
 						OnFailure: "dead-letter",
 					},
 				},
@@ -80,7 +80,7 @@ func testConfigMultiPipeline() *config.Config {
 						OutputSchema: config.StageSchemaRef{
 							Name: "intake_output", Version: "v1",
 						},
-						OnSuccess: "done",
+						OnSuccess: config.StaticOnSuccess("done"),
 						OnFailure: "dead-letter",
 					},
 				},

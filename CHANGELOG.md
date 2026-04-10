@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - 72-byte API key length validation with clear startup error
 
 ### Security
+- SEC3-001: RecordSuccess resets brute force window — RecordSuccess is
+  now a no-op; failures expire via sliding window
 - SEC3-002: Non-uniform 401 responses — all auth failures now return
   identical response body
 - SEC3-003: 403 response scope information leak — forbidden responses

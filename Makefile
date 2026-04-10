@@ -1,4 +1,4 @@
-.PHONY: test-unit test-integration test-all check example-code-review
+.PHONY: test-unit test-integration test-all check example-code-review build-echo-plugin
 
 test-unit:
 	go test -race ./...
@@ -15,6 +15,9 @@ test-all: test-unit test-integration
 check: test-all
 	go vet ./...
 	staticcheck ./...
+
+build-echo-plugin:
+	go build -buildmode=plugin -o examples/plugins/echo/echo.so ./examples/plugins/echo/
 
 example-code-review:
 	go run ./cmd/orcastrator submit \

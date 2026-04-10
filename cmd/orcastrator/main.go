@@ -30,14 +30,29 @@ import (
 	"github.com/orcastrator/orcastrator/internal/contract"
 	"github.com/orcastrator/orcastrator/internal/metrics"
 	"github.com/orcastrator/orcastrator/internal/migration"
+	internalplugin "github.com/orcastrator/orcastrator/internal/plugin"
 	"github.com/orcastrator/orcastrator/internal/store/memory"
 	pgstore "github.com/orcastrator/orcastrator/internal/store/postgres"
 	redisstore "github.com/orcastrator/orcastrator/internal/store/redis"
 	"github.com/orcastrator/orcastrator/internal/tracing"
+	pluginapi "github.com/orcastrator/orcastrator/pkg/plugin"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
 )
+
+// onSuccessDisplay formats an OnSuccessConfig for CLI display.
+func onSuccessDisplay(cfg config.OnSuccessConfig) string {
+	if !cfg.IsConditional {
+		return cfg.Static
+	}
+	parts := make([]string, 0, len(cfg.Routes)+1)
+	for _, r := range cfg.Routes {
+		parts = append(parts, fmt.Sprintf("[%s → %s]", r.RawExpr, r.Stage))
+	}
+	parts = append(parts, fmt.Sprintf("[default → %s]", cfg.Default))
+	return "conditional: " + strings.Join(parts, " ")
+}
 
 func main() {
 	root := rootCmd()
@@ -88,6 +103,7 @@ Quick start:
 	root.AddCommand(migrateCmd())
 	root.AddCommand(cancelCmd())
 	root.AddCommand(pipelinesCmd())
+	root.AddCommand(deadLetterCmd())
 	root.AddCommand(completionCmd())
 
 	return root
@@ -195,10 +211,10 @@ func buildStore(cfg *config.Config, logger *slog.Logger) (broker.Store, error) {
 	}
 }
 
-func buildAgents(cfg *config.Config, logger *slog.Logger, m *metrics.Metrics) (map[string]broker.Agent, error) {
+func buildAgents(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, logger *slog.Logger, m *metrics.Metrics) (map[string]broker.Agent, error) {
 	agents := make(map[string]broker.Agent, len(cfg.Agents))
 	for _, ac := range cfg.Agents {
-		a, err := registry.NewFromConfig(ac, logger, m)
+		a, err := registry.NewFromConfigWithPlugins(ac, plugins, logger, m)
 		if err != nil {
 			return nil, fmt.Errorf("agent %q: %w", ac.ID, err)
 		}
@@ -207,7 +223,7 @@ func buildAgents(cfg *config.Config, logger *slog.Logger, m *metrics.Metrics) (m
 	return agents, nil
 }
 
-func buildBroker(cfg *config.Config, configPath string, logger *slog.Logger, m *metrics.Metrics, t *tracing.Tracer) (*broker.Broker, error) {
+func buildBroker(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, configPath string, logger *slog.Logger, m *metrics.Metrics, t *tracing.Tracer) (*broker.Broker, error) {
 	basePath := configBasePath(configPath)
 
 	reg, err := buildContractRegistry(cfg, basePath)
@@ -220,7 +236,7 @@ func buildBroker(cfg *config.Config, configPath string, logger *slog.Logger, m *
 		return nil, fmt.Errorf("store: %w", err)
 	}
 
-	agents, err := buildAgents(cfg, logger, m)
+	agents, err := buildAgents(cfg, plugins, logger, m)
 	if err != nil {
 		return nil, fmt.Errorf("agents: %w", err)
 	}
@@ -280,7 +296,16 @@ func runCmd() *cobra.Command {
 			}
 			defer t.Shutdown(context.Background())
 
-			b, err := buildBroker(cfg, configPath, logger, m, t)
+			// Load plugins (if configured).
+			plugins, err := internalplugin.LoadPlugins(cfg.Plugins, logger)
+			if err != nil {
+				return fmt.Errorf("plugins: %w", err)
+			}
+			if len(plugins) > 0 {
+				logger.Info("plugins loaded", "count", len(plugins))
+			}
+
+			b, err := buildBroker(cfg, plugins, configPath, logger, m, t)
 			if err != nil {
 				return err
 			}
@@ -342,7 +367,15 @@ func runCmd() *cobra.Command {
 					logger.Error("hot-reload: contract registry failed", "error", err)
 					return
 				}
-				newAgents, err := buildAgents(newCfg, logger, m)
+				// Re-load plugins so newly-added .so files are picked up.
+				// Note: Go's plugin package caches already-loaded .so files,
+				// so existing plugins are not re-initialized.
+				reloadedPlugins, err := internalplugin.LoadPlugins(newCfg.Plugins, logger)
+				if err != nil {
+					logger.Error("hot-reload: plugins failed", "error", err)
+					return
+				}
+				newAgents, err := buildAgents(newCfg, reloadedPlugins, logger, m)
 				if err != nil {
 					logger.Error("hot-reload: agents failed", "error", err)
 					return
@@ -352,6 +385,7 @@ func runCmd() *cobra.Command {
 					"pipelines", len(newCfg.Pipelines),
 					"agents", len(newCfg.Agents),
 					"schemas", len(newCfg.SchemaRegistry),
+					"plugins", len(reloadedPlugins),
 				)
 			}); err != nil {
 				logger.Warn("config watch failed", "error", err)
@@ -453,7 +487,7 @@ issues without consuming API quota.`,
 				return dryRunSubmit(cfg, configPath, pipelineID, payloadBytes, cmd.OutOrStdout())
 			}
 
-			b, err := buildBroker(cfg, configPath, logger, nil, nil)
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
 			if err != nil {
 				return err
 			}
@@ -580,7 +614,7 @@ Use --watch to poll every 2 seconds until the task reaches a terminal state
 				return fmtConfigError(configPath, err)
 			}
 
-			b, err := buildBroker(cfg, configPath, logger, nil, nil)
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
 			if err != nil {
 				return err
 			}
@@ -682,7 +716,7 @@ func watchTask(ctx context.Context, b *broker.Broker, taskID string, w interface
 }
 
 func isTerminal(s broker.TaskState) bool {
-	return s == broker.TaskStateDone || s == broker.TaskStateFailed
+	return s == broker.TaskStateDone || s == broker.TaskStateFailed || s == broker.TaskStateDiscarded
 }
 
 // --- validate command ---
@@ -1134,7 +1168,7 @@ is returned.`,
 				return fmtConfigError(configPath, err)
 			}
 
-			b, err := buildBroker(cfg, configPath, logger, nil, nil)
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
 			if err != nil {
 				return err
 			}
@@ -1283,7 +1317,7 @@ stage's agent, schema versions, retry policy, and routing targets.`,
 				fmt.Fprintf(w, "%sTimeout:    %s\n", childPrefix, st.Timeout.Duration)
 				fmt.Fprintf(w, "%sRetry:      max=%d backoff=%s delay=%s\n", childPrefix,
 					st.Retry.MaxAttempts, st.Retry.Backoff, st.Retry.BaseDelay.Duration)
-				fmt.Fprintf(w, "%sOn success: %s\n", childPrefix, st.OnSuccess)
+				fmt.Fprintf(w, "%sOn success: %s\n", childPrefix, onSuccessDisplay(st.OnSuccess))
 				fmt.Fprintf(w, "%sOn failure: %s\n", childPrefix, st.OnFailure)
 			}
 			return nil
@@ -1292,6 +1326,311 @@ stage's agent, schema versions, retry policy, and routing targets.`,
 
 	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
 	cmd.Flags().StringVar(&pipelineID, "pipeline", "", "pipeline ID to show")
+	cmd.MarkFlagRequired("config")
+	cmd.MarkFlagRequired("pipeline")
+	return cmd
+}
+
+// --- dead-letter command ---
+
+func deadLetterCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "dead-letter",
+		Short: "Manage dead-lettered tasks",
+	}
+	cmd.AddCommand(deadLetterListCmd())
+	cmd.AddCommand(deadLetterReplayCmd())
+	cmd.AddCommand(deadLetterReplayAllCmd())
+	cmd.AddCommand(deadLetterDiscardCmd())
+	cmd.AddCommand(deadLetterDiscardAllCmd())
+	return cmd
+}
+
+func deadLetterListCmd() *cobra.Command {
+	var configPath string
+	var pipelineID string
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List dead-lettered tasks",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger()
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				return fmtConfigError(configPath, err)
+			}
+
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			deadLetter := true
+			failedState := broker.TaskStateFailed
+			filter := broker.TaskFilter{
+				State:              &failedState,
+				RoutedToDeadLetter: &deadLetter,
+				Limit:              100,
+			}
+			if pipelineID != "" {
+				filter.PipelineID = &pipelineID
+			}
+
+			result, err := b.Store().ListTasks(cmd.Context(), filter)
+			if err != nil {
+				return err
+			}
+
+			if len(result.Tasks) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No dead-lettered tasks found.")
+				return nil
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "%-36s %-20s %-20s %-30s %s\n", "TASK ID", "PIPELINE", "STAGE", "FAILURE REASON", "AGE")
+			fmt.Fprintf(cmd.OutOrStdout(), "%-36s %-20s %-20s %-30s %s\n", "-------", "--------", "-----", "--------------", "---")
+			for _, t := range result.Tasks {
+				reason := "unknown"
+				if r, ok := t.Metadata["failure_reason"]; ok {
+					reason = fmt.Sprintf("%v", r)
+				}
+				age := time.Since(t.CreatedAt).Round(time.Second)
+				fmt.Fprintf(cmd.OutOrStdout(), "%-36s %-20s %-20s %-30s %s\n",
+					t.ID, t.PipelineID, t.StageID, reason, age)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
+	cmd.Flags().StringVar(&pipelineID, "pipeline", "", "filter by pipeline ID")
+	cmd.MarkFlagRequired("config")
+	return cmd
+}
+
+func deadLetterReplayCmd() *cobra.Command {
+	var configPath string
+	var taskID string
+
+	cmd := &cobra.Command{
+		Use:   "replay",
+		Short: "Re-enqueue a dead-lettered task",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger()
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				return fmtConfigError(configPath, err)
+			}
+
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			task, err := b.GetTask(cmd.Context(), taskID)
+			if err != nil {
+				return fmt.Errorf("task %q not found: %w", taskID, err)
+			}
+			if !task.RoutedToDeadLetter || task.State != broker.TaskStateFailed {
+				return fmt.Errorf("task %q is not in dead-letter state (state: %s)", taskID, task.State)
+			}
+
+			newTask, err := b.Submit(cmd.Context(), task.PipelineID, task.Payload)
+			if err != nil {
+				return fmt.Errorf("replay failed: %w", err)
+			}
+
+			fmt.Fprintln(cmd.OutOrStdout(), newTask.ID)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
+	cmd.Flags().StringVar(&taskID, "task", "", "task ID to replay")
+	cmd.MarkFlagRequired("config")
+	cmd.MarkFlagRequired("task")
+	return cmd
+}
+
+func deadLetterReplayAllCmd() *cobra.Command {
+	var configPath string
+	var pipelineID string
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "replay-all",
+		Short: "Re-enqueue all dead-lettered tasks for a pipeline",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger()
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				return fmtConfigError(configPath, err)
+			}
+
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			deadLetter := true
+			failedState := broker.TaskStateFailed
+			result, err := b.Store().ListTasks(cmd.Context(), broker.TaskFilter{
+				PipelineID:         &pipelineID,
+				State:              &failedState,
+				RoutedToDeadLetter: &deadLetter,
+				Limit:              1000,
+			})
+			if err != nil {
+				return err
+			}
+
+			if len(result.Tasks) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No dead-lettered tasks found.")
+				return nil
+			}
+
+			if !yes {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Replay %d dead-lettered tasks for pipeline %q? [y/N] ", len(result.Tasks), pipelineID)
+				var input string
+				fmt.Fscanln(os.Stdin, &input)
+				if strings.ToLower(input) != "y" {
+					fmt.Fprintln(cmd.ErrOrStderr(), "Cancelled.")
+					return nil
+				}
+			}
+
+			count := 0
+			for _, task := range result.Tasks {
+				newTask, err := b.Submit(cmd.Context(), task.PipelineID, task.Payload)
+				if err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Failed to replay task %s: %v\n", task.ID, err)
+					continue
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s → %s\n", task.ID, newTask.ID)
+				count++
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Replayed %d tasks.\n", count)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
+	cmd.Flags().StringVar(&pipelineID, "pipeline", "", "pipeline ID")
+	cmd.Flags().BoolVar(&yes, "yes", false, "skip confirmation prompt")
+	cmd.MarkFlagRequired("config")
+	cmd.MarkFlagRequired("pipeline")
+	return cmd
+}
+
+func deadLetterDiscardCmd() *cobra.Command {
+	var configPath string
+	var taskID string
+
+	cmd := &cobra.Command{
+		Use:   "discard",
+		Short: "Permanently discard a dead-lettered task",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger()
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				return fmtConfigError(configPath, err)
+			}
+
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			task, err := b.GetTask(cmd.Context(), taskID)
+			if err != nil {
+				return fmt.Errorf("task %q not found: %w", taskID, err)
+			}
+			if task.State == broker.TaskStateDiscarded {
+				return fmt.Errorf("task %q is already discarded", taskID)
+			}
+			if !task.RoutedToDeadLetter || task.State != broker.TaskStateFailed {
+				return fmt.Errorf("task %q is not in dead-letter state (state: %s)", taskID, task.State)
+			}
+
+			state := broker.TaskStateDiscarded
+			if err := b.Store().UpdateTask(cmd.Context(), taskID, broker.TaskUpdate{State: &state}); err != nil {
+				return fmt.Errorf("discard failed: %w", err)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "Discarded.")
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
+	cmd.Flags().StringVar(&taskID, "task", "", "task ID to discard")
+	cmd.MarkFlagRequired("config")
+	cmd.MarkFlagRequired("task")
+	return cmd
+}
+
+func deadLetterDiscardAllCmd() *cobra.Command {
+	var configPath string
+	var pipelineID string
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "discard-all",
+		Short: "Discard all dead-lettered tasks for a pipeline",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger()
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				return fmtConfigError(configPath, err)
+			}
+
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			deadLetter := true
+			failedState := broker.TaskStateFailed
+			result, err := b.Store().ListTasks(cmd.Context(), broker.TaskFilter{
+				PipelineID:         &pipelineID,
+				State:              &failedState,
+				RoutedToDeadLetter: &deadLetter,
+				Limit:              1000,
+			})
+			if err != nil {
+				return err
+			}
+
+			if len(result.Tasks) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No dead-lettered tasks found.")
+				return nil
+			}
+
+			if !yes {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Discard %d dead-lettered tasks for pipeline %q? [y/N] ", len(result.Tasks), pipelineID)
+				var input string
+				fmt.Fscanln(os.Stdin, &input)
+				if strings.ToLower(input) != "y" {
+					fmt.Fprintln(cmd.ErrOrStderr(), "Cancelled.")
+					return nil
+				}
+			}
+
+			count := 0
+			state := broker.TaskStateDiscarded
+			for _, task := range result.Tasks {
+				if err := b.Store().UpdateTask(cmd.Context(), task.ID, broker.TaskUpdate{State: &state}); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Failed to discard task %s: %v\n", task.ID, err)
+					continue
+				}
+				count++
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Discarded %d tasks.\n", count)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
+	cmd.Flags().StringVar(&pipelineID, "pipeline", "", "pipeline ID")
+	cmd.Flags().BoolVar(&yes, "yes", false, "skip confirmation prompt")
 	cmd.MarkFlagRequired("config")
 	cmd.MarkFlagRequired("pipeline")
 	return cmd

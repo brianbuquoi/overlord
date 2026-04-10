@@ -103,8 +103,40 @@ func validate(cfg *Config) error {
 		if err := validatePipeline(p, agentIDs, schemaIndex); err != nil {
 			return fmt.Errorf("pipeline %q: %w", p.Name, err)
 		}
+		if err := detectCycles(p); err != nil {
+			return err
+		}
+		if p.RetryBudget != nil {
+			if err := validateRetryBudget("pipeline "+p.Name, p.RetryBudget); err != nil {
+				return err
+			}
+		}
 	}
 
+	for _, a := range cfg.Agents {
+		if a.RetryBudget != nil {
+			if err := validateRetryBudget("agent "+a.ID, a.RetryBudget); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateRetryBudget(owner string, rb *RetryBudgetConfig) error {
+	if rb.MaxRetries < 1 {
+		return fmt.Errorf("%s: retry_budget.max_retries must be at least 1", owner)
+	}
+	if rb.Window.Duration <= 0 {
+		return fmt.Errorf("%s: retry_budget.window must be a positive duration", owner)
+	}
+	switch rb.OnExhausted {
+	case "", "fail", "wait":
+		// valid
+	default:
+		return fmt.Errorf("%s: retry_budget.on_exhausted must be \"fail\" or \"wait\", got %q", owner, rb.OnExhausted)
+	}
 	return nil
 }
 
@@ -211,7 +243,7 @@ func validatePipeline(p Pipeline, agentIDs map[string]bool, schemaIndex map[stri
 			}
 		}
 
-		if err := validateStageTarget("on_success", s.OnSuccess, stageIDs); err != nil {
+		if err := validateOnSuccess(s.ID, s.OnSuccess, stageIDs); err != nil {
 			return fmt.Errorf("stage %q: %w", s.ID, err)
 		}
 		if err := validateStageTarget("on_failure", s.OnFailure, stageIDs); err != nil {
@@ -277,6 +309,27 @@ func validateSchemaRef(field string, ref StageSchemaRef, schemaIndex map[string]
 	}
 
 	return fmt.Errorf("%s: schema %q is not declared in schema_registry", field, ref.Name)
+}
+
+// validateOnSuccess validates the on_success field, handling both static and conditional forms.
+func validateOnSuccess(stageID string, cfg OnSuccessConfig, stageIDs map[string]bool) error {
+	if !cfg.IsConditional {
+		return validateStageTarget("on_success", cfg.Static, stageIDs)
+	}
+
+	// Validate default target.
+	if err := validateStageTarget("on_success.default", cfg.Default, stageIDs); err != nil {
+		return err
+	}
+
+	// Validate each route's stage reference.
+	for i, route := range cfg.Routes {
+		if err := validateStageTarget(fmt.Sprintf("on_success.routes[%d].stage", i), route.Stage, stageIDs); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func validateStageTarget(field, target string, stageIDs map[string]bool) error {

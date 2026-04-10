@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "assessment": {
+      "type": "string",
+      "enum": ["approve", "request_changes"]
+    },
+    "critical_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": ["assessment", "critical_count", "summary"],
+  "additionalProperties": false
+}

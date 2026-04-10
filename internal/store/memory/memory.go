@@ -133,6 +133,12 @@ func (m *MemoryStore) UpdateTask(_ context.Context, taskID string, update broker
 	if update.MaxAttempts != nil {
 		task.MaxAttempts = *update.MaxAttempts
 	}
+	if update.RoutedToDeadLetter != nil {
+		task.RoutedToDeadLetter = *update.RoutedToDeadLetter
+	}
+	if update.CrossStageTransitions != nil {
+		task.CrossStageTransitions = *update.CrossStageTransitions
+	}
 	task.UpdatedAt = time.Now()
 	return nil
 }
@@ -177,6 +183,13 @@ func (m *MemoryStore) ListTasks(_ context.Context, filter broker.TaskFilter) (*b
 			continue
 		}
 		if filter.State != nil && task.State != *filter.State {
+			continue
+		}
+		// Exclude DISCARDED tasks by default unless explicitly included.
+		if !filter.IncludeDiscarded && task.State == broker.TaskStateDiscarded {
+			continue
+		}
+		if filter.RoutedToDeadLetter != nil && task.RoutedToDeadLetter != *filter.RoutedToDeadLetter {
 			continue
 		}
 		matching = append(matching, id)

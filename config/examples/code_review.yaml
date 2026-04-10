@@ -13,12 +13,24 @@ schema_registry:
   - name: review_output
     version: "v1"
     path: ../../schemas/review_output_v1.json
-  - name: summarize_input
+  - name: judge_input
     version: "v1"
-    path: ../../schemas/summarize_input_v1.json
-  - name: summarize_output
+    path: ../../schemas/judge_input_v1.json
+  - name: judge_output
     version: "v1"
-    path: ../../schemas/summarize_output_v1.json
+    path: ../../schemas/judge_output_v1.json
+  - name: escalate_input
+    version: "v1"
+    path: ../../schemas/escalate_input_v1.json
+  - name: escalate_output
+    version: "v1"
+    path: ../../schemas/escalate_output_v1.json
+  - name: implement_input
+    version: "v1"
+    path: ../../schemas/implement_input_v1.json
+  - name: implement_output
+    version: "v1"
+    path: ../../schemas/implement_output_v1.json
 
 pipelines:
   - name: code-review
@@ -54,22 +66,62 @@ pipelines:
           max_attempts: 2
           backoff: exponential
           base_delay: 2s
-        on_success: summarize
+        on_success: judge
         on_failure: dead-letter
 
-      - id: summarize
-        agent: haiku-summarize
+      - id: judge
+        agent: haiku-judge
         input_schema:
-          name: summarize_input
+          name: judge_input
           version: "v1"
         output_schema:
-          name: summarize_output
+          name: judge_output
           version: "v1"
         timeout: 30s
         retry:
           max_attempts: 2
           backoff: fixed
           base_delay: 1s
+        on_success:
+          routes:
+            - condition: 'output.assessment == "approve"'
+              stage: done
+            - condition: 'output.critical_count > 0'
+              stage: escalate
+            - condition: 'output.assessment == "request_changes"'
+              stage: implement
+          default: done
+        on_failure: dead-letter
+
+      - id: escalate
+        agent: sonnet-escalate
+        input_schema:
+          name: escalate_input
+          version: "v1"
+        output_schema:
+          name: escalate_output
+          version: "v1"
+        timeout: 60s
+        retry:
+          max_attempts: 2
+          backoff: fixed
+          base_delay: 1s
+        on_success: done
+        on_failure: dead-letter
+
+      - id: implement
+        agent: haiku-implement
+        input_schema:
+          name: implement_input
+          version: "v1"
+        output_schema:
+          name: implement_output
+          version: "v1"
+        timeout: 60s
+        retry:
+          max_attempts: 3
+          backoff: exponential
+          base_delay: 2s
         on_success: done
         on_failure: dead-letter
 
@@ -142,31 +194,70 @@ agents:
     max_tokens: 4096
     timeout: 90s
 
-  - id: haiku-summarize
+  - id: haiku-judge
     provider: anthropic
     model: claude-haiku-4-5-20251001
     auth:
       api_key_env: ANTHROPIC_API_KEY
     system_prompt: |
-      You are a code review summarizer. You receive structured review findings and produce an executive summary suitable for posting as a PR comment.
+      You are a code review judge. You receive structured review findings and decide the next action.
 
-      Count the findings by severity. Set action_required to true if any critical or high severity findings exist.
+      Count critical findings. Set assessment to:
+      - "approve" if no critical or high severity findings
+      - "request_changes" if any critical or high findings exist
 
-      Provide up to 3 top recommendations, prioritized by severity.
-
-      You MUST respond with valid JSON and nothing else. No markdown, no code fences.
+      You MUST respond with valid JSON and nothing else.
 
       Response format:
       {
-        "executive_summary": "Brief summary of the review...",
+        "assessment": "approve",
         "critical_count": 0,
-        "high_count": 0,
-        "action_required": false,
-        "top_recommendations": ["Recommendation 1"]
+        "summary": "Brief explanation of decision"
       }
     temperature: 0.0
     max_tokens: 1024
     timeout: 30s
+
+  - id: sonnet-escalate
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: |
+      You are a security escalation handler. You receive review findings with critical issues.
+      Create an escalation report describing the critical findings and recommended actions.
+
+      You MUST respond with valid JSON and nothing else.
+
+      Response format:
+      {
+        "action": "escalate_to_security_team",
+        "escalated_to": "security-team",
+        "message": "Description of critical findings requiring attention"
+      }
+    temperature: 0.1
+    max_tokens: 2048
+    timeout: 60s
+
+  - id: haiku-implement
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    auth:
+      api_key_env: ANTHROPIC_API_KEY
+    system_prompt: |
+      You are a code change implementer. You receive review findings that require changes.
+      List the changes that should be applied to address the findings.
+
+      You MUST respond with valid JSON and nothing else.
+
+      Response format:
+      {
+        "changes_applied": ["Description of change 1", "Description of change 2"],
+        "status": "changes_suggested"
+      }
+    temperature: 0.1
+    max_tokens: 2048
+    timeout: 60s
 
 stores:
   memory:

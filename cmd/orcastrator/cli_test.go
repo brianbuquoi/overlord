@@ -222,7 +222,7 @@ func TestCLI_PollTask_FailedReturnsError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestCLI_Status_FormattedOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +415,7 @@ func TestCLI_Status_FailedTaskShowsReason(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +459,7 @@ func TestCLI_Status_WatchTerminatesOnDone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestCLI_Cancel_PendingTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +552,7 @@ func TestCLI_Cancel_TerminalStateReturnsError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +584,7 @@ func TestCLI_Cancel_ExecutingTaskShowsNote(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +621,7 @@ func TestCLI_Cancel_NonexistentTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,7 +761,7 @@ func TestCLI_Submit_DryRun_DoesNotSubmit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := buildBroker(cfg, configPath, newLogger(), nil, nil)
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

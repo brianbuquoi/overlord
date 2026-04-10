@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/orcastrator/orcastrator/internal/budget"
 	"github.com/orcastrator/orcastrator/internal/config"
 	"github.com/orcastrator/orcastrator/internal/contract"
 	"github.com/orcastrator/orcastrator/internal/metrics"
+	"github.com/orcastrator/orcastrator/internal/routing"
 	"github.com/orcastrator/orcastrator/internal/sanitize"
 	"github.com/orcastrator/orcastrator/internal/tracing"
 	"go.opentelemetry.io/otel/propagation"
@@ -80,6 +82,7 @@ type Broker struct {
 	eventBus  *EventBus
 	metrics   *metrics.Metrics
 	tracer    *tracing.Tracer
+	budgets   *budget.Tracker
 
 	// sleepFn is called for backoff delays during retry. Defaults to a
 	// context-aware sleep. Replaced in tests via SetSleepFunc.
@@ -131,6 +134,7 @@ func New(
 		eventBus:  NewEventBus(),
 		metrics:   m,
 		tracer:    t,
+		budgets:   budget.NewTracker(),
 		pipelines: make(map[string]*config.Pipeline, len(cfg.Pipelines)),
 		stages:    make(map[string]map[string]*config.Stage),
 		agentCfg:  make(map[string]*config.Agent, len(cfg.Agents)),
@@ -187,6 +191,9 @@ func (b *Broker) Metrics() *metrics.Metrics { return b.metrics }
 
 // Tracer returns the broker's OpenTelemetry tracer (may be nil).
 func (b *Broker) Tracer() *tracing.Tracer { return b.tracer }
+
+// Budgets returns the broker's retry budget tracker.
+func (b *Broker) Budgets() *budget.Tracker { return b.budgets }
 
 // stageKey returns the map key used in stageWorkers.
 func stageKey(pipelineID, stageID string) string {
@@ -727,6 +734,20 @@ func (b *Broker) handleAgentError(ctx context.Context, pipelineID string, stage 
 	if errors.As(err, &retryable) && retryable.IsRetryable() {
 		task.Attempts++
 		if task.Attempts < stage.Retry.MaxAttempts {
+			// Atomically check+increment both budgets before allowing the retry.
+			exhaustedKey, exhaustedBudget := b.tryAcquireBudgets(ctx, pipelineID, stage, task)
+			if exhaustedBudget != nil {
+				if exhaustedBudget.OnExhausted == "wait" {
+					b.waitForBudget(ctx, pipelineID, stage, task)
+					return
+				}
+				b.logger.Warn("retry budget exhausted",
+					"task_id", task.ID, "budget_key", exhaustedKey,
+				)
+				b.failTask(ctx, pipelineID, stage, task, "retry_budget_exhausted")
+				return
+			}
+
 			b.logger.Info("retrying task",
 				"task_id", task.ID, "stage", stage.ID,
 				"attempt", task.Attempts, "max", stage.Retry.MaxAttempts,
@@ -743,6 +764,124 @@ func (b *Broker) handleAgentError(ctx context.Context, pipelineID string, stage 
 		)
 	}
 	b.failTask(ctx, pipelineID, stage, task, fmt.Sprintf("agent error: %v", err))
+}
+
+// budgetConfigs returns the pipeline and agent budget configs for a stage.
+func (b *Broker) budgetConfigs(pipelineID string, stage *config.Stage) (pipelineBudget *budget.Budget, agentBudget *budget.Budget, agentID string) {
+	b.mu.RLock()
+	p := b.pipelines[pipelineID]
+	agentID = stage.Agent
+	var agentCfg *config.Agent
+	if agentID != "" {
+		agentCfg = b.agentCfg[agentID]
+	}
+	b.mu.RUnlock()
+
+	if p != nil {
+		pipelineBudget = budget.FromConfig(p.RetryBudget)
+	}
+	if agentCfg != nil {
+		agentBudget = budget.FromConfig(agentCfg.RetryBudget)
+	}
+	return
+}
+
+// tryAcquireBudgets atomically checks and increments both pipeline and agent
+// budgets. If either is exhausted, no counters are incremented and the
+// exhausted key+budget are returned. If both have capacity, both are
+// incremented and ("", nil) is returned.
+func (b *Broker) tryAcquireBudgets(ctx context.Context, pipelineID string, stage *config.Stage, task *Task) (string, *budget.Budget) {
+	pb, ab, agentID := b.budgetConfigs(pipelineID, stage)
+
+	// Try pipeline budget.
+	if pb != nil {
+		pKey := budget.PipelineKey(pipelineID)
+		allowed, _, _ := b.budgets.IncrementIfNotExhausted(ctx, pKey, pb)
+		if !allowed {
+			b.logger.Warn("pipeline retry budget exhausted",
+				"task_id", task.ID, "pipeline", pipelineID, "budget_key", pKey,
+			)
+			if b.metrics != nil {
+				b.metrics.RetryBudgetExhaustionsTotal.WithLabelValues(pipelineID, agentID, "pipeline").Inc()
+			}
+			return pKey, pb
+		}
+	}
+
+	// Try agent budget.
+	if ab != nil {
+		aKey := budget.AgentKey(agentID)
+		allowed, _, _ := b.budgets.IncrementIfNotExhausted(ctx, aKey, ab)
+		if !allowed {
+			// Roll back the pipeline increment we just did.
+			if pb != nil {
+				b.budgets.Decrement(ctx, budget.PipelineKey(pipelineID))
+			}
+			b.logger.Warn("agent retry budget exhausted",
+				"task_id", task.ID, "agent", agentID, "budget_key", aKey,
+			)
+			if b.metrics != nil {
+				b.metrics.RetryBudgetExhaustionsTotal.WithLabelValues(pipelineID, agentID, "agent").Inc()
+			}
+			return aKey, ab
+		}
+	}
+
+	return "", nil
+}
+
+// waitForBudget holds a task in WAITING state until both budgets have capacity,
+// then atomically acquires them and retries. Re-checks every 30s or the
+// shortest budget window, whichever is shorter.
+func (b *Broker) waitForBudget(ctx context.Context, pipelineID string, stage *config.Stage, task *Task) {
+	b.transition(ctx, task, TaskStateWaiting)
+
+	pb, ab, _ := b.budgetConfigs(pipelineID, stage)
+
+	// Determine check interval from the shortest window.
+	checkInterval := 30 * time.Second
+	if pb != nil && pb.Window < checkInterval {
+		checkInterval = pb.Window
+	}
+	if ab != nil && ab.Window < checkInterval {
+		checkInterval = ab.Window
+	}
+
+	b.logger.Info("task waiting for budget refill",
+		"task_id", task.ID, "check_interval", checkInterval,
+	)
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			b.failTask(ctx, pipelineID, stage, task, "context cancelled while waiting for budget")
+			return
+		case <-ticker.C:
+			// Re-check BOTH budgets atomically.
+			exhaustedKey, exhaustedBudget := b.tryAcquireBudgets(ctx, pipelineID, stage, task)
+			if exhaustedBudget == nil {
+				b.logger.Info("budget refilled, retrying task",
+					"task_id", task.ID,
+				)
+				b.retryTask(ctx, stage, task)
+				return
+			}
+			// If the blocking budget's policy is "fail", stop waiting.
+			if exhaustedBudget.OnExhausted == "fail" {
+				b.logger.Warn("budget exhausted with on_exhausted=fail, giving up wait",
+					"task_id", task.ID, "budget_key", exhaustedKey,
+				)
+				b.failTask(ctx, pipelineID, stage, task, "retry_budget_exhausted")
+				return
+			}
+			b.logger.Debug("budget still exhausted",
+				"task_id", task.ID, "budget_key", exhaustedKey,
+			)
+		}
+	}
 }
 
 // retryTask applies backoff with jitter and re-enqueues the task.
@@ -806,9 +945,69 @@ func (b *Broker) calculateBackoff(policy config.RetryPolicy, attempt int) time.D
 	return delay
 }
 
+// maxStageTransitions returns the configured transition limit for a pipeline,
+// defaulting to config.DefaultMaxStageTransitions.
+func (b *Broker) maxStageTransitions(pipelineID string) int {
+	b.mu.RLock()
+	p := b.pipelines[pipelineID]
+	b.mu.RUnlock()
+	if p != nil && p.MaxStageTransitions > 0 {
+		return p.MaxStageTransitions
+	}
+	return config.DefaultMaxStageTransitions
+}
+
+// checkTransitionLimit increments CrossStageTransitions and dead-letters the
+// task if the limit is exceeded. Returns true if the task was dead-lettered.
+func (b *Broker) checkTransitionLimit(ctx context.Context, pipelineID string, stage *config.Stage, task *Task) bool {
+	task.CrossStageTransitions++
+	limit := b.maxStageTransitions(pipelineID)
+	if task.CrossStageTransitions > limit {
+		b.mergeMetadata(ctx, task, map[string]any{
+			"failure_reason": "max_stage_transitions_exceeded",
+			"transitions":    task.CrossStageTransitions - 1,
+		})
+		from := task.State
+		state := TaskStateFailed
+		deadLetter := true
+		transitions := task.CrossStageTransitions
+		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
+			State:                 &state,
+			RoutedToDeadLetter:    &deadLetter,
+			CrossStageTransitions: &transitions,
+		})
+		b.logger.Warn("task exceeded max stage transitions",
+			"task_id", task.ID, "pipeline", pipelineID,
+			"transitions", task.CrossStageTransitions-1, "limit", limit,
+		)
+		b.eventBus.Publish(TaskEvent{
+			Event:      "state_change",
+			TaskID:     task.ID,
+			PipelineID: pipelineID,
+			StageID:    stage.ID,
+			From:       from,
+			To:         TaskStateFailed,
+			Timestamp:  time.Now(),
+		})
+		if b.metrics != nil {
+			b.metrics.TasksDeadLettered.WithLabelValues(pipelineID, stage.ID).Inc()
+		}
+		b.recordTerminalMetrics(task, pipelineID, stage.ID, "FAILED")
+		return true
+	}
+	return false
+}
+
 // routeSuccess sends the task to the next stage or marks it done.
 func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *config.Stage, task *Task, outputPayload json.RawMessage) {
-	next := stage.OnSuccess
+	next, err := routing.Resolve(stage.OnSuccess.RouteConfig, outputPayload)
+	if err != nil {
+		b.logger.Error("conditional routing failed",
+			"task_id", task.ID, "stage", stage.ID, "error", err,
+		)
+		b.failTask(ctx, pipelineID, stage, task, fmt.Sprintf("routing error: %v", err))
+		return
+	}
 	if next == "done" || next == "" {
 		from := task.State
 		state := TaskStateDone
@@ -832,6 +1031,11 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 		return
 	}
 
+	// Check cross-stage transition limit before routing.
+	if b.checkTransitionLimit(ctx, pipelineID, stage, task) {
+		return
+	}
+
 	b.mu.RLock()
 	nextStage, ok := b.stages[pipelineID][next]
 	b.mu.RUnlock()
@@ -846,16 +1050,18 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 	state := TaskStatePending
 	attempts := 0
 	maxAttempts := nextStage.Retry.MaxAttempts
+	transitions := task.CrossStageTransitions
 	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
-		State:               &state,
-		StageID:             &next,
-		Payload:             &outputPayload,
-		Attempts:            &attempts,
-		InputSchemaName:     &nextStage.InputSchema.Name,
-		InputSchemaVersion:  &nextStage.InputSchema.Version,
-		OutputSchemaName:    &nextStage.OutputSchema.Name,
-		OutputSchemaVersion: &nextStage.OutputSchema.Version,
-		MaxAttempts:         &maxAttempts,
+		State:                 &state,
+		StageID:               &next,
+		Payload:               &outputPayload,
+		Attempts:              &attempts,
+		InputSchemaName:       &nextStage.InputSchema.Name,
+		InputSchemaVersion:    &nextStage.InputSchema.Version,
+		OutputSchemaName:      &nextStage.OutputSchema.Name,
+		OutputSchemaVersion:   &nextStage.OutputSchema.Version,
+		MaxAttempts:           &maxAttempts,
+		CrossStageTransitions: &transitions,
 	})
 
 	task.StageID = next
@@ -886,7 +1092,8 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 	if next == "" || next == "dead-letter" {
 		from := task.State
 		state := TaskStateFailed
-		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state})
+		deadLetter := true
+		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state, RoutedToDeadLetter: &deadLetter})
 		b.logger.Warn("task failed",
 			"task_id", task.ID, "stage", stage.ID, "reason", reason,
 		)
@@ -903,6 +1110,11 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 			b.metrics.TasksDeadLettered.WithLabelValues(pipelineID, stage.ID).Inc()
 		}
 		b.recordTerminalMetrics(task, pipelineID, stage.ID, "FAILED")
+		return
+	}
+
+	// Check cross-stage transition limit before routing to failure stage.
+	if b.checkTransitionLimit(ctx, pipelineID, stage, task) {
 		return
 	}
 
@@ -923,15 +1135,17 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 	state := TaskStatePending
 	attempts := 0
 	maxAttempts := nextStage.Retry.MaxAttempts
+	transitions := task.CrossStageTransitions
 	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
-		State:               &state,
-		StageID:             &next,
-		Attempts:            &attempts,
-		InputSchemaName:     &nextStage.InputSchema.Name,
-		InputSchemaVersion:  &nextStage.InputSchema.Version,
-		OutputSchemaName:    &nextStage.OutputSchema.Name,
-		OutputSchemaVersion: &nextStage.OutputSchema.Version,
-		MaxAttempts:         &maxAttempts,
+		State:                 &state,
+		StageID:               &next,
+		Attempts:              &attempts,
+		InputSchemaName:       &nextStage.InputSchema.Name,
+		InputSchemaVersion:    &nextStage.InputSchema.Version,
+		OutputSchemaName:      &nextStage.OutputSchema.Name,
+		OutputSchemaVersion:   &nextStage.OutputSchema.Version,
+		MaxAttempts:           &maxAttempts,
+		CrossStageTransitions: &transitions,
 	})
 
 	task.StageID = next

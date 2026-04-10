@@ -54,6 +54,71 @@ output from all agents. The `output_schema` validates each individual agent's
 output, while `aggregate_schema` validates the merged result passed to the
 next stage.
 
+## Writing a Plugin (Custom Provider Adapter)
+
+Plugins let you add custom LLM providers without modifying Orcastrator.
+Each plugin is a Go shared library (.so) that exports a single symbol.
+
+### 1. Implement `AgentPlugin` and `Agent`
+
+Import the public plugin API:
+
+```go
+import "github.com/orcastrator/orcastrator/pkg/plugin"
+```
+
+Create a type that implements `plugin.AgentPlugin`:
+
+```go
+var Plugin plugin.AgentPlugin = &myPlugin{}
+
+type myPlugin struct{}
+
+func (p *myPlugin) ProviderName() string { return "myprovider" }
+
+func (p *myPlugin) NewAgent(cfg plugin.PluginAgentConfig) (plugin.Agent, error) {
+    // Use cfg.Auth, cfg.Model, cfg.Extra, etc. to configure your agent.
+    return &myAgent{id: cfg.ID}, nil
+}
+```
+
+Your agent must implement `plugin.Agent` (ID, Provider, Execute, HealthCheck).
+
+### 2. Build the .so file
+
+```bash
+go build -buildmode=plugin -o myprovider.so ./path/to/plugin/
+```
+
+### 3. Configure in YAML
+
+```yaml
+plugins:
+  dir: ./plugins        # scan directory for .so files
+  # or list specific files:
+  files:
+    - ./plugins/myprovider.so
+
+agents:
+  - id: my-agent
+    provider: myprovider   # matches ProviderName()
+    model: my-model
+    auth:
+      api_key_env: MY_API_KEY
+    extra:
+      custom_option: value  # passed via PluginAgentConfig.Extra
+```
+
+### 4. Platform limitations
+
+- Go's `plugin` package only works on **Linux and macOS** with **CGO enabled**.
+- Plugins must be compiled with the **same Go version** and **same module
+  dependencies** as the Orcastrator binary.
+- Tests that load actual .so files must be tagged `//go:build plugin_test`.
+
+See `examples/plugins/echo/` for a complete example. Build it with
+`make build-echo-plugin`.
+
 ## Reporting bugs
 
 Use [GitHub Issues](../../issues) with the bug report template.

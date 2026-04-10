@@ -147,7 +147,8 @@ func TestBruteForce_ThresholdAccuracy(t *testing.T) {
 	}
 }
 
-func TestBruteForce_SuccessResetsCounter(t *testing.T) {
+func TestBruteForce_SuccessDoesNotResetCounter(t *testing.T) {
+	// SEC3-001 FIXED: RecordSuccess is a no-op.
 	tracker := NewBruteForceTracker(10, time.Minute)
 	ip := "10.20.30.41"
 
@@ -156,16 +157,14 @@ func TestBruteForce_SuccessResetsCounter(t *testing.T) {
 		tracker.RecordFailure(ip)
 	}
 
-	// 1 success — should reset.
+	// 1 success — no-op.
 	tracker.RecordSuccess(ip)
 
-	// 1 more failure — should NOT be blocked (counter was reset).
+	// 1 more failure — total is 10, should be blocked.
 	tracker.RecordFailure(ip)
-	if tracker.IsBlocked(ip) {
-		t.Error("should not be blocked — success reset the counter")
+	if !tracker.IsBlocked(ip) {
+		t.Error("should be blocked after 10 failures — RecordSuccess must not reset (SEC3-001)")
 	}
-
-	t.Log("Behaviour documented: RecordSuccess resets the failure counter for the IP")
 }
 
 // --- Test 9: Window expiry ---

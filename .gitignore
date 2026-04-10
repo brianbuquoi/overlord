@@ -29,5 +29,8 @@ coverage.html
 go.work
 go.work.sum
 
+# Plugin shared libraries
+*.so
+
 # Integration test containers (local overrides)
 docker-compose.override.yml

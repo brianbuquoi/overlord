@@ -61,7 +61,7 @@ func buildTwoStagePipeline(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "any_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "stage2",
+						OnSuccess:    config.StaticOnSuccess("stage2"),
 						OnFailure:    "dead-letter",
 					},
 					{
@@ -71,7 +71,7 @@ func buildTwoStagePipeline(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "any_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
@@ -181,7 +181,7 @@ func TestEnvelopeCoverage_LoopbackRouting(t *testing.T) {
 						OutputSchema: config.StageSchemaRef{Name: "any", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "stage2",
+						OnSuccess:    config.StaticOnSuccess("stage2"),
 						OnFailure:    "dead-letter",
 					},
 					{
@@ -191,7 +191,7 @@ func TestEnvelopeCoverage_LoopbackRouting(t *testing.T) {
 						OutputSchema: config.StageSchemaRef{Name: "any", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "stage1", // loopback to stage1
 					},
 				},

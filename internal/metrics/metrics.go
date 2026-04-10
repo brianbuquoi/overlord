@@ -20,6 +20,9 @@ type Metrics struct {
 	SanitizerRedactions  *prometheus.CounterVec
 	QueueDepth           *prometheus.GaugeVec
 
+	// Retry budget metrics.
+	RetryBudgetExhaustionsTotal *prometheus.CounterVec
+
 	// Fan-out metrics.
 	FanOutAgentResults          *prometheus.CounterVec
 	FanOutRequirePolicyFailures *prometheus.CounterVec
@@ -74,6 +77,11 @@ func New() *Metrics {
 			Help: "Current tasks waiting in each stage queue.",
 		}, []string{"pipeline_id", "stage_id"}),
 
+		RetryBudgetExhaustionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "orcastrator_retry_budget_exhaustions_total",
+			Help: "Times a retry budget was exhausted.",
+		}, []string{"pipeline_id", "agent_id", "budget_type"}),
+
 		FanOutAgentResults: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "orcastrator_fanout_agent_results_total",
 			Help: "Per-agent results in fan-out executions.",
@@ -94,6 +102,7 @@ func New() *Metrics {
 		m.TasksDeadLettered,
 		m.SanitizerRedactions,
 		m.QueueDepth,
+		m.RetryBudgetExhaustionsTotal,
 		m.FanOutAgentResults,
 		m.FanOutRequirePolicyFailures,
 	)

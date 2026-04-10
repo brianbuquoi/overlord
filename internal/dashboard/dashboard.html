@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<!--
+  Orcastrator Pipeline Dashboard
+  Single-file embedded dashboard served by the Go binary.
+
+  Manual Verification Steps:
+  1. Start Orcastrator: go run ./cmd/orcastrator --config config/examples/code_review.yaml
+  2. Open http://localhost:8080/dashboard in a browser
+  3. Verify: pipeline list shows configured pipelines in left sidebar
+  4. Verify: stage topology diagram renders with nodes and edges
+  5. Verify: agent health panel shows all configured agents with status
+  6. Submit a task via POST /v1/pipelines/{name}/tasks and verify live feed updates
+  7. Disconnect network briefly — verify reconnecting indicator appears
+  8. Reconnect — verify status returns to connected, no duplicate events
+  9. With auth enabled: verify login prompt, wrong key error, correct key loads dashboard
+  10. Verify sessionStorage persistence across refresh, new tab prompts again
+  11. Test in Firefox and Chrome — verify no console errors
+
+  Manual Verification Results:
+  (To be filled after manual testing against a running instance)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orcastrator Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232736;
+    --border: #2e3346;
+    --text: #e1e4ed;
+    --text-muted: #8b90a5;
+    --accent: #6c8cff;
+    --green: #4ade80;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --gray: #6b7280;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* Layout */
+  .app { display: grid; grid-template-rows: 48px 1fr 220px; grid-template-columns: 240px 1fr; height: 100vh; }
+  .topbar { grid-column: 1 / -1; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; padding: 0 16px; gap: 16px; }
+  .sidebar { background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px; }
+  .main { padding: 16px; overflow: auto; position: relative; }
+  .drawer { grid-column: 1 / -1; background: var(--surface); border-top: 1px solid var(--border); overflow-y: auto; padding: 12px 16px; }
+
+  /* Topbar */
+  .topbar h1 { font-size: 14px; font-weight: 600; color: var(--accent); }
+  .health-summary { display: flex; gap: 12px; margin-left: auto; align-items: center; font-size: 12px; }
+  .health-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .health-dot.ok { background: var(--green); }
+  .health-dot.degraded { background: var(--yellow); }
+  .health-dot.error { background: var(--red); }
+  .refresh-indicator { color: var(--text-muted); font-size: 11px; }
+  .ws-status { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+  .ws-status.connected { background: rgba(74,222,128,0.15); color: var(--green); }
+  .ws-status.reconnecting { background: rgba(251,191,36,0.15); color: var(--yellow); }
+  .ws-status.disconnected { background: rgba(248,113,113,0.15); color: var(--red); }
+  #logout-btn { background: none; border: 1px solid var(--border); color: var(--text-muted); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+  #logout-btn:hover { border-color: var(--text-muted); }
+
+  /* Sidebar */
+  .sidebar h2 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; letter-spacing: 0.5px; }
+  .pipeline-item { padding: 8px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; font-size: 13px; }
+  .pipeline-item:hover { background: var(--surface2); }
+  .pipeline-item.active { background: var(--surface2); border-left: 2px solid var(--accent); }
+  .pipeline-item .stage-count { color: var(--text-muted); font-size: 11px; }
+
+  /* Main — topology */
+  #topology { width: 100%; height: 100%; }
+  #topology svg { width: 100%; height: 100%; }
+  .stage-node rect { rx: 8; ry: 8; stroke-width: 1.5; }
+  .stage-node text { font-size: 12px; fill: var(--text); }
+  .stage-node .badge { font-size: 10px; }
+  .edge { stroke: var(--border); stroke-width: 1.5; fill: none; }
+  .edge.failure { stroke: var(--red); stroke-dasharray: 4 2; }
+  .edge-label { font-size: 10px; fill: var(--text-muted); }
+
+  /* Stage detail panel */
+  .stage-detail { position: absolute; top: 16px; right: 16px; width: 280px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-size: 12px; z-index: 10; }
+  .stage-detail h3 { font-size: 13px; margin-bottom: 8px; }
+  .stage-detail dt { color: var(--text-muted); margin-top: 6px; }
+  .stage-detail dd { margin-left: 0; }
+  .stage-detail .close { position: absolute; top: 8px; right: 10px; cursor: pointer; color: var(--text-muted); background: none; border: none; font-size: 14px; }
+
+  /* Drawer — event feed */
+  .drawer-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .drawer-header h2 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }
+  #filter-pipeline { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 2px 8px; border-radius: 4px; font-size: 11px; }
+  .event-list { font-size: 12px; font-family: monospace; }
+  .event-row { padding: 3px 0; border-bottom: 1px solid var(--border); display: flex; gap: 12px; }
+  .event-row .task-id { color: var(--accent); min-width: 72px; }
+  .event-row .pipeline { color: var(--text-muted); min-width: 100px; }
+  .event-row .stage { min-width: 80px; }
+  .event-row .transition { min-width: 140px; }
+  .event-row .state-DONE { color: var(--green); }
+  .event-row .state-FAILED { color: var(--red); }
+  .event-row .state-progress { color: var(--gray); }
+  .event-row .ts { color: var(--text-muted); min-width: 80px; }
+  .event-row .duration { color: var(--text-muted); }
+
+  /* Agent health */
+  .agent-row { display: flex; align-items: center; gap: 12px; padding: 4px 0; font-size: 12px; }
+  .agent-badge { padding: 1px 6px; border-radius: 3px; font-size: 10px; }
+  .agent-badge.ok { background: rgba(74,222,128,0.15); color: var(--green); }
+  .agent-badge.error { background: rgba(248,113,113,0.15); color: var(--red); }
+
+  /* Login */
+  .login-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 100; }
+  .login-box { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; width: 360px; text-align: center; }
+  .login-box h2 { margin-bottom: 16px; font-size: 16px; }
+  .login-box input { width: 100%; padding: 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 13px; margin-bottom: 12px; }
+  .login-box button { width: 100%; padding: 10px; background: var(--accent); border: none; border-radius: 6px; color: #fff; font-size: 13px; cursor: pointer; }
+  .login-box .error { color: var(--red); font-size: 12px; margin-top: 8px; }
+
+  /* Hidden */
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="login-overlay" class="login-overlay hidden">
+  <div class="login-box">
+    <h2>Orcastrator</h2>
+    <p style="color:var(--text-muted);font-size:12px;margin-bottom:16px;">Enter your API key to access the dashboard</p>
+    <input id="login-key" type="password" placeholder="API Key" autocomplete="off">
+    <button id="login-btn">Sign In</button>
+    <div id="login-error" class="error hidden"></div>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+  <div class="topbar">
+    <h1>Orcastrator</h1>
+    <div class="health-summary">
+      <div id="health-agents"></div>
+      <span class="refresh-indicator" id="last-scrape"></span>
+      <span class="ws-status disconnected" id="ws-status">disconnected</span>
+    </div>
+    <button id="logout-btn">Logout</button>
+  </div>
+
+  <div class="sidebar">
+    <h2>Pipelines</h2>
+    <div id="pipeline-list"></div>
+    <h2 style="margin-top:16px;">Agent Health</h2>
+    <div id="agent-health"></div>
+  </div>
+
+  <div class="main">
+    <div id="topology"></div>
+    <div id="stage-detail" class="stage-detail hidden">
+      <button class="close" id="detail-close">&times;</button>
+      <h3 id="detail-title"></h3>
+      <dl id="detail-body"></dl>
+    </div>
+  </div>
+
+  <div class="drawer">
+    <div class="drawer-header">
+      <h2>Live Task Feed</h2>
+      <select id="filter-pipeline"><option value="">All pipelines</option></select>
+    </div>
+    <div class="event-list" id="event-list"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script>
+(function() {
+  'use strict';
+
+  const API_BASE = '';
+  let apiKey = null;
+  let pipelines = [];
+  let selectedPipeline = null;
+  let ws = null;
+  let wsBackoff = 1000;
+  let wsReconnectTimer = null;
+  let events = [];
+  const MAX_EVENTS = 500;
+  let healthInterval = null;
+  let queueInterval = null;
+  let dashboardActive = false;
+
+  // --- Auth ---
+
+  function getStoredKey() {
+    return sessionStorage.getItem('orcastrator_api_key');
+  }
+
+  function setStoredKey(key) {
+    sessionStorage.setItem('orcastrator_api_key', key);
+  }
+
+  function clearStoredKey() {
+    sessionStorage.removeItem('orcastrator_api_key');
+  }
+
+  function authHeaders() {
+    const h = {};
+    if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
+    return h;
+  }
+
+  async function apiFetch(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign(authHeaders(), opts.headers || {});
+    const resp = await fetch(API_BASE + path, opts);
+    // If the API returns 401, the key has been rotated or expired.
+    // Stop polling and show the login screen.
+    if (resp.status === 401 && dashboardActive) {
+      clearStoredKey();
+      apiKey = null;
+      showLogin();
+    }
+    return resp;
+  }
+
+  // --- Init ---
+
+  async function init() {
+    const stored = getStoredKey();
+    if (stored) apiKey = stored;
+
+    // Probe auth requirement
+    const resp = await fetch(API_BASE + '/v1/pipelines', { headers: authHeaders() });
+    if (resp.status === 401) {
+      if (!apiKey) {
+        showLogin();
+        return;
+      }
+      // stored key is invalid
+      clearStoredKey();
+      apiKey = null;
+      showLogin();
+      return;
+    }
+
+    // Auth not required or key is valid
+    showDashboard();
+  }
+
+  function stopDashboard() {
+    dashboardActive = false;
+    if (healthInterval) { clearInterval(healthInterval); healthInterval = null; }
+    if (queueInterval) { clearInterval(queueInterval); queueInterval = null; }
+    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+    if (ws) { try { ws.close(); } catch(e) {} ws = null; }
+  }
+
+  function showLogin() {
+    stopDashboard();
+    document.getElementById('login-overlay').classList.remove('hidden');
+    document.getElementById('app').classList.add('hidden');
+  }
+
+  function showDashboard() {
+    if (dashboardActive) return;
+    dashboardActive = true;
+    document.getElementById('login-overlay').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    loadPipelines();
+    loadHealth();
+    connectWS();
+    healthInterval = setInterval(loadHealth, 30000);
+    queueInterval = setInterval(updateQueueDepths, 5000);
+  }
+
+  // Login handler
+  document.getElementById('login-btn').addEventListener('click', async function() {
+    const key = document.getElementById('login-key').value.trim();
+    if (!key) return;
+    apiKey = key;
+    const resp = await fetch(API_BASE + '/v1/pipelines', { headers: authHeaders() });
+    if (resp.status === 401) {
+      document.getElementById('login-error').textContent = 'Invalid API key';
+      document.getElementById('login-error').classList.remove('hidden');
+      apiKey = null;
+      return;
+    }
+    setStoredKey(key);
+    showDashboard();
+  });
+
+  document.getElementById('login-key').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') document.getElementById('login-btn').click();
+  });
+
+  document.getElementById('logout-btn').addEventListener('click', function() {
+    clearStoredKey();
+    apiKey = null;
+    if (ws) ws.close();
+    location.reload();
+  });
+
+  // --- Pipelines ---
+
+  async function loadPipelines() {
+    const resp = await apiFetch('/v1/pipelines');
+    if (!resp.ok) return;
+    pipelines = await resp.json();
+    renderPipelineList();
+    populateFilterDropdown();
+    if (pipelines.length > 0 && !selectedPipeline) {
+      selectPipeline(pipelines[0].name);
+    }
+  }
+
+  function renderPipelineList() {
+    const el = document.getElementById('pipeline-list');
+    el.innerHTML = '';
+    pipelines.forEach(function(p) {
+      const div = document.createElement('div');
+      div.className = 'pipeline-item' + (selectedPipeline === p.name ? ' active' : '');
+      div.innerHTML = '<div>' + esc(p.name) + '</div><div class="stage-count">' + p.stages.length + ' stages</div>';
+      div.addEventListener('click', function() { selectPipeline(p.name); });
+      el.appendChild(div);
+    });
+  }
+
+  function selectPipeline(name) {
+    selectedPipeline = name;
+    renderPipelineList();
+    renderTopology();
+  }
+
+  function populateFilterDropdown() {
+    const sel = document.getElementById('filter-pipeline');
+    sel.innerHTML = '<option value="">All pipelines</option>';
+    pipelines.forEach(function(p) {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = p.name;
+      sel.appendChild(opt);
+    });
+  }
+
+  // --- Health ---
+
+  async function loadHealth() {
+    try {
+      const resp = await apiFetch('/v1/health');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      renderHealth(data);
+    } catch(e) { /* ignore */ }
+  }
+
+  function renderHealth(data) {
+    // Topbar summary
+    const sumEl = document.getElementById('health-agents');
+    const dot = '<span class="health-dot ' + (data.status === 'ok' ? 'ok' : 'degraded') + '"></span>';
+    sumEl.innerHTML = dot + data.status;
+    document.getElementById('last-scrape').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+    // Sidebar detail
+    const el = document.getElementById('agent-health');
+    el.innerHTML = '';
+    Object.keys(data.agents).sort().forEach(function(id) {
+      const status = data.agents[id];
+      const isOk = status === 'ok';
+      const div = document.createElement('div');
+      div.className = 'agent-row';
+      div.innerHTML = '<span>' + esc(id) + '</span><span class="agent-badge ' + (isOk ? 'ok' : 'error') + '">' +
+        (isOk ? 'ok' : esc(status.substring(0, 40))) + '</span>';
+      el.appendChild(div);
+    });
+  }
+
+  // --- Topology (D3) ---
+
+  function renderTopology() {
+    const container = document.getElementById('topology');
+    container.innerHTML = '';
+    if (!selectedPipeline) return;
+
+    const pipeline = pipelines.find(function(p) { return p.name === selectedPipeline; });
+    if (!pipeline) return;
+
+    const stages = pipeline.stages;
+    if (stages.length === 0) return;
+
+    const width = container.clientWidth || 800;
+    const height = container.clientHeight || 400;
+    const nodeW = 160, nodeH = 50;
+    const gapX = 60, gapY = 30;
+    const startX = 40, startY = 40;
+
+    // Build node positions (left-to-right flow)
+    const stageMap = {};
+    const nodes = stages.map(function(s, i) {
+      const cols = Math.max(1, Math.floor((width - startX) / (nodeW + gapX)));
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const node = {
+        id: s.id,
+        x: startX + col * (nodeW + gapX),
+        y: startY + row * (nodeH + gapY),
+        stage: s,
+        queueDepth: 0
+      };
+      stageMap[s.id] = node;
+      return node;
+    });
+
+    // Build edges
+    const edges = [];
+    stages.forEach(function(s) {
+      var targets = [];
+      if (typeof s.on_success === 'string') {
+        if (s.on_success !== 'done') targets.push({ target: s.on_success, type: 'success', label: '' });
+      } else if (s.on_success && s.on_success.routes) {
+        s.on_success.routes.forEach(function(r) {
+          targets.push({ target: r.stage, type: 'success', label: r.condition.length > 20 ? r.condition.substring(0, 20) + '…' : r.condition });
+        });
+        if (s.on_success.default && s.on_success.default !== 'done') {
+          targets.push({ target: s.on_success.default, type: 'success', label: 'default' });
+        }
+      }
+      if (s.on_failure && s.on_failure !== 'dead-letter') {
+        targets.push({ target: s.on_failure, type: 'failure', label: '' });
+      }
+      targets.forEach(function(t) {
+        if (stageMap[t.target]) {
+          edges.push({ source: s.id, target: t.target, type: t.type, label: t.label });
+        }
+      });
+    });
+
+    const svg = d3.select(container).append('svg')
+      .attr('viewBox', '0 0 ' + Math.max(width, startX + nodes.length * (nodeW + gapX)) + ' ' + Math.max(height, startY + Math.ceil(nodes.length / 3) * (nodeH + gapY) + nodeH));
+
+    // Arrowhead markers
+    svg.append('defs').selectAll('marker')
+      .data(['arrow', 'arrow-fail'])
+      .join('marker')
+        .attr('id', function(d) { return d; })
+        .attr('viewBox', '0 0 10 10')
+        .attr('refX', 10).attr('refY', 5)
+        .attr('markerWidth', 6).attr('markerHeight', 6)
+        .attr('orient', 'auto')
+      .append('path')
+        .attr('d', 'M 0 0 L 10 5 L 0 10 z')
+        .attr('fill', function(d) { return d === 'arrow-fail' ? 'var(--red)' : 'var(--border)'; });
+
+    // Edges
+    svg.selectAll('.edge').data(edges).join('path')
+      .attr('class', function(d) { return 'edge' + (d.type === 'failure' ? ' failure' : ''); })
+      .attr('marker-end', function(d) { return 'url(#' + (d.type === 'failure' ? 'arrow-fail' : 'arrow') + ')'; })
+      .attr('d', function(d) {
+        var s = stageMap[d.source], t = stageMap[d.target];
+        if (!s || !t) return '';
+        return 'M' + (s.x + nodeW) + ',' + (s.y + nodeH / 2) + ' L' + t.x + ',' + (t.y + nodeH / 2);
+      });
+
+    // Edge labels
+    svg.selectAll('.edge-label').data(edges.filter(function(d) { return d.label; })).join('text')
+      .attr('class', 'edge-label')
+      .attr('x', function(d) { var s = stageMap[d.source], t = stageMap[d.target]; return (s.x + nodeW + t.x) / 2; })
+      .attr('y', function(d) { var s = stageMap[d.source], t = stageMap[d.target]; return (s.y + t.y) / 2 + nodeH / 2 - 4; })
+      .attr('text-anchor', 'middle')
+      .text(function(d) { return d.label; });
+
+    // Nodes
+    var nodeGroup = svg.selectAll('.stage-node').data(nodes).join('g')
+      .attr('class', 'stage-node')
+      .attr('transform', function(d) { return 'translate(' + d.x + ',' + d.y + ')'; })
+      .style('cursor', 'pointer')
+      .on('click', function(ev, d) { showStageDetail(d.stage); });
+
+    nodeGroup.append('rect')
+      .attr('width', nodeW).attr('height', nodeH)
+      .attr('fill', 'var(--surface2)')
+      .attr('stroke', function(d) { return d.stage.fan_out ? 'var(--yellow)' : 'var(--accent)'; });
+
+    nodeGroup.append('text')
+      .attr('x', 10).attr('y', 22)
+      .text(function(d) { return d.id; });
+
+    // Agent/fan-out label
+    nodeGroup.append('text')
+      .attr('x', 10).attr('y', 38)
+      .attr('fill', 'var(--text-muted)')
+      .attr('font-size', '10px')
+      .text(function(d) {
+        if (d.stage.fan_out) return 'fan-out';
+        return d.stage.agent || '';
+      });
+
+    // Queue depth badge
+    nodeGroup.append('rect')
+      .attr('class', 'badge-bg')
+      .attr('x', nodeW - 28).attr('y', 4)
+      .attr('width', 24).attr('height', 16)
+      .attr('rx', 8)
+      .attr('fill', 'var(--accent)')
+      .attr('opacity', 0.2);
+
+    nodeGroup.append('text')
+      .attr('class', 'badge queue-badge')
+      .attr('x', nodeW - 16).attr('y', 15)
+      .attr('text-anchor', 'middle')
+      .attr('fill', 'var(--accent)')
+      .text('0');
+
+    window._stageMap = stageMap;
+    window._svg = svg;
+  }
+
+  function showStageDetail(stage) {
+    const el = document.getElementById('stage-detail');
+    document.getElementById('detail-title').textContent = stage.id;
+    const body = document.getElementById('detail-body');
+    var html = '';
+    html += '<dt>Agent</dt><dd>' + esc(stage.agent || (stage.fan_out ? 'fan-out' : 'n/a')) + '</dd>';
+    html += '<dt>Input Schema</dt><dd>' + esc(stage.input_schema.name + ' ' + stage.input_schema.version) + '</dd>';
+    html += '<dt>Output Schema</dt><dd>' + esc(stage.output_schema.name + ' ' + stage.output_schema.version) + '</dd>';
+    if (typeof stage.on_success === 'string') {
+      html += '<dt>On Success</dt><dd>' + esc(stage.on_success) + '</dd>';
+    } else if (stage.on_success && stage.on_success.routes) {
+      html += '<dt>On Success</dt><dd>conditional (' + stage.on_success.routes.length + ' routes)</dd>';
+    }
+    html += '<dt>On Failure</dt><dd>' + esc(stage.on_failure) + '</dd>';
+    body.innerHTML = html;
+    el.classList.remove('hidden');
+  }
+
+  document.getElementById('detail-close').addEventListener('click', function() {
+    document.getElementById('stage-detail').classList.add('hidden');
+  });
+
+  // --- Queue depth from /metrics ---
+
+  async function updateQueueDepths() {
+    if (!window._stageMap) return;
+    try {
+      const resp = await apiFetch('/metrics');
+      if (!resp.ok) return;
+      const text = await resp.text();
+      // Parse Prometheus text: orcastrator_stage_queue_depth{stage="...",pipeline="..."} N
+      const lines = text.split('\n');
+      lines.forEach(function(line) {
+        var m = line.match(/orcastrator_stage_queue_depth\{.*?stage="([^"]+)".*?\}\s+(\d+)/);
+        if (m) {
+          var stageId = m[1], depth = parseInt(m[2], 10);
+          if (window._stageMap[stageId]) {
+            window._stageMap[stageId].queueDepth = depth;
+          }
+        }
+      });
+      // Update badges
+      if (window._svg) {
+        window._svg.selectAll('.queue-badge').text(function(d) { return d.queueDepth; });
+      }
+    } catch(e) { /* metrics may not be available */ }
+  }
+
+  // --- WebSocket ---
+
+  function connectWS() {
+    if (ws) { try { ws.close(); } catch(e) {} }
+
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var url = proto + '//' + location.host + '/v1/stream';
+    if (apiKey) url += '?token=' + encodeURIComponent(apiKey);
+
+    ws = new WebSocket(url);
+    var statusEl = document.getElementById('ws-status');
+
+    ws.onopen = function() {
+      statusEl.className = 'ws-status connected';
+      statusEl.textContent = 'connected';
+      wsBackoff = 1000;
+    };
+
+    ws.onmessage = function(ev) {
+      try {
+        var data = JSON.parse(ev.data);
+        if (data.type === 'state_change') {
+          addEvent(data);
+        }
+      } catch(e) {}
+    };
+
+    ws.onclose = function() {
+      statusEl.className = 'ws-status reconnecting';
+      statusEl.textContent = 'reconnecting';
+      scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+      statusEl.className = 'ws-status disconnected';
+      statusEl.textContent = 'disconnected';
+    };
+  }
+
+  function scheduleReconnect() {
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(function() {
+      connectWS();
+      wsBackoff = Math.min(wsBackoff * 2, 30000);
+    }, wsBackoff);
+  }
+
+  // --- Event feed ---
+
+  function addEvent(data) {
+    events.unshift({
+      taskId: (data.task_id || '').substring(0, 8),
+      pipeline: data.pipeline_id || '',
+      stage: data.stage_id || '',
+      oldState: data.old_state || '',
+      newState: data.new_state || '',
+      timestamp: new Date(),
+    });
+    if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+    renderEvents();
+  }
+
+  function renderEvents() {
+    const filter = document.getElementById('filter-pipeline').value;
+    const el = document.getElementById('event-list');
+    const filtered = filter ? events.filter(function(e) { return e.pipeline === filter; }) : events;
+    el.innerHTML = filtered.slice(0, 100).map(function(e) {
+      var stateClass = e.newState === 'DONE' ? 'state-DONE' : e.newState === 'FAILED' ? 'state-FAILED' : 'state-progress';
+      return '<div class="event-row">' +
+        '<span class="task-id">' + esc(e.taskId) + '</span>' +
+        '<span class="pipeline">' + esc(e.pipeline) + '</span>' +
+        '<span class="stage">' + esc(e.stage) + '</span>' +
+        '<span class="transition ' + stateClass + '">' + esc(e.oldState) + ' → ' + esc(e.newState) + '</span>' +
+        '<span class="ts">' + e.timestamp.toLocaleTimeString() + '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  document.getElementById('filter-pipeline').addEventListener('change', renderEvents);
+
+  // --- Util ---
+
+  function esc(s) {
+    if (!s) return '';
+    var d = document.createElement('div');
+    d.appendChild(document.createTextNode(s));
+    return d.innerHTML;
+  }
+
+  // --- Boot ---
+  init();
+})();
+</script>
+</body>
+</html>

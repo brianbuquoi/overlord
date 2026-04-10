@@ -64,7 +64,7 @@ func testConfig() *config.Config {
 						OutputSchema: config.StageSchemaRef{
 							Name: "intake_output", Version: "v1",
 						},
-						OnSuccess: "done",
+						OnSuccess: config.StaticOnSuccess("done"),
 						OnFailure: "dead-letter",
 					},
 				},

@@ -82,7 +82,7 @@ func buildTestEnv(t *testing.T) (*config.Config, *memory.MemoryStore, map[string
 						OutputSchema: config.StageSchemaRef{Name: "out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 3, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},

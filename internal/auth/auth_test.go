@@ -271,20 +271,21 @@ func TestBruteForceTracker_ThresholdAndExpiry(t *testing.T) {
 	}
 }
 
-func TestBruteForceTracker_SuccessResets(t *testing.T) {
+func TestBruteForceTracker_SuccessDoesNotReset(t *testing.T) {
+	// SEC3-001: RecordSuccess is now a no-op. Failures accumulate regardless
+	// of intervening successes.
 	tracker := NewBruteForceTracker(3, time.Minute)
 
 	ip := "192.168.1.1"
 
 	tracker.RecordFailure(ip)
 	tracker.RecordFailure(ip)
-	tracker.RecordSuccess(ip)
+	tracker.RecordSuccess(ip) // no-op
 
-	// Should not be blocked after success reset.
+	// 2 failures accumulated, one more should block (threshold 3).
 	tracker.RecordFailure(ip)
-	tracker.RecordFailure(ip)
-	if tracker.IsBlocked(ip) {
-		t.Error("should not be blocked — success should have reset counter")
+	if !tracker.IsBlocked(ip) {
+		t.Error("should be blocked — RecordSuccess must not reset the counter (SEC3-001)")
 	}
 }
 
@@ -463,21 +464,12 @@ func TestBruteForce_IPCapFailOpen(t *testing.T) {
 
 // --- Test 1: RecordSuccess reset behaviour ---
 
-func TestBruteForce_RecordSuccessResetsMidAttack(t *testing.T) {
-	// Security test: verify that RecordSuccess fully resets the failure counter.
+func TestBruteForce_RecordSuccessNoResetMidAttack(t *testing.T) {
+	// SEC3-001 FIXED: RecordSuccess is now a no-op. Failures accumulate
+	// regardless of intervening successes.
 	//
-	// Scenario: attacker sends 8 failed attempts (below 10-attempt threshold),
-	// then one valid attempt, then continues with failed attempts.
-	//
-	// FINDING: RecordSuccess calls delete(t.failures, ip), which fully resets
-	// the counter to 0. This means the attacker gets a fresh window of 10
-	// more attempts after each valid authentication.
-	//
-	// SECURITY IMPLICATION: An attacker who possesses one valid credential
-	// can reset their own brute force window indefinitely by authenticating
-	// successfully every 9 attempts. This allows unlimited password guessing
-	// against other keys as long as they have one valid key.
-	// See KNOWN_GAPS.md SEC3-001 for tracking.
+	// Scenario: attacker sends 8 failed attempts, one valid attempt,
+	// then continues. The counter must NOT reset.
 
 	tracker := NewBruteForceTracker(10, time.Minute)
 	ip := "10.99.99.99"
@@ -490,22 +482,17 @@ func TestBruteForce_RecordSuccessResetsMidAttack(t *testing.T) {
 		t.Fatal("should not be blocked after 8 failures (threshold is 10)")
 	}
 
-	// One successful attempt — resets the counter.
+	// One successful attempt — no-op, does not reset counter.
 	tracker.RecordSuccess(ip)
 
-	// RecordSuccess deletes the entry entirely, so the counter resets to 0.
-	// Verify the attacker now has a full fresh window of 10 attempts.
-	for i := 0; i < 9; i++ {
-		tracker.RecordFailure(ip)
-		if tracker.IsBlocked(ip) {
-			t.Fatalf("blocked at attempt %d after reset — RecordSuccess should have given a fresh 10-attempt window", i+1)
-		}
+	// 2 more failures bring total to 10 → blocked.
+	tracker.RecordFailure(ip)
+	if tracker.IsBlocked(ip) {
+		t.Fatal("should not be blocked after 9 total failures")
 	}
-
-	// 10th failure after reset — NOW should be blocked.
 	tracker.RecordFailure(ip)
 	if !tracker.IsBlocked(ip) {
-		t.Error("should be blocked after 10 failures post-reset")
+		t.Error("should be blocked after 10 total failures (RecordSuccess must not reset)")
 	}
 }
 

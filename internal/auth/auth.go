@@ -337,9 +337,24 @@ func (t *BruteForceTracker) Cleanup() {
 	}
 }
 
-// RecordSuccess clears the failure counter for the given IP.
-func (t *BruteForceTracker) RecordSuccess(ip string) {
+// RecordSuccess is a no-op. It intentionally does NOT reset the failure
+// counter for the given IP. See SEC3-001: an attacker with one valid
+// credential could previously reset their brute force window indefinitely
+// by interleaving valid and invalid requests. Failures now expire naturally
+// via the sliding window.
+func (t *BruteForceTracker) RecordSuccess(_ string) {
+	// No-op: failures expire naturally via windowDuration.
+}
+
+// WindowEnd returns the time when the current failure window expires for an
+// IP, or the zero time if the IP has no active failures. Used to calculate
+// the Retry-After header on 429 responses.
+func (t *BruteForceTracker) WindowEnd(ip string) time.Time {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.failures, ip)
+	f, ok := t.failures[ip]
+	if !ok {
+		return time.Time{}
+	}
+	return f.windowEnd
 }

@@ -249,7 +249,12 @@ Remaining open items from security audits:
 - SEC-014: Token bucket cleanup goroutine leak (Low — open)
 - SEC2-003: cancel command TOCTOU race (Medium — open)
 - SEC2-005: Migration lacks live broker guard (Medium — open)
-- SEC3-001: RecordSuccess resets brute force window (Medium — open)
+- SEC3-001: RecordSuccess resets brute force window (Medium — resolved in v0.2.0)
+- SEC4-003: WebSocket lacks ping/pong keepalive (Medium — open)
+- SEC4-006: No config-level system_prompt size limit (Medium — open)
+- SEC4-007: Plugin paths not traversal-checked (Medium — open)
+- SEC4-008: Replay dead-letter TOCTOU race (Medium — open)
+- SEC4-010: IPv6 brute force tracking per /128 (Medium — open)
 
 KNOWN_GAPS.md also includes a **Deployment Hardening** section (SEC2-NEW-002)
 documenting that `/metrics` shares the API port and should be restricted at

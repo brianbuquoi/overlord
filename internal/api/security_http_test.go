@@ -302,3 +302,40 @@ func TestSecurity_HTTPAPICredentialLeakage(t *testing.T) {
 		t.Fatalf("SECURITY: credential canary found in store task data: %s", taskJSON)
 	}
 }
+
+// SEC4-001: Verify security headers on all API responses.
+func TestSecurity_ResponseHeaders(t *testing.T) {
+	srv, _, _ := newSecurityTestServer(t)
+	ts := httptest.NewServer(srv.routes())
+	defer ts.Close()
+
+	endpoints := []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/v1/health"},
+		{"GET", "/v1/tasks?limit=10"},
+		{"GET", "/v1/pipelines/"},
+	}
+
+	for _, ep := range endpoints {
+		t.Run(ep.method+" "+ep.path, func(t *testing.T) {
+			req, _ := http.NewRequest(ep.method, ts.URL+ep.path, nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+
+			if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want %q", got, "nosniff")
+			}
+			if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
+				t.Errorf("X-Frame-Options = %q, want %q", got, "DENY")
+			}
+			if got := resp.Header.Get("Referrer-Policy"); got != "no-referrer" {
+				t.Errorf("Referrer-Policy = %q, want %q", got, "no-referrer")
+			}
+		})
+	}
+}

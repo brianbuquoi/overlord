@@ -363,16 +363,21 @@ func TestPipelineStageTopology(t *testing.T) {
 		t.Fatal("pipeline 'code-review' not found")
 	}
 
-	if len(pipeline.Stages) != 3 {
-		t.Fatalf("expected 3 stages, got %d", len(pipeline.Stages))
+	if len(pipeline.Stages) != 5 {
+		t.Fatalf("expected 5 stages, got %d", len(pipeline.Stages))
 	}
 
-	expected := []struct {
-		id, onSuccess, onFailure string
-	}{
-		{"parse", "review", "dead-letter"},
-		{"review", "summarize", "dead-letter"},
-		{"summarize", "done", "dead-letter"},
+	type stageExpect struct {
+		id, onFailure string
+		isConditional bool
+		staticSuccess string
+	}
+	expected := []stageExpect{
+		{"parse", "dead-letter", false, "review"},
+		{"review", "dead-letter", false, "judge"},
+		{"judge", "dead-letter", true, ""},
+		{"escalate", "dead-letter", false, "done"},
+		{"implement", "dead-letter", false, "done"},
 	}
 
 	for i, want := range expected {
@@ -380,8 +385,11 @@ func TestPipelineStageTopology(t *testing.T) {
 		if got.ID != want.id {
 			t.Errorf("stage[%d]: id=%q, want %q", i, got.ID, want.id)
 		}
-		if got.OnSuccess != want.onSuccess {
-			t.Errorf("stage[%d] (%s): on_success=%q, want %q", i, want.id, got.OnSuccess, want.onSuccess)
+		if got.OnSuccess.IsConditional != want.isConditional {
+			t.Errorf("stage[%d] (%s): isConditional=%v, want %v", i, want.id, got.OnSuccess.IsConditional, want.isConditional)
+		}
+		if !want.isConditional && got.OnSuccess.Static != want.staticSuccess {
+			t.Errorf("stage[%d] (%s): on_success=%q, want %q", i, want.id, got.OnSuccess.Static, want.staticSuccess)
 		}
 		if got.OnFailure != want.onFailure {
 			t.Errorf("stage[%d] (%s): on_failure=%q, want %q", i, want.id, got.OnFailure, want.onFailure)
@@ -419,12 +427,16 @@ func buildCodeReviewBroker(t *testing.T, m *metrics.Metrics) (
 	mocks := map[string]*mockAgent{
 		"haiku-parse":     {id: "haiku-parse", provider: "mock"},
 		"sonnet-review":   {id: "sonnet-review", provider: "mock"},
-		"haiku-summarize": {id: "haiku-summarize", provider: "mock"},
+		"haiku-judge":     {id: "haiku-judge", provider: "mock"},
+		"sonnet-escalate": {id: "sonnet-escalate", provider: "mock"},
+		"haiku-implement": {id: "haiku-implement", provider: "mock"},
 	}
 	agents := map[string]broker.Agent{
 		"haiku-parse":     mocks["haiku-parse"],
 		"sonnet-review":   mocks["sonnet-review"],
-		"haiku-summarize": mocks["haiku-summarize"],
+		"haiku-judge":     mocks["haiku-judge"],
+		"sonnet-escalate": mocks["sonnet-escalate"],
+		"haiku-implement": mocks["haiku-implement"],
 	}
 
 	b := broker.New(cfg, st, agents, reg, logger, m, nil)
@@ -470,12 +482,16 @@ func buildCodeReviewBrokerWithRetryOverride(t *testing.T, m *metrics.Metrics, st
 	mocks := map[string]*mockAgent{
 		"haiku-parse":     {id: "haiku-parse", provider: "mock"},
 		"sonnet-review":   {id: "sonnet-review", provider: "mock"},
-		"haiku-summarize": {id: "haiku-summarize", provider: "mock"},
+		"haiku-judge":     {id: "haiku-judge", provider: "mock"},
+		"sonnet-escalate": {id: "sonnet-escalate", provider: "mock"},
+		"haiku-implement": {id: "haiku-implement", provider: "mock"},
 	}
 	agents := map[string]broker.Agent{
 		"haiku-parse":     mocks["haiku-parse"],
 		"sonnet-review":   mocks["sonnet-review"],
-		"haiku-summarize": mocks["haiku-summarize"],
+		"haiku-judge":     mocks["haiku-judge"],
+		"sonnet-escalate": mocks["sonnet-escalate"],
+		"haiku-implement": mocks["haiku-implement"],
 	}
 
 	b := broker.New(cfg, st, agents, reg, logger, m, nil)
@@ -520,19 +536,31 @@ var (
 		"overall_assessment": "request_changes"
 	}`)
 
-	validSummarizeOutput = json.RawMessage(`{
-		"executive_summary": "Critical security issues found: SQL injection and hardcoded credentials.",
+	validJudgeApproveOutput = json.RawMessage(`{
+		"assessment": "approve",
+		"critical_count": 0,
+		"summary": "No critical issues found. Code is safe to merge."
+	}`)
+
+	validJudgeRejectOutput = json.RawMessage(`{
+		"assessment": "request_changes",
 		"critical_count": 2,
-		"high_count": 0,
-		"action_required": true,
-		"top_recommendations": [
-			"Replace string interpolation with parameterized SQL queries",
-			"Move hardcoded admin token to environment variable"
-		]
+		"summary": "Critical security issues found that must be addressed."
+	}`)
+
+	validEscalateOutput = json.RawMessage(`{
+		"action": "escalate_to_security_team",
+		"escalated_to": "security-team",
+		"message": "Critical security findings require immediate attention."
+	}`)
+
+	validImplementOutput = json.RawMessage(`{
+		"changes_applied": ["Fixed SQL injection", "Removed hardcoded token"],
+		"status": "changes_suggested"
 	}`)
 )
 
-// setAllMockHandlers sets the standard happy-path handlers on all three mock agents.
+// setAllMockHandlers sets the standard happy-path handlers (approve flow).
 func setAllMockHandlers(mocks map[string]*mockAgent) {
 	mocks["haiku-parse"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
 		return &broker.TaskResult{Payload: validParseOutput}, nil
@@ -540,8 +568,14 @@ func setAllMockHandlers(mocks map[string]*mockAgent) {
 	mocks["sonnet-review"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
 		return &broker.TaskResult{Payload: validReviewOutput}, nil
 	})
-	mocks["haiku-summarize"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
-		return &broker.TaskResult{Payload: validSummarizeOutput}, nil
+	mocks["haiku-judge"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		return &broker.TaskResult{Payload: validJudgeApproveOutput}, nil
+	})
+	mocks["sonnet-escalate"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		return &broker.TaskResult{Payload: validEscalateOutput}, nil
+	})
+	mocks["haiku-implement"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		return &broker.TaskResult{Payload: validImplementOutput}, nil
 	})
 }
 
@@ -564,25 +598,20 @@ func TestMockedEndToEnd_HappyPath(t *testing.T) {
 
 	finalTask := waitForTaskState(t, st, task.ID, broker.TaskStateDone, 10*time.Second)
 
-	var summary struct {
-		ExecutiveSummary   string   `json:"executive_summary"`
-		CriticalCount      int      `json:"critical_count"`
-		HighCount          int      `json:"high_count"`
-		ActionRequired     bool     `json:"action_required"`
-		TopRecommendations []string `json:"top_recommendations"`
+	var judgeResult struct {
+		Assessment    string `json:"assessment"`
+		CriticalCount int    `json:"critical_count"`
+		Summary       string `json:"summary"`
 	}
-	if err := json.Unmarshal(finalTask.Payload, &summary); err != nil {
+	if err := json.Unmarshal(finalTask.Payload, &judgeResult); err != nil {
 		t.Fatalf("unmarshal final payload: %v", err)
 	}
 
-	if summary.ExecutiveSummary == "" {
-		t.Error("executive_summary should not be empty")
+	if judgeResult.Assessment != "approve" {
+		t.Errorf("expected assessment=approve, got %q", judgeResult.Assessment)
 	}
-	if summary.CriticalCount != 2 {
-		t.Errorf("expected critical_count=2, got %d", summary.CriticalCount)
-	}
-	if !summary.ActionRequired {
-		t.Error("expected action_required=true")
+	if judgeResult.CriticalCount != 0 {
+		t.Errorf("expected critical_count=0, got %d", judgeResult.CriticalCount)
 	}
 
 	// No sanitizer warnings expected from clean mock output.
@@ -622,17 +651,12 @@ func TestMockedEndToEnd_SecurityIssueDetection(t *testing.T) {
 		}`)}, nil
 	})
 
-	mocks["haiku-summarize"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
-		return &broker.TaskResult{Payload: json.RawMessage(`{
-			"executive_summary": "2 critical security vulnerabilities: SQL injection and hardcoded credentials.",
-			"critical_count": 2,
-			"high_count": 0,
-			"action_required": true,
-			"top_recommendations": [
-				"Replace string interpolation with parameterized SQL queries",
-				"Remove hardcoded admin token and use environment variables"
-			]
-		}`)}, nil
+	mocks["haiku-judge"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		return &broker.TaskResult{Payload: validJudgeRejectOutput}, nil
+	})
+
+	mocks["sonnet-escalate"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		return &broker.TaskResult{Payload: validEscalateOutput}, nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -646,19 +670,19 @@ func TestMockedEndToEnd_SecurityIssueDetection(t *testing.T) {
 
 	finalTask := waitForTaskState(t, st, task.ID, broker.TaskStateDone, 10*time.Second)
 
-	var summary struct {
-		CriticalCount  int  `json:"critical_count"`
-		ActionRequired bool `json:"action_required"`
+	var result struct {
+		Action  string `json:"action"`
+		Message string `json:"message"`
 	}
-	if err := json.Unmarshal(finalTask.Payload, &summary); err != nil {
+	if err := json.Unmarshal(finalTask.Payload, &result); err != nil {
 		t.Fatal(err)
 	}
 
-	if summary.CriticalCount == 0 {
-		t.Error("expected critical_count > 0 for planted SQL injection")
+	if result.Action == "" {
+		t.Error("expected escalation action for critical security findings")
 	}
-	if !summary.ActionRequired {
-		t.Error("expected action_required=true for security findings")
+	if result.Message == "" {
+		t.Error("expected escalation message for security findings")
 	}
 }
 
@@ -682,8 +706,8 @@ func TestMockedEndToEnd_SchemaViolation(t *testing.T) {
 		t.Error("review stage should not be reached after schema violation")
 		return nil, fmt.Errorf("should not be called")
 	})
-	mocks["haiku-summarize"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
-		t.Error("summarize stage should not be reached after schema violation")
+	mocks["haiku-judge"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		t.Error("judge stage should not be reached after schema violation")
 		return nil, fmt.Errorf("should not be called")
 	})
 
@@ -737,8 +761,8 @@ func TestMockedEndToEnd_RetryBehavior(t *testing.T) {
 		return &broker.TaskResult{Payload: validReviewOutput}, nil
 	})
 
-	mocks["haiku-summarize"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
-		return &broker.TaskResult{Payload: validSummarizeOutput}, nil
+	mocks["haiku-judge"].setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		return &broker.TaskResult{Payload: validJudgeApproveOutput}, nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

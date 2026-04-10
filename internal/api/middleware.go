@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/orcastrator/orcastrator/internal/auth"
@@ -53,6 +56,17 @@ func rateLimitMiddleware(limiter *tokenBucket, exempt ...string) func(http.Handl
 	}
 }
 
+// securityHeaders sets standard security response headers on every response.
+// SEC4-001: Prevents MIME-type sniffing, clickjacking, and referrer leakage.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // clientIP extracts the client IP from the request, stripping the port.
 //
 // Security: X-Forwarded-For is NOT trusted because it can be trivially spoofed
@@ -86,6 +100,13 @@ func AuthKeyFromContext(ctx context.Context) *auth.APIKey {
 // authMiddleware returns middleware that enforces Bearer token authentication
 // with scope checking and brute force protection. The required scope is
 // determined per-request by the scopeFn callback.
+//
+// For WebSocket upgrade requests, the Authorization header is preferred but
+// a ?token= query parameter is also accepted as a fallback. Browsers cannot
+// set custom headers on WebSocket connections, so the query parameter is the
+// only mechanism available to browser-based clients. The token is NOT logged
+// and callers should use wss:// in production to keep the URL off the wire
+// in cleartext.
 func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger *slog.Logger, scopeFn func(r *http.Request) auth.Scope) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,7 +114,13 @@ func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger 
 
 			// Brute force protection: reject if IP is blocked.
 			if tracker.IsBlocked(ip) {
-				w.Header().Set("Retry-After", "60")
+				windowEnd := tracker.WindowEnd(ip)
+				retryAfter := int(math.Ceil(time.Until(windowEnd).Seconds()))
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+				w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", windowEnd.Unix()))
 				writeError(w, http.StatusTooManyRequests, "too many authentication failures", "AUTH_RATE_LIMITED")
 				logger.Warn("auth rate limited",
 					"ip", ip,
@@ -104,7 +131,14 @@ func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger 
 			}
 
 			// Extract Bearer token from Authorization header.
+			// For WebSocket upgrades, fall back to ?token= query parameter
+			// since browsers cannot set headers on WebSocket connections.
 			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" && isWebSocketUpgrade(r) {
+				if qToken := r.URL.Query().Get("token"); qToken != "" {
+					authHeader = "Bearer " + qToken
+				}
+			}
 			if authHeader == "" {
 				tracker.RecordFailure(ip)
 				w.Header().Set("WWW-Authenticate", "Bearer")
@@ -160,7 +194,8 @@ func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger 
 				return
 			}
 
-			tracker.RecordSuccess(ip)
+			// SEC3-001: RecordSuccess is a no-op — do not call it.
+			// Failures expire naturally via the sliding window.
 
 			// Attach key to context for downstream handlers.
 			ctx := context.WithValue(r.Context(), authKeyContextKey, key)
@@ -169,9 +204,21 @@ func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger 
 	}
 }
 
+// isWebSocketUpgrade returns true if the request is a WebSocket upgrade.
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
 // endpointScope returns the required scope for a given request based on
 // method and path.
 func endpointScope(r *http.Request) auth.Scope {
+	path := r.URL.Path
+
+	// replay-all and discard-all require admin scope.
+	if path == "/v1/dead-letter/replay-all" || path == "/v1/dead-letter/discard-all" {
+		return auth.ScopeAdmin
+	}
+
 	if r.Method == http.MethodPost {
 		return auth.ScopeWrite
 	}

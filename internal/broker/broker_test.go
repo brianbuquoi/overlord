@@ -124,7 +124,7 @@ func buildTestEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "s1_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 3, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "stage2",
+						OnSuccess:    config.StaticOnSuccess("stage2"),
 						OnFailure:    "dead-letter",
 					},
 					{
@@ -134,7 +134,7 @@ func buildTestEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "s2_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 2, Backoff: "linear", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "stage3",
+						OnSuccess:    config.StaticOnSuccess("stage3"),
 						OnFailure:    "dead-letter",
 					},
 					{
@@ -144,7 +144,7 @@ func buildTestEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "s3_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
@@ -586,7 +586,7 @@ func buildLoopbackEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "data", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "validate",
+						OnSuccess:    config.StaticOnSuccess("validate"),
 						OnFailure:    "dead-letter",
 					},
 					{
@@ -596,7 +596,7 @@ func buildLoopbackEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "result", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "process", // loopback
 					},
 				},
@@ -662,7 +662,7 @@ func buildTwoPipelineEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "io_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
@@ -679,7 +679,7 @@ func buildTwoPipelineEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "io_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
@@ -1426,7 +1426,7 @@ func buildTwoStageEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "s1_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "stage2",
+						OnSuccess:    config.StaticOnSuccess("stage2"),
 						OnFailure:    "dead-letter",
 					},
 					{
@@ -1436,7 +1436,7 @@ func buildTwoStageEnv(t *testing.T) (
 						OutputSchema: config.StageSchemaRef{Name: "s2_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
@@ -1521,7 +1521,7 @@ func TestReloadAddsNewStageWorkers(t *testing.T) {
 						OutputSchema: config.StageSchemaRef{Name: "s2_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "stage3", // now routes to stage3
+						OnSuccess:    config.StaticOnSuccess("stage3"), // now routes to stage3
 						OnFailure:    "dead-letter",
 					},
 					{
@@ -1531,7 +1531,7 @@ func TestReloadAddsNewStageWorkers(t *testing.T) {
 						OutputSchema: config.StageSchemaRef{Name: "s3_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
@@ -1599,7 +1599,7 @@ func TestReloadRemovesStageWorkers(t *testing.T) {
 		config.SchemaEntry{Name: "s3_in", Version: "v1", Path: s3in},
 		config.SchemaEntry{Name: "s3_out", Version: "v1", Path: s3out},
 	)
-	cfg.Pipelines[0].Stages[1].OnSuccess = "stage3"
+	cfg.Pipelines[0].Stages[1].OnSuccess = config.StaticOnSuccess("stage3")
 	cfg.Pipelines[0].Stages = append(cfg.Pipelines[0].Stages, config.Stage{
 		ID:           "stage3",
 		Agent:        "agent3",
@@ -1607,7 +1607,7 @@ func TestReloadRemovesStageWorkers(t *testing.T) {
 		OutputSchema: config.StageSchemaRef{Name: "s3_out", Version: "v1"},
 		Timeout:      config.Duration{Duration: 5 * time.Second},
 		Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-		OnSuccess:    "done",
+		OnSuccess:    config.StaticOnSuccess("done"),
 		OnFailure:    "dead-letter",
 	})
 	cfg.Agents = append(cfg.Agents, config.Agent{ID: "agent3", Provider: "mock", SystemPrompt: "Stage 3 prompt"})
@@ -1670,7 +1670,7 @@ func TestReloadRemovesStageWorkers(t *testing.T) {
 						OutputSchema: config.StageSchemaRef{Name: "s2_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
@@ -1774,7 +1774,7 @@ func TestReloadRemovedStageDrainsInFlight(t *testing.T) {
 						OutputSchema: config.StageSchemaRef{Name: "s1_out", Version: "v1"},
 						Timeout:      config.Duration{Duration: 5 * time.Second},
 						Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-						OnSuccess:    "done",
+						OnSuccess:    config.StaticOnSuccess("done"),
 						OnFailure:    "dead-letter",
 					},
 				},
