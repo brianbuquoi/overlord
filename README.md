@@ -124,6 +124,8 @@ Key top-level blocks:
 | `agents` | LLM provider bindings with model, auth, and prompt config |
 | `stores` | Backend configuration for memory, Redis, or Postgres |
 | `auth` | API key authentication (disabled by default) |
+| `dashboard` | Web UI configuration (enabled by default) |
+| `plugins` | Custom provider adapter loading from .so files |
 
 ### Fan-out stages
 
@@ -193,6 +195,148 @@ hardcoded in YAML. Keys must be 72 bytes or fewer (bcrypt limit).
 | `write` | All read + task submission, dead-letter replay/discard |
 | `admin` | All write + bulk dead-letter operations |
 
+### Conditional routing
+
+Route tasks to different next stages based on field values in the
+agent's output. Conditions are evaluated in order — first match wins.
+A default is required and used when no condition matches.
+
+```yaml
+stages:
+  - id: judge
+    agent: judge-claude
+    input_schema:  { name: judge_input,  version: "v1" }
+    output_schema: { name: judge_output, version: "v1" }
+    on_success:
+      routes:
+        - condition: 'output.assessment == "approve"'
+          stage: done
+        - condition: 'output.critical_count > 0'
+          stage: escalate
+        - condition: 'output.assessment == "request_changes"'
+          stage: implement
+      default: done
+    on_failure: dead-letter
+```
+
+Supported operators: `==`, `!=`, `>`, `>=`, `<`, `<=`, `contains`.
+Field paths use dot notation (`output.findings[0].severity`).
+Missing fields evaluate to false. `on_failure` routing remains
+unconditional — conditions apply to `on_success` only.
+
+### Pipeline dashboard
+
+Orcastrator serves a built-in web dashboard at `/dashboard`. No
+separate build step or frontend tooling required — the dashboard
+is embedded in the binary.
+
+The dashboard shows:
+- Live pipeline topology with stage nodes and routing edges
+- Per-stage queue depth badges updated every 5 seconds
+- Real-time task event feed via WebSocket
+- Agent health status polled every 30 seconds
+
+Enable or disable via config:
+
+```yaml
+dashboard:
+  enabled: true    # default: true
+  path: /dashboard # default: /dashboard
+```
+
+When auth is enabled, the dashboard shows a login prompt on first
+load and stores the API key in `sessionStorage` (cleared on tab close).
+The `/dashboard` route itself is exempt from auth middleware — only
+the API calls the dashboard makes are protected.
+
+### Retry budgets
+
+Limit total retry attempts within a sliding time window at the
+pipeline or agent level. When a budget is exhausted, tasks route
+to `on_failure` immediately rather than being re-enqueued.
+
+```yaml
+pipelines:
+  - name: code-review
+    retry_budget:
+      max_retries: 100
+      window: 1h
+      on_exhausted: fail   # fail | wait
+
+agents:
+  - id: reviewer-claude
+    retry_budget:
+      max_retries: 50
+      window: 1h
+      on_exhausted: fail
+```
+
+`on_exhausted: wait` holds the task until the budget window refills
+(up to the task timeout) rather than failing immediately.
+Budget counters are stored in the state store so they work correctly
+in multi-instance deployments.
+
+### Dead letter queue management
+
+Inspect, replay, and discard dead-lettered tasks via the CLI and API.
+
+```bash
+# List dead-lettered tasks
+orcastrator dead-letter list --config pipeline.yaml
+
+# Replay a single task (re-enqueues with fresh attempt count)
+orcastrator dead-letter replay --config pipeline.yaml --task <id>
+
+# Replay all dead-lettered tasks for a pipeline
+orcastrator dead-letter replay-all --config pipeline.yaml --pipeline <id>
+
+# Discard (permanently marks as DISCARDED, keeps record for audit)
+orcastrator dead-letter discard --config pipeline.yaml --task <id>
+orcastrator dead-letter discard-all --config pipeline.yaml --pipeline <id>
+```
+
+Replay creates a new task with the original payload and a fresh
+attempt count — the original dead-lettered task is preserved.
+Discarded tasks are excluded from `GET /v1/tasks` by default
+(`?include_discarded=true` to include them).
+
+API endpoints: `GET /v1/dead-letter`, `POST /v1/dead-letter/{id}/replay`,
+`POST /v1/dead-letter/{id}/discard`, and bulk variants.
+Bulk operations require `admin` scope.
+
+### Plugin system
+
+Add custom LLM provider adapters without forking Orcastrator. Plugins
+are Go shared libraries (`.so` files) that export a single `Plugin`
+symbol implementing the `orcastrator.AgentPlugin` interface.
+
+```yaml
+plugins:
+  dir: ./plugins          # scan directory for .so files
+  # or list specific files:
+  files:
+    - ./plugins/myprovider.so
+
+agents:
+  - id: my-custom-agent
+    provider: myprovider  # matches ProviderName() from the plugin
+    model: custom-v1
+    auth: { api_key_env: MY_PROVIDER_KEY }
+    extra:
+      custom_option: value  # passed to PluginAgentConfig.Extra
+```
+
+Plugins run in the same process with the same privileges as Orcastrator.
+Only load plugins from trusted sources. See [SECURITY.md](SECURITY.md)
+for the plugin trust model.
+
+Plugin development: implement `orcastrator.AgentPlugin` from
+`pkg/plugin/`, compile with `go build -buildmode=plugin`, and drop
+the `.so` in the plugins directory. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for full instructions.
+
+Note: Go's plugin package requires Linux or macOS with CGO enabled.
+
 ## Supported LLM providers
 
 | Provider | Models | Auth | Status |
@@ -202,6 +346,9 @@ hardcoded in YAML. Keys must be 72 bytes or fewer (bcrypt limit).
 | Google Gemini | Gemini Pro, Flash | `GEMINI_API_KEY` env var | Stable |
 | Ollama | Any model via Ollama REST API | None (local) | Stable |
 | GitHub Copilot | — | — | Stub (waiting for public API) |
+
+> Custom providers can be added via the plugin system without forking
+> Orcastrator. See [Plugin system](#plugin-system) above.
 
 ## Deployment
 
@@ -227,29 +374,22 @@ make example-code-review
 
 ## Roadmap
 
-The following features are planned for future releases. Build prompts
-for each are available in `.claude/prompts/build/` for contributors
-using Claude Code.
+The following improvements are being tracked for future releases.
+See [KNOWN_GAPS.md](KNOWN_GAPS.md) for a full list of known
+limitations and their current status.
 
-- **Conditional routing** — Route tasks to different next stages
-  based on field values in the agent's output. Supports ==, !=, >,
-  >=, <, <=, and contains operators against output payload fields.
-
-- **Pipeline dashboard** — Single-page web UI served by Orcastrator,
-  showing live pipeline topology, per-stage queue depths, task event
-  feed, and agent health status. No separate build step required.
-
-- **Retry budgets** — Pipeline-level and agent-level caps on total
-  retry attempts within a sliding time window. Prevents runaway API
-  consumption from a single bad task.
-
-- **Dead letter queue management** — Inspect, replay, and discard
-  dead-lettered tasks via the CLI and API. Includes bulk replay and
-  discard with confirmation prompts.
-
-- **Plugin system** — Load custom LLM provider adapters as Go shared
-  libraries without forking Orcastrator. Drop a .so file in the
-  plugins directory and reference the provider name in YAML.
+- **Authentication improvements** — Token revocation without restart,
+  per-pipeline key scoping, and OAuth/OIDC integration.
+- **Horizontal scaling improvements** — EventBus federation across
+  instances so WebSocket clients receive events regardless of which
+  instance processed the task.
+- **Metrics port separation** — Serve `/metrics` on a dedicated port
+  to simplify network-level access control in production.
+- **Redis ListTasks optimisation** — Replace SCAN-based listing with
+  a sorted set index for O(log N) pagination at scale.
+- **Hot-reload topology changes** — Currently, adding or removing
+  stages requires a restart. Full topology changes via SIGHUP are
+  planned.
 
 ## Security
 
