@@ -4,11 +4,50 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/brianbuquoi/orcastrator/internal/broker"
 )
+
+// ParseJSONObjectOutput validates that an LLM adapter's extracted text output
+// is a JSON object, stripping a single pair of surrounding markdown code fences
+// if present. On success it returns the raw JSON bytes ready to be stored in
+// TaskResult.Payload. On failure it returns a descriptive error — callers wrap
+// it as a non-retryable AgentError so the broker routes the task to failure.
+//
+// The broker validates task payloads against JSONSchema output schemas, which
+// require an object at the root. Rejecting non-object output here gives a
+// clear provider-level error instead of a generic contract violation.
+func ParseJSONObjectOutput(text string) (json.RawMessage, error) {
+	cleaned := strings.TrimSpace(text)
+	if cleaned == "" {
+		return nil, fmt.Errorf("model output is empty")
+	}
+	if strings.HasPrefix(cleaned, "```") {
+		if idx := strings.Index(cleaned, "\n"); idx != -1 {
+			cleaned = cleaned[idx+1:]
+		}
+		if idx := strings.LastIndex(cleaned, "```"); idx != -1 {
+			cleaned = cleaned[:idx]
+		}
+		cleaned = strings.TrimSpace(cleaned)
+	}
+	if cleaned == "" {
+		return nil, fmt.Errorf("model output is empty after stripping code fences")
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(cleaned), &obj); err != nil {
+		raw := text
+		if len(raw) > 200 {
+			raw = raw[:200]
+		}
+		return nil, fmt.Errorf("model output is not a valid JSON object: %v (raw: %s)", err, raw)
+	}
+	return json.RawMessage(cleaned), nil
+}
 
 // Agent is the interface every LLM provider adapter implements.
 type Agent interface {

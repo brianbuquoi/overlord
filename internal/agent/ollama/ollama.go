@@ -215,11 +215,9 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		a.metrics.AgentTokensTotal.WithLabelValues(providerName, a.cfg.Model, "output").Add(float64(result.EvalCount))
 	}
 
-	var payload json.RawMessage
-	if json.Valid([]byte(output)) {
-		payload = json.RawMessage(output)
-	} else {
-		payload = json.RawMessage(fmt.Sprintf("%q", output))
+	payload, parseErr := agent.ParseJSONObjectOutput(output)
+	if parseErr != nil {
+		return nil, a.nonRetryableErr(parseErr)
 	}
 
 	return &broker.TaskResult{

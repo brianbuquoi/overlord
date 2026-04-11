@@ -68,7 +68,7 @@ func mustAgentError(t *testing.T, err error) *agent.AgentError {
 
 func successResponse() chatResponse {
 	return chatResponse{
-		Message:         chatMessage{Role: "assistant", Content: "Hello back!"},
+		Message:         chatMessage{Role: "assistant", Content: `{"reply": "Hello back!"}`},
 		PromptEvalCount: 10,
 		EvalCount:       5,
 	}
@@ -109,12 +109,12 @@ func TestExecute_Success(t *testing.T) {
 		t.Errorf("unexpected task ID: %s", result.TaskID)
 	}
 
-	var output string
+	var output map[string]any
 	if err := json.Unmarshal(result.Payload, &output); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
-	if output != "Hello back!" {
-		t.Errorf("unexpected output: %s", output)
+	if output["reply"] != "Hello back!" {
+		t.Errorf("unexpected output: %v", output)
 	}
 	if result.Metadata["input_tokens"] != 10 {
 		t.Errorf("unexpected input_tokens: %v", result.Metadata["input_tokens"])
@@ -282,7 +282,7 @@ func TestExecute_TokenLogging(t *testing.T) {
 func TestExecute_TokenLogging_ZeroWhenOmitted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(chatResponse{
-			Message: chatMessage{Role: "assistant", Content: "ok"},
+			Message: chatMessage{Role: "assistant", Content: `{"ok": true}`},
 			// Token counts intentionally omitted — zero values.
 		})
 	}))
@@ -673,5 +673,100 @@ func TestNew_EndpointPrecedence_DefaultFallback(t *testing.T) {
 
 	if a.cfg.Endpoint != "http://localhost:11434" {
 		t.Errorf("should fall back to default endpoint.\nwant: http://localhost:11434\ngot:  %s", a.cfg.Endpoint)
+	}
+}
+
+// --- JSON output parsing ---
+
+func jsonTextResponse(text string) chatResponse {
+	return chatResponse{
+		Message:         chatMessage{Role: "assistant", Content: text},
+		PromptEvalCount: 1,
+		EvalCount:       1,
+	}
+}
+
+func TestExecute_JSONOutput_ValidObject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(jsonTextResponse(`{"approved": false, "summary": "test"}`))
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	result, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(result.Payload, &out); err != nil {
+		t.Fatalf("payload is not a JSON object: %v", err)
+	}
+	if out["approved"] != false || out["summary"] != "test" {
+		t.Errorf("unexpected output: %v", out)
+	}
+}
+
+func TestExecute_JSONOutput_MarkdownFenced(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(jsonTextResponse("```json\n{\"key\": \"value\"}\n```"))
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	result, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(result.Payload, &out); err != nil {
+		t.Fatalf("payload is not a JSON object: %v", err)
+	}
+	if out["key"] != "value" {
+		t.Errorf("key: want value, got %v", out["key"])
+	}
+}
+
+func TestExecute_JSONOutput_PlainText_Rejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(jsonTextResponse("This is the review"))
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	_, err := a.Execute(context.Background(), testTask())
+	ae := mustAgentError(t, err)
+	if ae.Retryable {
+		t.Error("plain-text output must be non-retryable")
+	}
+	if !strings.Contains(ae.Error(), "JSON") && !strings.Contains(ae.Error(), "json") {
+		t.Errorf("error should mention JSON, got: %s", ae.Error())
+	}
+}
+
+func TestExecute_JSONOutput_Empty_Rejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(jsonTextResponse(""))
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	_, err := a.Execute(context.Background(), testTask())
+	ae := mustAgentError(t, err)
+	if ae.Retryable {
+		t.Error("empty output must be non-retryable")
+	}
+}
+
+func TestExecute_JSONOutput_Array_Rejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(jsonTextResponse("[1, 2, 3]"))
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	_, err := a.Execute(context.Background(), testTask())
+	ae := mustAgentError(t, err)
+	if ae.Retryable {
+		t.Error("array output must be non-retryable (must be an object)")
 	}
 }
