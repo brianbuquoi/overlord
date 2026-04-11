@@ -35,14 +35,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.2.2] - 2026-04-11
 
 ### Fixed
-- All LLM adapters now parse model response text as JSON before
-  setting TaskResult.Output. Previously, adapters passed the raw
-  text string directly, causing every task to fail contract
-  validation with "got string, want object". Adapters now return
-  a non-retryable error if the model response is not valid JSON.
-- Adapters strip markdown code fences (```json ... ```) from model
-  responses before JSON parsing, since models sometimes wrap valid
-  JSON in fences despite instructions not to.
+- Correct Go module path from `github.com/orcastrator/orcastrator` to
+  `github.com/brianbuquoi/orcastrator` — `go install` was failing with
+  a module path conflict
+- All LLM adapters now parse model response text as JSON before setting
+  TaskResult.Output. Previously adapters passed the raw text string
+  directly, causing every task to fail contract validation with
+  "got string, want object". Adapters also strip markdown code fences
+  before parsing.
+- Rate limiter tests hardened with clock injection — replaced
+  timing-dependent burst exhaustion tests with frozen-clock approach,
+  eliminating ~1/20 flake rate on loaded CI runners
+
+### Changed
+- tokenBucket now accepts an optional clock function (default time.Now)
+  for deterministic testing
 
 ## [0.2.1] - 2026-04-10
 ### Added
