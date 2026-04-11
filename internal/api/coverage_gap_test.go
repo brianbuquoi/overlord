@@ -609,6 +609,9 @@ func TestRateLimiter_MetricsExempt(t *testing.T) {
 	defer srv.Shutdown(context.Background())
 	handler := srv.Handler()
 
+	frozen := time.Now()
+	srv.limiter.now = func() time.Time { return frozen }
+
 	// Exhaust rate limit from a single IP.
 	for i := 0; i < 101; i++ {
 		req := httptest.NewRequest("GET", "/v1/health", nil)

@@ -742,6 +742,12 @@ func TestRateLimiter_TokenBucket_Correctness(t *testing.T) {
 	srv, _ := newTestServer(t)
 	defer srv.Shutdown(context.Background())
 
+	// Freeze the clock so the burst exhausts deterministically (no partial
+	// refill between the 100 requests). We advance the clock manually below
+	// to exercise the refill path.
+	frozen := time.Now()
+	srv.limiter.now = func() time.Time { return frozen }
+
 	ip := "10.0.0.99:12345"
 
 	// Send 100 requests — all should succeed.
@@ -771,8 +777,9 @@ func TestRateLimiter_TokenBucket_Correctness(t *testing.T) {
 		t.Fatal("expected Retry-After header on 429 response")
 	}
 
-	// Wait 1 second for token refill (100 tokens/sec rate).
-	time.Sleep(1100 * time.Millisecond)
+	// Advance the frozen clock 1.1s instead of sleeping — deterministic refill.
+	frozen = frozen.Add(1100 * time.Millisecond)
+	srv.limiter.now = func() time.Time { return frozen }
 
 	// Should now be allowed again.
 	req = httptest.NewRequest(http.MethodGet, "/v1/health", nil)
@@ -792,6 +799,9 @@ func TestRateLimiter_TokenBucket_Correctness(t *testing.T) {
 func TestRateLimiter_PerIPIsolation(t *testing.T) {
 	srv, _ := newTestServer(t)
 	defer srv.Shutdown(context.Background())
+
+	frozen := time.Now()
+	srv.limiter.now = func() time.Time { return frozen }
 
 	// Exhaust the bucket for IP 10.0.0.1.
 	for i := 0; i < 100; i++ {

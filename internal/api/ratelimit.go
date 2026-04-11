@@ -12,6 +12,7 @@ type tokenBucket struct {
 	rate    float64       // tokens per second
 	burst   int           // max tokens (bucket capacity)
 	cleanup time.Duration // how often to sweep stale buckets
+	now     func() time.Time
 }
 
 type bucket struct {
@@ -25,6 +26,7 @@ func newTokenBucket(rate float64, burst int) *tokenBucket {
 		rate:    rate,
 		burst:   burst,
 		cleanup: 5 * time.Minute,
+		now:     time.Now,
 	}
 	go tb.cleanupLoop()
 	return tb
@@ -35,7 +37,7 @@ func (tb *tokenBucket) allow(key string) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	now := time.Now()
+	now := tb.now()
 	b, ok := tb.buckets[key]
 	if !ok {
 		b = &bucket{tokens: float64(tb.burst), lastSeen: now}

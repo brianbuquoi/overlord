@@ -388,9 +388,17 @@ func TestErrorResponse_Format(t *testing.T) {
 
 // --- Rate limiter ---
 
+// Clock injection (Option A): freeze the token bucket's clock so no refill
+// can occur between requests. Without this, under CI load the ~tens of ms
+// needed to drive 101 HTTP round-trips is enough for partial refill at
+// 100 tokens/sec, letting the 101st request slip through as 200 instead
+// of 429. See ratelimit.go tokenBucket.now.
 func TestRateLimiter_BlocksAfterBurst(t *testing.T) {
 	srv, _ := newTestServer(t)
 	defer srv.Shutdown(context.Background())
+
+	frozen := time.Now()
+	srv.limiter.now = func() time.Time { return frozen }
 
 	// Exhaust the burst (100 requests).
 	for i := 0; i < 100; i++ {
