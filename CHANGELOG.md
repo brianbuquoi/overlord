@@ -38,18 +38,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Correct Go module path from `github.com/orcastrator/orcastrator` to
   `github.com/brianbuquoi/orcastrator` — `go install` was failing with
   a module path conflict
-- All LLM adapters now parse model response text as JSON before setting
-  TaskResult.Output. Previously adapters passed the raw text string
-  directly, causing every task to fail contract validation with
-  "got string, want object". Adapters also strip markdown code fences
-  before parsing.
-- Rate limiter tests hardened with clock injection — replaced
-  timing-dependent burst exhaustion tests with frozen-clock approach,
-  eliminating ~1/20 flake rate on loaded CI runners
+- All LLM adapters (Anthropic, OpenAI, Gemini, Ollama) now parse model
+  response text as JSON before setting TaskResult.Output. Previously
+  adapters passed the raw text string directly, causing every task to
+  fail contract validation with "got string, want object". Adapters also
+  strip markdown code fences before parsing. JSON parse errors are
+  retryable so the retry policy fires on occasional malformed responses.
+- Broker no longer overwrites task.Payload with the envelope prompt
+  before calling agent.Execute. Agents were receiving their own system
+  prompt as the user message with no input data, causing models to
+  respond "I'm ready to review code. Please provide the JSON object".
+  Task struct now carries a separate Prompt field for the envelope result.
 
 ### Changed
 - tokenBucket now accepts an optional clock function (default time.Now)
-  for deterministic testing
+  for deterministic testing, eliminating timing-dependent test flakiness
 
 ## [0.2.1] - 2026-04-10
 ### Added
