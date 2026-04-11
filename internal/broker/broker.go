@@ -530,6 +530,12 @@ func (b *Broker) processTask(ctx context.Context, pipelineID string, stage *conf
 		b.logger.Warn("sanitizer warnings",
 			"task_id", task.ID, "stage", stage.ID, "count", len(warnings),
 		)
+		b.logger.Debug("sanitizer redacted content",
+			"task_id", task.ID,
+			"stage", stage.ID,
+			"warning_count", len(warnings),
+			"patterns_matched", warningPatterns(warnings),
+		)
 		b.mergeMetadata(ctx, task, map[string]any{
 			"sanitizer_warnings": sanitize.WarningsToJSON(warnings),
 		})
@@ -558,6 +564,15 @@ func (b *Broker) processTask(ctx context.Context, pipelineID string, stage *conf
 	} else {
 		prompt = sanitize.Wrap(agentCfg.SystemPrompt, sanitizedOutput)
 	}
+
+	b.logger.Debug("envelope built",
+		"task_id", task.ID,
+		"stage", stage.ID,
+		"is_first_stage", isFirstStage,
+		"prior_output_length", len(sanitizedOutput),
+		"prompt_length", len(prompt),
+		"sanitizer_warnings", len(warnings),
+	)
 
 	// --- Execute agent ---
 	b.transition(ctx, task, TaskStateExecuting)
@@ -1197,6 +1212,20 @@ var reservedMetadataKeys = map[string]struct{}{
 	"version_mismatch":   {},
 	"trace_id":           {},
 	"span_id":            {},
+}
+
+// warningPatterns extracts just the Pattern field from each sanitizer warning
+// so debug logs can report which detection rules fired without dumping the
+// full span offsets.
+func warningPatterns(warnings []sanitize.SanitizeWarning) []string {
+	if len(warnings) == 0 {
+		return nil
+	}
+	out := make([]string, len(warnings))
+	for i, w := range warnings {
+		out[i] = w.Pattern
+	}
+	return out
 }
 
 // filterReservedMetadata returns a copy of meta with broker-reserved keys removed.

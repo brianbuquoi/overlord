@@ -175,6 +175,14 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		},
 	}
 
+	a.logger.Debug("anthropic request body",
+		"agent_id", a.cfg.ID,
+		"system_prompt_length", len(reqBody.System),
+		"user_message_length", len(reqBody.Messages[0].Content),
+		"system_prompt_preview", agent.Truncate(reqBody.System, 200),
+		"user_message_preview", agent.Truncate(reqBody.Messages[0].Content, 200),
+	)
+
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, a.nonRetryableErr(fmt.Errorf("marshal request: %w", err))
@@ -231,6 +239,13 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		return nil, a.retryableErr(fmt.Errorf("empty text content in response"))
 	}
 
+	textContent := output.String()
+	a.logger.Debug("anthropic raw response",
+		"agent_id", a.cfg.ID,
+		"raw_length", len(textContent),
+		"raw_preview", agent.Truncate(textContent, 200),
+	)
+
 	a.logger.Info("anthropic request completed",
 		"agent_id", a.cfg.ID,
 		"model", a.cfg.Model,
@@ -246,7 +261,7 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		a.metrics.AgentTokensTotal.WithLabelValues(providerName, a.cfg.Model, "output").Add(float64(result.Usage.OutputTokens))
 	}
 
-	payload, parseErr := agent.ParseJSONObjectOutput(output.String())
+	payload, parseErr := agent.ParseJSONObjectOutput(textContent)
 	if parseErr != nil {
 		return nil, a.retryableErr(parseErr)
 	}

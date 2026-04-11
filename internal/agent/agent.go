@@ -49,6 +49,18 @@ func ParseJSONObjectOutput(text string) (json.RawMessage, error) {
 	return json.RawMessage(cleaned), nil
 }
 
+// Truncate returns the first n characters of s, appending "...(truncated)" if
+// the input exceeds n. It is intended for debug logging of prompt/response
+// content where a preview is sufficient. The helper must never be applied to
+// credentials — only to non-secret fields such as system prompts, user message
+// bodies, and raw model responses.
+func Truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...(truncated)"
+}
+
 // Agent is the interface every LLM provider adapter implements.
 type Agent interface {
 	ID() string

@@ -1,6 +1,9 @@
 package sanitize
 
-import "strings"
+import (
+	"log/slog"
+	"strings"
+)
 
 // Wrap produces the envelope format defined in CLAUDE.md for safe inter-agent
 // communication. Agent output from a prior stage is wrapped in a clearly
@@ -11,6 +14,11 @@ import "strings"
 // is omitted entirely and only the stage prompt appears.
 func Wrap(stagePrompt, sanitizedPriorOutput string) string {
 	if sanitizedPriorOutput == "" {
+		slog.Debug("envelope wrapped",
+			"has_prior_output", false,
+			"stage_prompt_length", len(stagePrompt),
+			"total_length", len(stagePrompt),
+		)
 		return stagePrompt
 	}
 
@@ -24,5 +32,11 @@ func Wrap(stagePrompt, sanitizedPriorOutput string) string {
 	b.WriteString("\n")
 	b.WriteString("Your task: ")
 	b.WriteString(stagePrompt)
-	return b.String()
+	result := b.String()
+	slog.Debug("envelope wrapped",
+		"has_prior_output", true,
+		"stage_prompt_length", len(stagePrompt),
+		"total_length", len(result),
+	)
+	return result
 }

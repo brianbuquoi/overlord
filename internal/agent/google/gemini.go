@@ -197,6 +197,22 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 	}
 	reqBody.GenerationConfig = genCfg
 
+	var sysInstructionText string
+	if reqBody.SystemInstruction != nil && len(reqBody.SystemInstruction.Parts) > 0 {
+		sysInstructionText = reqBody.SystemInstruction.Parts[0].Text
+	}
+	var firstUserPart string
+	if len(reqBody.Contents) > 0 && len(reqBody.Contents[0].Parts) > 0 {
+		firstUserPart = reqBody.Contents[0].Parts[0].Text
+	}
+	a.logger.Debug("gemini request body",
+		"agent_id", a.cfg.ID,
+		"system_prompt_length", len(sysInstructionText),
+		"user_message_length", len(firstUserPart),
+		"system_prompt_preview", agent.Truncate(sysInstructionText, 200),
+		"user_message_preview", agent.Truncate(firstUserPart, 200),
+	)
+
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, a.nonRetryableErr(fmt.Errorf("marshal request: %w", err))
@@ -251,6 +267,13 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		return nil, a.retryableErr(fmt.Errorf("no text content in response"))
 	}
 
+	textContent := output.String()
+	a.logger.Debug("gemini raw response",
+		"agent_id", a.cfg.ID,
+		"raw_length", len(textContent),
+		"raw_preview", agent.Truncate(textContent, 200),
+	)
+
 	var inputTokens, outputTokens int
 	if result.UsageMetadata != nil {
 		inputTokens = result.UsageMetadata.PromptTokenCount
@@ -272,7 +295,7 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		a.metrics.AgentTokensTotal.WithLabelValues(providerName, a.cfg.Model, "output").Add(float64(outputTokens))
 	}
 
-	payload, parseErr := agent.ParseJSONObjectOutput(output.String())
+	payload, parseErr := agent.ParseJSONObjectOutput(textContent)
 	if parseErr != nil {
 		return nil, a.retryableErr(parseErr)
 	}
