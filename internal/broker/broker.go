@@ -51,13 +51,18 @@ type Store interface {
 	UpdateTask(ctx context.Context, taskID string, update TaskUpdate) error
 	GetTask(ctx context.Context, taskID string) (*Task, error)
 	ListTasks(ctx context.Context, filter TaskFilter) (*ListTasksResult, error)
-	// ClaimForReplay validates the task is in a replayable state (FAILED +
-	// RoutedToDeadLetter = true) and returns it. It does not mutate state;
-	// the original task remains in its terminal dead-lettered form. The
-	// caller is responsible for submitting a new task with the returned
-	// payload. Returns ErrTaskNotReplayable / ErrTaskNotFound on the
-	// failure paths.
+	// ClaimForReplay atomically transitions a FAILED+dead-lettered task to
+	// REPLAY_PENDING and clears RoutedToDeadLetter. The state flip is the
+	// claim token — concurrent callers see ErrTaskNotReplayable after the
+	// winner lands. The caller is responsible for completing the replay
+	// (Submit + mark REPLAYED) or calling RollbackReplayClaim on submit
+	// failure. Returns ErrTaskNotReplayable / ErrTaskNotFound on the failure
+	// paths.
 	ClaimForReplay(ctx context.Context, taskID string) (*Task, error)
+	// RollbackReplayClaim transitions a task from REPLAY_PENDING back to
+	// FAILED+RoutedToDeadLetter=true. Used by the replay handler when Submit
+	// fails after a successful claim.
+	RollbackReplayClaim(ctx context.Context, taskID string) error
 }
 
 // ErrQueueEmpty is returned by Store.DequeueTask when no tasks are available.

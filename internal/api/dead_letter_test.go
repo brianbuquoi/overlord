@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,12 +174,11 @@ func TestDeadLetterReplay_PreservesPayload(t *testing.T) {
 		t.Fatalf("expected 0 attempts on replayed task, got %d", newTask.Attempts)
 	}
 
-	// After a successful claim, the original task stays FAILED (audit
-	// record) but RoutedToDeadLetter is cleared — that flip is the claim
-	// token that makes concurrent replays idempotent.
+	// After a successful replay, the original task is marked REPLAYED
+	// (terminal audit state) with RoutedToDeadLetter cleared.
 	origAfter, _ := st.GetTask(context.Background(), taskID)
-	if origAfter.State != broker.TaskStateFailed {
-		t.Fatalf("original task should remain FAILED after replay, got %s", origAfter.State)
+	if origAfter.State != broker.TaskStateReplayed {
+		t.Fatalf("original task should be REPLAYED after successful replay, got %s", origAfter.State)
 	}
 	if origAfter.RoutedToDeadLetter {
 		t.Fatal("original task RoutedToDeadLetter should be cleared after a successful replay")
@@ -283,11 +281,11 @@ func TestDeadLetterReplayAll(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fetch original %s: %v", id, err)
 		}
-		if orig.State != broker.TaskStateFailed {
-			t.Errorf("original %s: state=%s want FAILED after replay-all", id, orig.State)
+		if orig.State != broker.TaskStateReplayed {
+			t.Errorf("original %s: state=%s want REPLAYED after replay-all", id, orig.State)
 		}
 		if orig.RoutedToDeadLetter {
-			t.Errorf("original %s: RoutedToDeadLetter should be cleared after replay-all (claim token flipped)", id)
+			t.Errorf("original %s: RoutedToDeadLetter should be cleared after replay-all", id)
 		}
 	}
 
@@ -448,8 +446,8 @@ func TestReplayDeadLetter_Concurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch original: %v", err)
 	}
-	if orig.State != broker.TaskStateFailed {
-		t.Fatalf("original task state after concurrent replays: got %s, want FAILED", orig.State)
+	if orig.State != broker.TaskStateReplayed {
+		t.Fatalf("original task state after concurrent replays: got %s, want REPLAYED", orig.State)
 	}
 	if orig.RoutedToDeadLetter {
 		t.Fatal("original task RoutedToDeadLetter should be cleared after a successful replay")
@@ -743,10 +741,10 @@ func seedDeadLetterTasksInStore(t *testing.T, b *broker.Broker, m *memory.Memory
 	return ids
 }
 
-// TestReplayAll_PerTaskFailure verifies the replay-all handler reports
-// per-task enqueue failures in `failed` and continues through the rest
-// of the page rather than aborting. An injected store pretends the first
-// two new submissions fail; the remaining three succeed.
+// TestReplayAll_PerTaskFailure verifies the replay-all handler rolls back
+// failed submits so the original tasks are recoverable, and marks successful
+// ones as REPLAYED. An injected store persistently fails the submits for
+// payloads "fail-0" and "fail-1"; the remaining three payloads succeed.
 func TestReplayAll_PerTaskFailure(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -760,12 +758,13 @@ func TestReplayAll_PerTaskFailure(t *testing.T) {
 		t.Fatalf("seeded %d tasks, want 5", len(ids))
 	}
 
-	// After seeding, fail the first 2 replay submissions (new task IDs are
-	// fresh so we gate on call count, not ID).
-	var calls atomic.Int32
+	// Match by payload content — Submit generates fresh task IDs, but the
+	// payload is preserved from the original dead-letter task, so failing on
+	// payload gives us a persistent per-original-task failure across retries.
 	mem := mstore.Memory()
 	mstore.OnEnqueueTask = func(ctx context.Context, stageID string, task *broker.Task) error {
-		if calls.Add(1) <= 2 {
+		payload := string(task.Payload)
+		if strings.Contains(payload, `"fail-0"`) || strings.Contains(payload, `"fail-1"`) {
 			return mock.ErrInjected
 		}
 		return mem.EnqueueTask(ctx, stageID, task)
@@ -785,17 +784,199 @@ func TestReplayAll_PerTaskFailure(t *testing.T) {
 	if resp.Processed != 3 {
 		t.Errorf("processed: got %d want 3", resp.Processed)
 	}
-	if resp.Failed != 2 {
-		t.Errorf("failed: got %d want 2", resp.Failed)
+	// Each iteration of the loop retries the rolled-back tasks until they
+	// all fail on the same page (no progress → break). So the 2 failing
+	// tasks register >= 2 failures but the 3 successful ones leave the
+	// filter immediately. Require at least 2.
+	if resp.Failed < 2 {
+		t.Errorf("failed: got %d want >= 2", resp.Failed)
 	}
 	if resp.Truncated {
 		t.Errorf("truncated: got true want false")
 	}
 
-	// Two Warn log lines should have been emitted for the failed submits.
+	// The 3 successful originals must be REPLAYED; the 2 failing originals
+	// must be rolled back to FAILED+RoutedToDeadLetter=true.
+	replayed, rolledBack := 0, 0
+	ctx := context.Background()
+	for i, id := range ids {
+		tk, err := mem.GetTask(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		expectFail := i == 0 || i == 1
+		switch {
+		case expectFail:
+			if tk.State == broker.TaskStateFailed && tk.RoutedToDeadLetter {
+				rolledBack++
+			} else {
+				t.Errorf("task %d: expected rolled back to FAILED+DL=true, got state=%s dl=%v",
+					i, tk.State, tk.RoutedToDeadLetter)
+			}
+		default:
+			if tk.State == broker.TaskStateReplayed {
+				replayed++
+			} else {
+				t.Errorf("task %d: expected REPLAYED, got state=%s", i, tk.State)
+			}
+		}
+	}
+	if replayed != 3 {
+		t.Errorf("replayed count: got %d want 3", replayed)
+	}
+	if rolledBack != 2 {
+		t.Errorf("rolled back count: got %d want 2", rolledBack)
+	}
+
+	// At least 2 Warn lines should be emitted for the failed submits.
 	warnCount := strings.Count(logBuf.String(), `"msg":"replay-all: failed to submit replay task"`)
-	if warnCount != 2 {
-		t.Errorf("replay-all warn log lines: got %d want 2 (logs: %s)", warnCount, logBuf.String())
+	if warnCount < 2 {
+		t.Errorf("replay-all warn log lines: got %d want >= 2 (logs: %s)", warnCount, logBuf.String())
+	}
+}
+
+// TestReplayAll_SubmitAndRollbackFail verifies that when BOTH submit and
+// rollback fail, the handler emits an Error log with submit_error and
+// rollback_error so an operator can manually recover the stranded task.
+func TestReplayAll_SubmitAndRollbackFail(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	mstore := mock.New()
+	srv, b := newDeadLetterTestServerWithStore(t, mstore, logger)
+	defer srv.Shutdown(context.Background())
+
+	ids := seedDeadLetterTasksInStore(t, b, mstore.Memory(), 1)
+	if len(ids) != 1 {
+		t.Fatalf("seeded %d tasks, want 1", len(ids))
+	}
+	mem := mstore.Memory()
+	mstore.OnEnqueueTask = func(ctx context.Context, stageID string, task *broker.Task) error {
+		if strings.Contains(string(task.Payload), `"fail-0"`) {
+			return mock.ErrInjected
+		}
+		return mem.EnqueueTask(ctx, stageID, task)
+	}
+	mstore.OnRollbackReplayClaim = func(ctx context.Context, taskID string) error {
+		return mock.ErrInjected
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/replay-all?pipeline_id=test-pipeline", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status: got %d want 202: %s", w.Code, w.Body.String())
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, `"msg":"replay-all rollback failed: task may be stranded in REPLAY_PENDING"`) {
+		t.Errorf("expected rollback-failed Error log, got: %s", logs)
+	}
+	if !strings.Contains(logs, `"submit_error"`) || !strings.Contains(logs, `"rollback_error"`) {
+		t.Errorf("expected submit_error and rollback_error in log, got: %s", logs)
+	}
+	if !strings.Contains(logs, `"task_id":"`+ids[0]+`"`) {
+		t.Errorf("expected task_id %q in log, got: %s", ids[0], logs)
+	}
+}
+
+// TestReplayDeadLetter_SubmitFails verifies single-task replay rolls back to
+// FAILED+RoutedToDeadLetter=true when Submit fails, leaving the task visible
+// and recoverable by subsequent replay operations.
+func TestReplayDeadLetter_SubmitFails(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	mstore := mock.New()
+	srv, b := newDeadLetterTestServerWithStore(t, mstore, logger)
+	defer srv.Shutdown(context.Background())
+
+	ids := seedDeadLetterTasksInStore(t, b, mstore.Memory(), 1)
+	taskID := ids[0]
+
+	mem := mstore.Memory()
+	mstore.OnEnqueueTask = func(ctx context.Context, stageID string, task *broker.Task) error {
+		// Fail only the replay submission: the task we're re-submitting has
+		// the payload of the dead-letter task ("fail-0").
+		if strings.Contains(string(task.Payload), `"fail-0"`) {
+			return mock.ErrInjected
+		}
+		return mem.EnqueueTask(ctx, stageID, task)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/"+taskID+"/replay", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status: got %d want 500: %s", w.Code, w.Body.String())
+	}
+
+	// Task must be rolled back.
+	tk, err := mem.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk.State != broker.TaskStateFailed {
+		t.Errorf("state after failed submit: got %s want FAILED", tk.State)
+	}
+	if !tk.RoutedToDeadLetter {
+		t.Errorf("RoutedToDeadLetter after failed submit: got false want true")
+	}
+
+	// Task must be replayable again.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/"+taskID+"/replay", nil)
+	w2 := httptest.NewRecorder()
+	// Lift the injected failure so the retry can succeed.
+	mstore.OnEnqueueTask = nil
+	srv.Handler().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("retry: got %d want 202: %s", w2.Code, w2.Body.String())
+	}
+}
+
+// TestReplayDeadLetter_SubmitAndRollbackFail verifies the Error log contains
+// both submit_error and rollback_error when both fail.
+func TestReplayDeadLetter_SubmitAndRollbackFail(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	mstore := mock.New()
+	srv, b := newDeadLetterTestServerWithStore(t, mstore, logger)
+	defer srv.Shutdown(context.Background())
+
+	ids := seedDeadLetterTasksInStore(t, b, mstore.Memory(), 1)
+	taskID := ids[0]
+
+	mem := mstore.Memory()
+	mstore.OnEnqueueTask = func(ctx context.Context, stageID string, task *broker.Task) error {
+		if strings.Contains(string(task.Payload), `"fail-0"`) {
+			return mock.ErrInjected
+		}
+		return mem.EnqueueTask(ctx, stageID, task)
+	}
+	mstore.OnRollbackReplayClaim = func(ctx context.Context, taskID string) error {
+		return mock.ErrInjected
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/"+taskID+"/replay", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status: got %d want 500", w.Code)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, `"msg":"replay rollback failed: task may be stranded in REPLAY_PENDING"`) {
+		t.Errorf("expected stranded-task Error log, got: %s", logs)
+	}
+	if !strings.Contains(logs, `"submit_error"`) || !strings.Contains(logs, `"rollback_error"`) {
+		t.Errorf("expected submit_error and rollback_error in log, got: %s", logs)
+	}
+	if !strings.Contains(logs, `"task_id":"`+taskID+`"`) {
+		t.Errorf("expected task_id in log, got: %s", logs)
 	}
 }
 

@@ -395,6 +395,11 @@ func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	task, err := s.broker.Store().ClaimForReplay(r.Context(), taskID)
 	if errors.Is(err, store.ErrTaskNotFound) {
 		writeError(w, http.StatusNotFound, "task not found", "TASK_NOT_FOUND")
@@ -411,8 +416,23 @@ func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) 
 
 	newTask, err := s.broker.Submit(r.Context(), task.PipelineID, task.Payload)
 	if err != nil {
-		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to replay task", "REPLAY_FAILED", err)
+		if rbErr := s.broker.Store().RollbackReplayClaim(r.Context(), task.ID); rbErr != nil {
+			logger.Error("replay rollback failed: task may be stranded in REPLAY_PENDING",
+				"task_id", task.ID,
+				"submit_error", err.Error(),
+				"rollback_error", rbErr.Error(),
+			)
+		}
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to submit replay task", "REPLAY_SUBMIT_FAILED", err)
 		return
+	}
+
+	replayed := broker.TaskStateReplayed
+	if markErr := s.broker.Store().UpdateTask(r.Context(), task.ID, broker.TaskUpdate{State: &replayed}); markErr != nil {
+		logger.Warn("replay: failed to mark original task as REPLAYED",
+			"task_id", task.ID,
+			"error", markErr.Error(),
+		)
 	}
 
 	writeJSON(w, http.StatusAccepted, replayResponse{TaskID: newTask.ID})
@@ -529,8 +549,22 @@ func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Reques
 					"pipeline_id", task.PipelineID,
 					"error", err.Error(),
 				)
+				if rbErr := s.broker.Store().RollbackReplayClaim(r.Context(), task.ID); rbErr != nil {
+					logger.Error("replay-all rollback failed: task may be stranded in REPLAY_PENDING",
+						"task_id", task.ID,
+						"submit_error", err.Error(),
+						"rollback_error", rbErr.Error(),
+					)
+				}
 				failed++
 				continue
+			}
+			replayed := broker.TaskStateReplayed
+			if markErr := s.broker.Store().UpdateTask(r.Context(), task.ID, broker.TaskUpdate{State: &replayed}); markErr != nil {
+				logger.Warn("replay-all: failed to mark original task as REPLAYED",
+					"task_id", task.ID,
+					"error", markErr.Error(),
+				)
 			}
 			count++
 			progressed = true

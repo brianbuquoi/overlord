@@ -19,6 +19,10 @@ var (
 	// ErrTaskNotReplayable is returned by ClaimForReplay when the task
 	// exists but is not in a replayable state (i.e. not FAILED+dead-lettered).
 	ErrTaskNotReplayable = errors.New("task is not in a replayable state")
+	// ErrTaskNotReplayPending is returned by RollbackReplayClaim when the task
+	// exists but is not in REPLAY_PENDING — it may have already been completed
+	// or rolled back by another caller.
+	ErrTaskNotReplayPending = errors.New("task is not in REPLAY_PENDING state")
 )
 
 // Store is the interface for task persistence and queuing.
@@ -28,13 +32,27 @@ type Store interface {
 	UpdateTask(ctx context.Context, taskID string, update broker.TaskUpdate) error
 	GetTask(ctx context.Context, taskID string) (*broker.Task, error)
 	ListTasks(ctx context.Context, filter broker.TaskFilter) (*broker.ListTasksResult, error)
-	// ClaimForReplay atomically validates that the task is in a replayable
-	// state (state = FAILED and RoutedToDeadLetter = true) and clears
-	// RoutedToDeadLetter to false to prevent duplicate replay submissions.
-	// The task state is not changed. Returns the task (with RoutedToDeadLetter
-	// now false) on success.
+	// ClaimForReplay atomically validates that the task is in a replayable state
+	// (state = FAILED and RoutedToDeadLetter = true), transitions the task to
+	// REPLAY_PENDING, and clears RoutedToDeadLetter to false. This is the claim
+	// token — only one concurrent caller can succeed.
+	//
+	// On success, returns the task in REPLAY_PENDING state.
 	// Returns ErrTaskNotFound if the task does not exist.
-	// Returns ErrTaskNotReplayable if the task exists but is not in a
-	// replayable state (including tasks already claimed by a concurrent caller).
+	// Returns ErrTaskNotReplayable if the task is not in a claimable state
+	// (including tasks already in REPLAY_PENDING from a prior concurrent claim).
+	//
+	// The caller is responsible for either completing the replay (Submit →
+	// broker, then UpdateTask to REPLAYED) or rolling back via
+	// RollbackReplayClaim if Submit fails.
 	ClaimForReplay(ctx context.Context, taskID string) (*broker.Task, error)
+
+	// RollbackReplayClaim atomically transitions a task from REPLAY_PENDING
+	// back to FAILED with RoutedToDeadLetter=true, making it visible and
+	// replayable again.
+	// Returns ErrTaskNotFound if the task does not exist.
+	// Returns ErrTaskNotReplayPending if the task is not in REPLAY_PENDING
+	// state (it may have already been completed or rolled back by another
+	// caller).
+	RollbackReplayClaim(ctx context.Context, taskID string) error
 }

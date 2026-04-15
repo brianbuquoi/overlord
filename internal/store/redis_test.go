@@ -728,8 +728,8 @@ func TestRedis_ClaimForReplay_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if claimed.State != broker.TaskStateFailed {
-		t.Errorf("state: got %s want FAILED (state unchanged)", claimed.State)
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Errorf("state: got %s want REPLAY_PENDING", claimed.State)
 	}
 	if claimed.RoutedToDeadLetter {
 		t.Errorf("routed_to_dead_letter should be cleared by the claim")
@@ -742,8 +742,8 @@ func TestRedis_ClaimForReplay_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed || stored.RoutedToDeadLetter || stored.Attempts != 3 {
-		t.Errorf("stored task: state=%s dl=%v attempts=%d, want FAILED/false/3",
+	if stored.State != broker.TaskStateReplayPending || stored.RoutedToDeadLetter || stored.Attempts != 3 {
+		t.Errorf("stored task: state=%s dl=%v attempts=%d, want REPLAY_PENDING/false/3",
 			stored.State, stored.RoutedToDeadLetter, stored.Attempts)
 	}
 
@@ -837,10 +837,137 @@ func TestRedis_ClaimForReplay_ConcurrentNoMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed {
-		t.Errorf("stored state: got %s want FAILED (unchanged)", stored.State)
+	if stored.State != broker.TaskStateReplayPending {
+		t.Errorf("stored state: got %s want REPLAY_PENDING", stored.State)
 	}
 	if stored.RoutedToDeadLetter {
 		t.Errorf("stored RoutedToDeadLetter should be cleared after a successful claim")
+	}
+}
+
+// TestRedis_RollbackReplayClaim_RestoresDeadLettered verifies that a rollback
+// after a successful claim leaves the task FAILED+dead-lettered and
+// re-claimable.
+func TestRedis_RollbackReplayClaim_RestoresDeadLettered(t *testing.T) {
+	t.Parallel()
+	s, _, _ := newRedisTestStore(t, "rb:")
+	ctx := context.Background()
+
+	task := &broker.Task{
+		ID: uuid.New().String(), PipelineID: "p", StageID: "s",
+		InputSchemaName: "in", InputSchemaVersion: "v1",
+		OutputSchemaName: "out", OutputSchemaVersion: "v1",
+		Payload: json.RawMessage(`{}`), Metadata: map[string]any{},
+		State: broker.TaskStateFailed, RoutedToDeadLetter: true,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := s.EnqueueTask(ctx, "s", task); err != nil {
+		t.Fatal(err)
+	}
+	failed := broker.TaskStateFailed
+	if err := s.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &failed}); err != nil {
+		t.Fatal(err)
+	}
+	dl := true
+	if err := s.UpdateTask(ctx, task.ID, broker.TaskUpdate{RoutedToDeadLetter: &dl}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ClaimForReplay(ctx, task.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := s.RollbackReplayClaim(ctx, task.ID); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	got, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != broker.TaskStateFailed {
+		t.Errorf("state after rollback: got %s want FAILED", got.State)
+	}
+	if !got.RoutedToDeadLetter {
+		t.Errorf("RoutedToDeadLetter after rollback: got false want true")
+	}
+	if _, err := s.ClaimForReplay(ctx, task.ID); err != nil {
+		t.Errorf("re-claim after rollback: got %v want nil", err)
+	}
+}
+
+func TestRedis_RollbackReplayClaim_FailsIfNotReplayPending(t *testing.T) {
+	t.Parallel()
+	s, _, _ := newRedisTestStore(t, "rb-nf:")
+	ctx := context.Background()
+
+	if err := s.RollbackReplayClaim(ctx, "does-not-exist"); err != store.ErrTaskNotFound {
+		t.Errorf("not found: got %v want ErrTaskNotFound", err)
+	}
+
+	task := &broker.Task{
+		ID: uuid.New().String(), PipelineID: "p", StageID: "s",
+		InputSchemaName: "in", InputSchemaVersion: "v1",
+		OutputSchemaName: "out", OutputSchemaVersion: "v1",
+		Payload: json.RawMessage(`{}`), Metadata: map[string]any{},
+		State: broker.TaskStateFailed, RoutedToDeadLetter: true,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := s.EnqueueTask(ctx, "s", task); err != nil {
+		t.Fatal(err)
+	}
+	failed := broker.TaskStateFailed
+	s.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &failed})
+	dl := true
+	s.UpdateTask(ctx, task.ID, broker.TaskUpdate{RoutedToDeadLetter: &dl})
+
+	if err := s.RollbackReplayClaim(ctx, task.ID); err != store.ErrTaskNotReplayPending {
+		t.Errorf("FAILED task rollback: got %v want ErrTaskNotReplayPending", err)
+	}
+}
+
+func TestRedis_ClaimForReplay_TransitionsToReplayPending(t *testing.T) {
+	t.Parallel()
+	s, _, _ := newRedisTestStore(t, "claim-rp:")
+	ctx := context.Background()
+
+	task := &broker.Task{
+		ID: uuid.New().String(), PipelineID: "p", StageID: "s",
+		InputSchemaName: "in", InputSchemaVersion: "v1",
+		OutputSchemaName: "out", OutputSchemaVersion: "v1",
+		Payload: json.RawMessage(`{}`), Metadata: map[string]any{},
+		State: broker.TaskStateFailed, RoutedToDeadLetter: true,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := s.EnqueueTask(ctx, "s", task); err != nil {
+		t.Fatal(err)
+	}
+	failed := broker.TaskStateFailed
+	s.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &failed})
+	dl := true
+	s.UpdateTask(ctx, task.ID, broker.TaskUpdate{RoutedToDeadLetter: &dl})
+
+	claimed, err := s.ClaimForReplay(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Errorf("claimed state: got %s want REPLAY_PENDING", claimed.State)
+	}
+
+	// The per-state index should reflect the new state (listable under REPLAY_PENDING).
+	rp := broker.TaskStateReplayPending
+	page, err := s.ListTasks(ctx, broker.TaskFilter{State: &rp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tk := range page.Tasks {
+		if tk.ID == task.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("task not in REPLAY_PENDING index")
 	}
 }

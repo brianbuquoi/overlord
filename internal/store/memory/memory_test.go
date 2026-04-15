@@ -346,8 +346,8 @@ func TestClaimForReplay_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if claimed.State != broker.TaskStateFailed {
-		t.Errorf("state: got %s want FAILED (state unchanged)", claimed.State)
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Errorf("state: got %s want REPLAY_PENDING", claimed.State)
 	}
 	if claimed.RoutedToDeadLetter {
 		t.Errorf("routed_to_dead_letter should be cleared by the claim")
@@ -360,8 +360,8 @@ func TestClaimForReplay_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed || stored.RoutedToDeadLetter || stored.Attempts != 3 {
-		t.Errorf("stored: state=%s dl=%v attempts=%d, want FAILED/false/3",
+	if stored.State != broker.TaskStateReplayPending || stored.RoutedToDeadLetter || stored.Attempts != 3 {
+		t.Errorf("stored: state=%s dl=%v attempts=%d, want REPLAY_PENDING/false/3",
 			stored.State, stored.RoutedToDeadLetter, stored.Attempts)
 	}
 
@@ -445,10 +445,88 @@ func TestClaimForReplay_ConcurrentNoMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed {
-		t.Errorf("stored state: got %s want FAILED", stored.State)
+	if stored.State != broker.TaskStateReplayPending {
+		t.Errorf("stored state: got %s want REPLAY_PENDING", stored.State)
 	}
 	if stored.RoutedToDeadLetter {
 		t.Errorf("stored RoutedToDeadLetter should be cleared after a successful claim")
+	}
+}
+
+func TestRollbackReplayClaim_RestoresDeadLettered(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := m.ClaimForReplay(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Fatalf("claimed state: got %s want REPLAY_PENDING", claimed.State)
+	}
+	if err := m.RollbackReplayClaim(ctx, task.ID); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	got, err := m.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != broker.TaskStateFailed {
+		t.Errorf("state after rollback: got %s want FAILED", got.State)
+	}
+	if !got.RoutedToDeadLetter {
+		t.Errorf("RoutedToDeadLetter after rollback: got false want true")
+	}
+	// Task should be replayable again.
+	if _, err := m.ClaimForReplay(ctx, task.ID); err != nil {
+		t.Errorf("re-claim after rollback: got %v want nil", err)
+	}
+}
+
+func TestRollbackReplayClaim_FailsIfNotReplayPending(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+
+	// Not found.
+	if err := m.RollbackReplayClaim(ctx, "does-not-exist"); err != store.ErrTaskNotFound {
+		t.Errorf("not found: got %v want ErrTaskNotFound", err)
+	}
+
+	// Task in FAILED state (not REPLAY_PENDING).
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RollbackReplayClaim(ctx, task.ID); err != store.ErrTaskNotReplayPending {
+		t.Errorf("FAILED task: got %v want ErrTaskNotReplayPending", err)
+	}
+}
+
+func TestClaimForReplay_TransitionsToReplayPending(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := m.ClaimForReplay(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Errorf("claimed state: got %s want REPLAY_PENDING", claimed.State)
+	}
+	stored, _ := m.GetTask(ctx, task.ID)
+	if stored.State != broker.TaskStateReplayPending {
+		t.Errorf("stored state: got %s want REPLAY_PENDING", stored.State)
 	}
 }

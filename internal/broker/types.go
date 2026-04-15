@@ -18,6 +18,19 @@ const (
 	TaskStateRetrying   TaskState = "RETRYING"
 	TaskStateWaiting    TaskState = "WAITING"
 	TaskStateDiscarded  TaskState = "DISCARDED"
+
+	// TaskStateReplayPending is set atomically by ClaimForReplay. The task
+	// remains in this state until Submit succeeds (→ REPLAYED) or the handler
+	// rolls back (→ FAILED with RoutedToDeadLetter=true). A task stuck in
+	// REPLAY_PENDING indicates a submission failure that was not rolled back —
+	// recoverable by an operator setting the task back to FAILED via the
+	// admin API.
+	TaskStateReplayPending TaskState = "REPLAY_PENDING"
+
+	// TaskStateReplayed is the terminal state for a task that was successfully
+	// replayed. The original task is preserved for audit; the new task
+	// carries the retry.
+	TaskStateReplayed TaskState = "REPLAYED"
 )
 
 // Task is the unit of work that flows through a pipeline.

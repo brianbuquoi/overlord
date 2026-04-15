@@ -144,9 +144,9 @@ func (m *MemoryStore) UpdateTask(_ context.Context, taskID string, update broker
 }
 
 // ClaimForReplay atomically validates that taskID refers to a
-// FAILED+dead-lettered task and flips RoutedToDeadLetter to false so
-// concurrent callers each get ErrTaskNotReplayable. The task state stays
-// FAILED to preserve the audit trail.
+// FAILED+dead-lettered task, transitions it to REPLAY_PENDING, and clears
+// RoutedToDeadLetter. The transition is the claim token so concurrent
+// callers each get ErrTaskNotReplayable after the winner lands.
 func (m *MemoryStore) ClaimForReplay(_ context.Context, taskID string) (*broker.Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -162,9 +162,30 @@ func (m *MemoryStore) ClaimForReplay(_ context.Context, taskID string) (*broker.
 		return nil, store.ErrTaskNotReplayable
 	}
 
+	task.State = broker.TaskStateReplayPending
 	task.RoutedToDeadLetter = false
 	task.UpdatedAt = time.Now()
 	return copyTask(task), nil
+}
+
+// RollbackReplayClaim atomically transitions a REPLAY_PENDING task back to
+// FAILED+RoutedToDeadLetter=true so it becomes visible and replayable again
+// after a Submit failure.
+func (m *MemoryStore) RollbackReplayClaim(_ context.Context, taskID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	task, ok := m.tasks[taskID]
+	if !ok {
+		return store.ErrTaskNotFound
+	}
+	if task.State != broker.TaskStateReplayPending {
+		return store.ErrTaskNotReplayPending
+	}
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	task.UpdatedAt = time.Now()
+	return nil
 }
 
 func (m *MemoryStore) GetTask(_ context.Context, taskID string) (*broker.Task, error) {

@@ -297,13 +297,15 @@ func (r *RedisStore) UpdateTask(ctx context.Context, taskID string, update broke
 }
 
 // claimForReplayScript atomically validates a task is in FAILED+dead-lettered
-// state and flips routed_to_dead_letter to false. The flip is the claim token:
-// once cleared, subsequent callers see NOT_REPLAYABLE because the task no
-// longer satisfies the FAILED+dead-lettered predicate. The task state stays
-// FAILED so the audit trail is preserved.
+// state, transitions it to REPLAY_PENDING, and flips routed_to_dead_letter to
+// false. The transition is the claim token: once made, subsequent callers see
+// NOT_REPLAYABLE because the task no longer satisfies the FAILED+dead-lettered
+// predicate. Per-state secondary index is updated atomically.
 //
 //	KEYS[1] = task key
 //	ARGV[1] = updated_at timestamp (RFC3339Nano string)
+//	ARGV[2] = state index key prefix (e.g. "overlord:tasks:state:")
+//	ARGV[3] = score for state index ZADD (unix seconds as string)
 //
 // Returns: the updated task JSON on success, or "TASK_NOT_FOUND" /
 // "NOT_REPLAYABLE" on the failure paths.
@@ -316,6 +318,7 @@ local task = cjson.decode(data)
 if task.state ~= 'FAILED' or not task.routed_to_dead_letter then
   return 'NOT_REPLAYABLE'
 end
+task.state = 'REPLAY_PENDING'
 task.routed_to_dead_letter = false
 task.updated_at = ARGV[1]
 local newData = cjson.encode(task)
@@ -325,21 +328,63 @@ if pttl and tonumber(pttl) and tonumber(pttl) > 0 then
 else
   redis.call('SET', KEYS[1], newData)
 end
+redis.call('ZREM', ARGV[2] .. 'FAILED', task.id)
+redis.call('ZADD', ARGV[2] .. 'REPLAY_PENDING', tonumber(ARGV[3]), task.id)
 return newData
 `
 
 var claimForReplay = redis.NewScript(claimForReplayScript)
 
-// ClaimForReplay atomically validates that taskID refers to a
-// FAILED+dead-lettered task and flips RoutedToDeadLetter from true to false.
-// The task state is unchanged (remains FAILED) so the audit trail is
-// preserved; the flipped flag is the claim token so concurrent callers each
-// get ErrTaskNotReplayable after the winner's flip lands.
+// rollbackReplayClaimScript atomically transitions a REPLAY_PENDING task back
+// to FAILED with routed_to_dead_letter=true, updating the per-state index.
+//
+//	KEYS[1] = task key
+//	ARGV[1] = updated_at timestamp (RFC3339Nano string)
+//	ARGV[2] = state index key prefix
+//	ARGV[3] = score for state index ZADD
+//
+// Returns: "OK" on success, "TASK_NOT_FOUND" / "NOT_REPLAY_PENDING" on failure.
+const rollbackReplayClaimScript = `
+local data = redis.call('GET', KEYS[1])
+if not data then
+  return 'TASK_NOT_FOUND'
+end
+local task = cjson.decode(data)
+if task.state ~= 'REPLAY_PENDING' then
+  return 'NOT_REPLAY_PENDING'
+end
+task.state = 'FAILED'
+task.routed_to_dead_letter = true
+task.updated_at = ARGV[1]
+local newData = cjson.encode(task)
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl and tonumber(pttl) and tonumber(pttl) > 0 then
+  redis.call('SET', KEYS[1], newData, 'PX', tonumber(pttl))
+else
+  redis.call('SET', KEYS[1], newData)
+end
+redis.call('ZREM', ARGV[2] .. 'REPLAY_PENDING', task.id)
+redis.call('ZADD', ARGV[2] .. 'FAILED', tonumber(ARGV[3]), task.id)
+return 'OK'
+`
+
+var rollbackReplayClaim = redis.NewScript(rollbackReplayClaimScript)
+
+// ClaimForReplay atomically transitions a FAILED+dead-lettered task to
+// REPLAY_PENDING and clears RoutedToDeadLetter. The state transition is the
+// claim token so concurrent callers each get ErrTaskNotReplayable after the
+// winner lands.
 func (r *RedisStore) ClaimForReplay(ctx context.Context, taskID string) (*broker.Task, error) {
-	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	now := time.Now()
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	score := float64(now.UnixNano()) / 1e9
+	scoreStr := fmt.Sprintf("%f", score)
+
 	res, err := claimForReplay.Run(ctx, r.client,
 		[]string{r.taskKey(taskID)},
 		nowStr,
+		r.stateIndexPrefix(),
+		scoreStr,
 	).Result()
 	if err != nil {
 		return nil, fmt.Errorf("redis: claim for replay: %w", err)
@@ -361,6 +406,39 @@ func (r *RedisStore) ClaimForReplay(ctx context.Context, taskID string) (*broker
 		return nil, fmt.Errorf("redis: claim for replay: unmarshal: %w", err)
 	}
 	return &task, nil
+}
+
+// RollbackReplayClaim atomically reverts a REPLAY_PENDING task to
+// FAILED+RoutedToDeadLetter=true so the replay remains recoverable after a
+// Submit failure.
+func (r *RedisStore) RollbackReplayClaim(ctx context.Context, taskID string) error {
+	now := time.Now()
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	score := float64(now.UnixNano()) / 1e9
+	scoreStr := fmt.Sprintf("%f", score)
+
+	res, err := rollbackReplayClaim.Run(ctx, r.client,
+		[]string{r.taskKey(taskID)},
+		nowStr,
+		r.stateIndexPrefix(),
+		scoreStr,
+	).Result()
+	if err != nil {
+		return fmt.Errorf("redis: rollback replay claim: %w", err)
+	}
+	s, ok := res.(string)
+	if !ok {
+		return fmt.Errorf("redis: rollback replay claim: unexpected reply type %T", res)
+	}
+	switch s {
+	case "TASK_NOT_FOUND":
+		return store.ErrTaskNotFound
+	case "NOT_REPLAY_PENDING":
+		return store.ErrTaskNotReplayPending
+	case "OK":
+		return nil
+	}
+	return fmt.Errorf("redis: rollback replay claim: unexpected reply %q", s)
 }
 
 func (r *RedisStore) GetTask(ctx context.Context, taskID string) (*broker.Task, error) {

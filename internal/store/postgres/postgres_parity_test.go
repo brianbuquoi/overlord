@@ -129,8 +129,8 @@ func TestPostgres_ClaimForReplay_RequiresDeadLettered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if claimed.State != broker.TaskStateFailed {
-		t.Errorf("returned state: got %s want FAILED (unchanged)", claimed.State)
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Errorf("returned state: got %s want REPLAY_PENDING", claimed.State)
 	}
 	if claimed.RoutedToDeadLetter {
 		t.Error("returned RoutedToDeadLetter should be cleared by the claim")
@@ -139,13 +139,13 @@ func TestPostgres_ClaimForReplay_RequiresDeadLettered(t *testing.T) {
 		t.Errorf("returned Attempts: got %d want 5", claimed.Attempts)
 	}
 
-	// Reread the stored row: RoutedToDeadLetter is now false.
+	// Reread the stored row: state is now REPLAY_PENDING, RoutedToDeadLetter false.
 	stored, err := s.GetTask(ctx, dl.ID)
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed || stored.RoutedToDeadLetter || stored.Attempts != 5 {
-		t.Errorf("stored: state=%s dl=%v attempts=%d, want FAILED/false/5",
+	if stored.State != broker.TaskStateReplayPending || stored.RoutedToDeadLetter || stored.Attempts != 5 {
+		t.Errorf("stored: state=%s dl=%v attempts=%d, want REPLAY_PENDING/false/5",
 			stored.State, stored.RoutedToDeadLetter, stored.Attempts)
 	}
 
@@ -199,11 +199,85 @@ func TestPostgres_ClaimForReplay_Concurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed {
-		t.Errorf("stored state: got %s want FAILED", stored.State)
+	if stored.State != broker.TaskStateReplayPending {
+		t.Errorf("stored state: got %s want REPLAY_PENDING", stored.State)
 	}
 	if stored.RoutedToDeadLetter {
 		t.Error("stored RoutedToDeadLetter should be cleared by the winner")
+	}
+}
+
+// TestPostgres_ClaimForReplay_TransitionsToReplayPending verifies the claim
+// updates the task's state to REPLAY_PENDING (not just flips the flag).
+func TestPostgres_ClaimForReplay_TransitionsToReplayPending(t *testing.T) {
+	s, _, _ := setupParityTest(t)
+	ctx := context.Background()
+	task := parityTask(uuid.New().String(), "p1", "s1", broker.TaskStateFailed)
+	task.RoutedToDeadLetter = true
+	if err := s.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimForReplay(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Errorf("claimed state: got %s want REPLAY_PENDING", claimed.State)
+	}
+	stored, _ := s.GetTask(ctx, task.ID)
+	if stored.State != broker.TaskStateReplayPending {
+		t.Errorf("stored state: got %s want REPLAY_PENDING", stored.State)
+	}
+}
+
+// TestPostgres_RollbackReplayClaim_RestoresDeadLettered asserts rollback from
+// REPLAY_PENDING returns the task to FAILED+dead-lettered and re-claimable.
+func TestPostgres_RollbackReplayClaim_RestoresDeadLettered(t *testing.T) {
+	s, _, _ := setupParityTest(t)
+	ctx := context.Background()
+	task := parityTask(uuid.New().String(), "p1", "s1", broker.TaskStateFailed)
+	task.RoutedToDeadLetter = true
+	if err := s.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimForReplay(ctx, task.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := s.RollbackReplayClaim(ctx, task.ID); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	got, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != broker.TaskStateFailed {
+		t.Errorf("state after rollback: got %s want FAILED", got.State)
+	}
+	if !got.RoutedToDeadLetter {
+		t.Errorf("RoutedToDeadLetter after rollback: got false want true")
+	}
+	if _, err := s.ClaimForReplay(ctx, task.ID); err != nil {
+		t.Errorf("re-claim after rollback: got %v want nil", err)
+	}
+}
+
+// TestPostgres_RollbackReplayClaim_FailsIfNotReplayPending covers both
+// ErrTaskNotFound and ErrTaskNotReplayPending disambiguation.
+func TestPostgres_RollbackReplayClaim_FailsIfNotReplayPending(t *testing.T) {
+	s, _, _ := setupParityTest(t)
+	ctx := context.Background()
+
+	if err := s.RollbackReplayClaim(ctx, "does-not-exist"); err != store.ErrTaskNotFound {
+		t.Errorf("not found: got %v want ErrTaskNotFound", err)
+	}
+
+	task := parityTask(uuid.New().String(), "p1", "s1", broker.TaskStateFailed)
+	task.RoutedToDeadLetter = true
+	if err := s.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RollbackReplayClaim(ctx, task.ID); err != store.ErrTaskNotReplayPending {
+		t.Errorf("FAILED task rollback: got %v want ErrTaskNotReplayPending", err)
 	}
 }
 

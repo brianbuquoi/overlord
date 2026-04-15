@@ -33,7 +33,8 @@ type Store struct {
 	OnUpdateTask     func(ctx context.Context, taskID string, update broker.TaskUpdate) error
 	OnGetTask        func(ctx context.Context, taskID string) (*broker.Task, error)
 	OnListTasks      func(ctx context.Context, filter broker.TaskFilter) (*broker.ListTasksResult, error)
-	OnClaimForReplay func(ctx context.Context, taskID string) (*broker.Task, error)
+	OnClaimForReplay    func(ctx context.Context, taskID string) (*broker.Task, error)
+	OnRollbackReplayClaim func(ctx context.Context, taskID string) error
 }
 
 // Compile-time assertion that *Store satisfies store.Store.
@@ -150,6 +151,16 @@ func (s *Store) ClaimForReplay(ctx context.Context, taskID string) (*broker.Task
 		return h(ctx, taskID)
 	}
 	return s.mem.ClaimForReplay(ctx, taskID)
+}
+
+func (s *Store) RollbackReplayClaim(ctx context.Context, taskID string) error {
+	s.mu.RLock()
+	h := s.OnRollbackReplayClaim
+	s.mu.RUnlock()
+	if h != nil {
+		return h(ctx, taskID)
+	}
+	return s.mem.RollbackReplayClaim(ctx, taskID)
 }
 
 func toSet(ids []string) map[string]struct{} {
