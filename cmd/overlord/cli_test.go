@@ -964,3 +964,171 @@ func TestIsTerminal(t *testing.T) {
 		}
 	}
 }
+
+// ── Dead-letter replay: atomic ClaimForReplay semantics ──
+
+// deadLetterTask submits a task via the broker, then mutates store state to
+// put it in FAILED+RoutedToDeadLetter so replay can be exercised.
+func deadLetterTask(t *testing.T, b *broker.Broker) *broker.Task {
+	t.Helper()
+	task, err := b.Submit(t.Context(), "test-pipeline", json.RawMessage(`{"request":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := broker.TaskStateFailed
+	dl := true
+	if err := b.Store().UpdateTask(t.Context(), task.ID, broker.TaskUpdate{
+		State:              &failed,
+		RoutedToDeadLetter: &dl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return task
+}
+
+func TestCLIReplay_AtomicClaim(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := deadLetterTask(t, b)
+
+	var errOut bytes.Buffer
+	newTask, err := replayDeadLetterTask(t.Context(), b, original.ID, &errOut, newLogger())
+	if err != nil {
+		t.Fatalf("replayDeadLetterTask failed: %v", err)
+	}
+	if newTask == nil || newTask.ID == "" {
+		t.Fatal("expected new task with non-empty ID")
+	}
+	if newTask.ID == original.ID {
+		t.Fatal("replay must create a new task with a fresh ID")
+	}
+
+	got, err := b.Store().GetTask(t.Context(), original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != broker.TaskStateReplayed {
+		t.Fatalf("original task state = %s, want REPLAYED", got.State)
+	}
+	if got.RoutedToDeadLetter {
+		t.Error("original task should no longer be flagged RoutedToDeadLetter")
+	}
+}
+
+func TestCLIReplay_NotReplayable(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Task that is merely pending — not in FAILED+DL state.
+	task, err := b.Submit(t.Context(), "test-pipeline", json.RawMessage(`{"request":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var errOut bytes.Buffer
+	newTask, err := replayDeadLetterTask(t.Context(), b, task.ID, &errOut, newLogger())
+	if err == nil {
+		t.Fatal("expected error for non-replayable task")
+	}
+	if newTask != nil {
+		t.Fatal("no new task should be created on error")
+	}
+	if !strings.Contains(err.Error(), "not in a replayable state") {
+		t.Errorf("expected 'not in a replayable state' error, got: %v", err)
+	}
+
+	// Task untouched.
+	got, err := b.Store().GetTask(t.Context(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State == broker.TaskStateReplayed {
+		t.Error("non-replayable task must not be marked REPLAYED")
+	}
+}
+
+func TestCLIReplay_NotFound(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var errOut bytes.Buffer
+	_, err = replayDeadLetterTask(t.Context(), b, "nonexistent-task-id", &errOut, newLogger())
+	if err == nil {
+		t.Fatal("expected error for missing task")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected 'not found' error, got: %v", err)
+	}
+}
+
+func TestCLIReplay_ConcurrentSingleWinner(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := deadLetterTask(t, b)
+
+	const N = 8
+	type result struct {
+		task *broker.Task
+		err  error
+	}
+	results := make(chan result, N)
+	start := make(chan struct{})
+	for i := 0; i < N; i++ {
+		go func() {
+			<-start
+			var errOut bytes.Buffer
+			nt, err := replayDeadLetterTask(t.Context(), b, original.ID, &errOut, newLogger())
+			results <- result{task: nt, err: err}
+		}()
+	}
+	close(start)
+
+	wins := 0
+	losses := 0
+	for i := 0; i < N; i++ {
+		r := <-results
+		if r.err == nil && r.task != nil {
+			wins++
+		} else if r.err != nil && strings.Contains(r.err.Error(), "not in a replayable state") {
+			losses++
+		} else {
+			t.Errorf("unexpected result: task=%v err=%v", r.task, r.err)
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("expected exactly 1 winner, got %d", wins)
+	}
+	if losses != N-1 {
+		t.Fatalf("expected %d NotReplayable losers, got %d", N-1, losses)
+	}
+}

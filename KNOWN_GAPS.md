@@ -371,6 +371,7 @@ without a total count.
 | — | Brute-force tracker comments overstated near-capacity behavior; eviction only fired at hard cap | Medium | Tracker now evicts in bulk at 90% of `maxIPCap` down to 80%, amortising the hot-path cost. Comments updated to match. SEC4-010 (IPv6 /64 coalescing) already resolved — near-capacity behaviour is the remaining piece |
 | — | replay-all / discard-all silently ignored per-task failures | Low | Per-task failures now logged at Warn with `task_id`, `pipeline_id`, and `error`; response body now includes a `failed` count alongside `count` |
 | — | Postgres store drift: `ClaimForReplay` ignored `RoutedToDeadLetter`; `UpdateTask` and `ListTasks` ignored `RoutedToDeadLetter`, `CrossStageTransitions`, and dead-letter/discarded filters | High | Postgres schema extended (migration 003) with `routed_to_dead_letter` and `cross_stage_transitions` columns; Postgres `ClaimForReplay`/`UpdateTask`/`ListTasks` now match Redis and Memory semantics |
+| — | CLI replay commands bypass atomic `ClaimForReplay`, reintroducing duplicate-replay bug through a separate code path | High | CLI `dead-letter replay` and `replay-all` now go through the same `ClaimForReplay` → `Submit` → `RollbackReplayClaim`-on-failure → mark `REPLAYED` sequence as the HTTP handlers. Concurrent CLI invocations and mixed CLI/API usage now produce exactly one winner; failed submits roll back to FAILED+DL=true or surface actionable REPLAY_PENDING warnings. |
 
 ---
 

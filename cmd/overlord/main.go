@@ -6,7 +6,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -31,6 +33,7 @@ import (
 	"github.com/brianbuquoi/overlord/internal/metrics"
 	"github.com/brianbuquoi/overlord/internal/migration"
 	internalplugin "github.com/brianbuquoi/overlord/internal/plugin"
+	"github.com/brianbuquoi/overlord/internal/store"
 	"github.com/brianbuquoi/overlord/internal/store/memory"
 	pgstore "github.com/brianbuquoi/overlord/internal/store/postgres"
 	redisstore "github.com/brianbuquoi/overlord/internal/store/redis"
@@ -1407,6 +1410,42 @@ func deadLetterListCmd() *cobra.Command {
 	return cmd
 }
 
+// replayDeadLetterTask performs the atomic ClaimForReplay → Submit →
+// RollbackReplayClaim-on-failure → mark REPLAYED sequence, matching the
+// semantics enforced by the HTTP dead-letter replay handler. Returns the
+// submitted new task on success.
+func replayDeadLetterTask(ctx context.Context, b *broker.Broker, taskID string, errOut io.Writer, logger *slog.Logger) (*broker.Task, error) {
+	task, err := b.Store().ClaimForReplay(ctx, taskID)
+	if errors.Is(err, store.ErrTaskNotFound) {
+		return nil, fmt.Errorf("task %q not found", taskID)
+	}
+	if errors.Is(err, store.ErrTaskNotReplayable) {
+		return nil, fmt.Errorf("task %q is not in a replayable state", taskID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to claim task for replay: %w", err)
+	}
+
+	newTask, err := b.Submit(ctx, task.PipelineID, task.Payload)
+	if err != nil {
+		if rbErr := b.Store().RollbackReplayClaim(ctx, task.ID); rbErr != nil {
+			fmt.Fprintf(errOut, "WARNING: replay rollback failed for task %s: %v (rollback error: %v)\n",
+				task.ID, err, rbErr)
+			fmt.Fprintf(errOut, "Task %s may be stranded in REPLAY_PENDING state — manual recovery required\n", task.ID)
+		}
+		return nil, fmt.Errorf("failed to submit replay task: %w", err)
+	}
+
+	replayed := broker.TaskStateReplayed
+	if markErr := b.Store().UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &replayed}); markErr != nil {
+		logger.Warn("replay: failed to mark original task as REPLAYED",
+			"task_id", task.ID,
+			"error", markErr.Error(),
+		)
+	}
+	return newTask, nil
+}
+
 func deadLetterReplayCmd() *cobra.Command {
 	var configPath string
 	var taskID string
@@ -1426,19 +1465,10 @@ func deadLetterReplayCmd() *cobra.Command {
 				return err
 			}
 
-			task, err := b.GetTask(cmd.Context(), taskID)
+			newTask, err := replayDeadLetterTask(cmd.Context(), b, taskID, cmd.ErrOrStderr(), logger)
 			if err != nil {
-				return fmt.Errorf("task %q not found: %w", taskID, err)
+				return err
 			}
-			if !task.RoutedToDeadLetter || task.State != broker.TaskStateFailed {
-				return fmt.Errorf("task %q is not in dead-letter state (state: %s)", taskID, task.State)
-			}
-
-			newTask, err := b.Submit(cmd.Context(), task.PipelineID, task.Payload)
-			if err != nil {
-				return fmt.Errorf("replay failed: %w", err)
-			}
-
 			fmt.Fprintln(cmd.OutOrStdout(), newTask.ID)
 			return nil
 		},
@@ -1473,7 +1503,13 @@ func deadLetterReplayAllCmd() *cobra.Command {
 
 			deadLetter := true
 			failedState := broker.TaskStateFailed
-			result, err := b.Store().ListTasks(cmd.Context(), broker.TaskFilter{
+
+			// Peek at the list first so we can prompt the operator. Use a
+			// bounded list solely for the confirmation message; the actual
+			// replay loop paginates via repeated offset=0 fetches since
+			// ClaimForReplay flips RoutedToDeadLetter and drops items out
+			// of the filter.
+			peek, err := b.Store().ListTasks(cmd.Context(), broker.TaskFilter{
 				PipelineID:         &pipelineID,
 				State:              &failedState,
 				RoutedToDeadLetter: &deadLetter,
@@ -1483,13 +1519,13 @@ func deadLetterReplayAllCmd() *cobra.Command {
 				return err
 			}
 
-			if len(result.Tasks) == 0 {
+			if len(peek.Tasks) == 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "No dead-lettered tasks found.")
 				return nil
 			}
 
 			if !yes {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Replay %d dead-lettered tasks for pipeline %q? [y/N] ", len(result.Tasks), pipelineID)
+				fmt.Fprintf(cmd.ErrOrStderr(), "Replay %d dead-lettered tasks for pipeline %q? [y/N] ", len(peek.Tasks), pipelineID)
 				var input string
 				fmt.Fscanln(os.Stdin, &input)
 				if strings.ToLower(input) != "y" {
@@ -1498,17 +1534,68 @@ func deadLetterReplayAllCmd() *cobra.Command {
 				}
 			}
 
+			const maxBulk = 100000
 			count := 0
-			for _, task := range result.Tasks {
-				newTask, err := b.Submit(cmd.Context(), task.PipelineID, task.Payload)
+			failed := 0
+			for count < maxBulk {
+				page, err := b.Store().ListTasks(cmd.Context(), broker.TaskFilter{
+					PipelineID:         &pipelineID,
+					State:              &failedState,
+					RoutedToDeadLetter: &deadLetter,
+					Limit:              1000,
+				})
 				if err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "Failed to replay task %s: %v\n", task.ID, err)
-					continue
+					return err
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%s → %s\n", task.ID, newTask.ID)
-				count++
+				if len(page.Tasks) == 0 {
+					break
+				}
+				progressed := false
+				for _, task := range page.Tasks {
+					if count >= maxBulk {
+						break
+					}
+					claimed, err := b.Store().ClaimForReplay(cmd.Context(), task.ID)
+					if err != nil {
+						logger.Warn("replay-all: failed to claim task",
+							"task_id", task.ID,
+							"pipeline_id", task.PipelineID,
+							"error", err.Error(),
+						)
+						failed++
+						continue
+					}
+					newTask, err := b.Submit(cmd.Context(), claimed.PipelineID, claimed.Payload)
+					if err != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(), "Failed to submit replay for task %s: %v\n", task.ID, err)
+						if rbErr := b.Store().RollbackReplayClaim(cmd.Context(), task.ID); rbErr != nil {
+							fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: replay rollback failed for task %s: %v (rollback error: %v)\n",
+								task.ID, err, rbErr)
+							fmt.Fprintf(cmd.ErrOrStderr(), "Task %s may be stranded in REPLAY_PENDING state — manual recovery required\n", task.ID)
+						}
+						failed++
+						continue
+					}
+					replayed := broker.TaskStateReplayed
+					if markErr := b.Store().UpdateTask(cmd.Context(), task.ID, broker.TaskUpdate{State: &replayed}); markErr != nil {
+						logger.Warn("replay-all: failed to mark original task as REPLAYED",
+							"task_id", task.ID,
+							"error", markErr.Error(),
+						)
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "%s → %s\n", task.ID, newTask.ID)
+					count++
+					progressed = true
+				}
+				if !progressed {
+					break
+				}
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Replayed %d tasks.\n", count)
+			if failed > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Replayed %d tasks, %d failed.\n", count, failed)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "Replayed %d tasks.\n", count)
+			}
 			return nil
 		},
 	}
