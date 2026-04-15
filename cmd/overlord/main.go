@@ -1600,12 +1600,12 @@ func deadLetterReplayAllCmd() *cobra.Command {
 				}
 			}
 
-			progress := func(taskID string, perErr error) {
+			progress := func(taskID, newTaskID string, perErr error) {
 				if perErr != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "Failed to replay task %s: %v\n", taskID, perErr)
+					fmt.Fprintf(cmd.ErrOrStderr(), "failed %s: %v\n", taskID, perErr)
 					return
 				}
-				fmt.Fprintln(cmd.OutOrStdout(), taskID)
+				fmt.Fprintf(cmd.OutOrStdout(), "replayed %s → %s\n", taskID, newTaskID)
 			}
 
 			result, err := svc.ReplayAll(cmd.Context(), pipelineID, 0, progress)
@@ -1720,9 +1720,9 @@ func deadLetterDiscardAllCmd() *cobra.Command {
 				}
 			}
 
-			progress := func(taskID string, perErr error) {
+			progress := func(taskID, newTaskID string, perErr error) {
 				if perErr != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "Failed to discard task %s: %v\n", taskID, perErr)
+					fmt.Fprintf(cmd.ErrOrStderr(), "failed %s: %v\n", taskID, perErr)
 				}
 			}
 

@@ -102,7 +102,16 @@ func TestReplayAll_HappyPath(t *testing.T) {
 
 	ids := seed(t, b, mstore.Memory(), 3)
 
-	result, err := svc.ReplayAll(context.Background(), "test-pipeline", 0, nil)
+	type call struct {
+		taskID, newTaskID string
+		err               error
+	}
+	var calls []call
+	progress := func(taskID, newTaskID string, err error) {
+		calls = append(calls, call{taskID, newTaskID, err})
+	}
+
+	result, err := svc.ReplayAll(context.Background(), "test-pipeline", 0, progress)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,6 +123,20 @@ func TestReplayAll_HappyPath(t *testing.T) {
 	}
 	if result.Truncated {
 		t.Errorf("truncated: got true want false")
+	}
+	if len(calls) != 3 {
+		t.Fatalf("progress calls: got %d want 3", len(calls))
+	}
+	for _, c := range calls {
+		if c.err != nil {
+			t.Errorf("unexpected progress err for %s: %v", c.taskID, c.err)
+		}
+		if c.newTaskID == "" {
+			t.Errorf("expected non-empty newTaskID for successful replay of %s", c.taskID)
+		}
+		if c.newTaskID == c.taskID {
+			t.Errorf("newTaskID should differ from original taskID %s", c.taskID)
+		}
 	}
 	for _, id := range ids {
 		tk, err := mstore.Memory().GetTask(context.Background(), id)
@@ -142,7 +165,23 @@ func TestReplayAll_PartialFailure(t *testing.T) {
 		return mem.EnqueueTask(ctx, stageID, task)
 	}
 
-	result, err := svc.ReplayAll(context.Background(), "test-pipeline", 0, nil)
+	successes := 0
+	failures := 0
+	progress := func(taskID, newTaskID string, err error) {
+		if err != nil {
+			failures++
+			if newTaskID != "" {
+				t.Errorf("failed callback for %s: newTaskID should be empty, got %q", taskID, newTaskID)
+			}
+			return
+		}
+		successes++
+		if newTaskID == "" {
+			t.Errorf("success callback for %s: newTaskID should be non-empty", taskID)
+		}
+	}
+
+	result, err := svc.ReplayAll(context.Background(), "test-pipeline", 0, progress)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -151,6 +190,9 @@ func TestReplayAll_PartialFailure(t *testing.T) {
 	}
 	if result.Failed != 2 {
 		t.Errorf("failed: got %d want 2", result.Failed)
+	}
+	if successes != 3 || failures != 2 {
+		t.Errorf("progress split: got successes=%d failures=%d, want 3/2", successes, failures)
 	}
 
 	for i, id := range ids {

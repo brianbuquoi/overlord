@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/brianbuquoi/overlord/internal/broker"
+	"github.com/brianbuquoi/overlord/internal/deadletter"
 	"github.com/spf13/cobra"
 )
 
@@ -1207,6 +1208,57 @@ func TestCLIReplayAll_EmptySet(t *testing.T) {
 	// No confirmation prompt should be emitted on stderr when the set is empty.
 	if strings.Contains(stderr.String(), "Replay") {
 		t.Errorf("stderr should not contain confirmation prompt when set is empty; got: %q", stderr.String())
+	}
+}
+
+// TestCLIReplayAll_ProgressOutputsNewTaskID verifies that the replay-all
+// progress callback used by the CLI emits "replayed {origID} → {newID}" so
+// operators can correlate dead-lettered tasks with their new counterparts.
+func TestCLIReplayAll_ProgressOutputsNewTaskID(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origID := deadLetterTask(t, b).ID
+
+	svc := deadletter.New(b.Store(), b, newLogger())
+
+	var stdout, stderr bytes.Buffer
+	progress := func(taskID, newTaskID string, perErr error) {
+		if perErr != nil {
+			fmt.Fprintf(&stderr, "failed %s: %v\n", taskID, perErr)
+			return
+		}
+		fmt.Fprintf(&stdout, "replayed %s → %s\n", taskID, newTaskID)
+	}
+
+	result, err := svc.ReplayAll(t.Context(), "test-pipeline", 0, progress)
+	if err != nil {
+		t.Fatalf("ReplayAll: %v", err)
+	}
+	if result.Processed != 1 || result.Failed != 0 {
+		t.Fatalf("result: got processed=%d failed=%d, want 1/0", result.Processed, result.Failed)
+	}
+
+	out := stdout.String()
+	prefix := "replayed " + origID + " → "
+	if !strings.Contains(out, prefix) {
+		t.Fatalf("stdout missing %q; got: %q", prefix, out)
+	}
+	rest := out[strings.Index(out, prefix)+len(prefix):]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[:nl]
+	}
+	if strings.TrimSpace(rest) == "" {
+		t.Errorf("new task ID after '→' is empty; full stdout: %q", out)
+	}
+	if strings.TrimSpace(rest) == origID {
+		t.Errorf("new task ID should differ from original %s; got: %q", origID, rest)
 	}
 }
 

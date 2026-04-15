@@ -30,10 +30,13 @@ type BulkResult struct {
 	Truncated bool
 }
 
-// ProgressFunc is called after each task is processed. taskID is the original
-// dead-letter task ID; err is non-nil when the task failed to be replayed or
-// discarded. Callers that do not need progress output can pass nil.
-type ProgressFunc func(taskID string, err error)
+// ProgressFunc is called after each task is processed during a bulk operation.
+// taskID is the original dead-lettered task ID.
+// newTaskID is the ID of the newly submitted task on success, or empty string
+// on failure and for operations (like discard) that do not produce a new task.
+// err is non-nil if the task failed to process.
+// Callers that do not need progress output can pass nil.
+type ProgressFunc func(taskID string, newTaskID string, err error)
 
 // Service encapsulates bulk dead-letter operations. It is safe for use from
 // any goroutine that calls the underlying Store and Broker safely; it has
@@ -103,17 +106,18 @@ func (s *Service) ReplayAll(ctx context.Context, pipelineID string, maxTasks int
 			if _, already := failedIDs[task.ID]; already {
 				continue
 			}
-			if err := s.replayOne(ctx, task); err != nil {
+			newTaskID, err := s.replayOne(ctx, task)
+			if err != nil {
 				failedIDs[task.ID] = struct{}{}
 				if onProgress != nil {
-					onProgress(task.ID, err)
+					onProgress(task.ID, "", err)
 				}
 				continue
 			}
 			count++
 			progressed = true
 			if onProgress != nil {
-				onProgress(task.ID, nil)
+				onProgress(task.ID, newTaskID, nil)
 			}
 		}
 		if !progressed {
@@ -139,7 +143,7 @@ func (s *Service) ReplayAll(ctx context.Context, pipelineID string, maxTasks int
 // It returns a non-nil error on any failure so the caller can track the task
 // in failedIDs. Log output matches the original API handler line-for-line so
 // operator-facing observability is preserved.
-func (s *Service) replayOne(ctx context.Context, task *broker.Task) error {
+func (s *Service) replayOne(ctx context.Context, task *broker.Task) (string, error) {
 	claimed, err := s.store.ClaimForReplay(ctx, task.ID)
 	if err != nil {
 		s.logger.Warn("replay-all: failed to claim task",
@@ -147,9 +151,10 @@ func (s *Service) replayOne(ctx context.Context, task *broker.Task) error {
 			"pipeline_id", task.PipelineID,
 			"error", err.Error(),
 		)
-		return err
+		return "", err
 	}
-	if _, err := s.broker.Submit(ctx, claimed.PipelineID, claimed.Payload); err != nil {
+	newTask, err := s.broker.Submit(ctx, claimed.PipelineID, claimed.Payload)
+	if err != nil {
 		s.logger.Warn("replay-all: failed to submit replay task",
 			"task_id", task.ID,
 			"pipeline_id", task.PipelineID,
@@ -162,7 +167,7 @@ func (s *Service) replayOne(ctx context.Context, task *broker.Task) error {
 				"rollback_error", rbErr.Error(),
 			)
 		}
-		return err
+		return "", err
 	}
 	replayed := broker.TaskStateReplayed
 	if markErr := s.store.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &replayed}); markErr != nil {
@@ -171,7 +176,7 @@ func (s *Service) replayOne(ctx context.Context, task *broker.Task) error {
 			"error", markErr.Error(),
 		)
 	}
-	return nil
+	return newTask.ID, nil
 }
 
 // DiscardAll discards all dead-lettered tasks matching the filter.
@@ -225,14 +230,14 @@ func (s *Service) DiscardAll(ctx context.Context, pipelineID string, maxTasks in
 				)
 				failedIDs[task.ID] = struct{}{}
 				if onProgress != nil {
-					onProgress(task.ID, err)
+					onProgress(task.ID, "", err)
 				}
 				continue
 			}
 			count++
 			progressed = true
 			if onProgress != nil {
-				onProgress(task.ID, nil)
+				onProgress(task.ID, "", nil)
 			}
 		}
 		if !progressed {
