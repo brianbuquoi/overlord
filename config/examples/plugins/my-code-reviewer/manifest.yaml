@@ -1,0 +1,14 @@
+# Example plugin manifest referenced by config/examples/plugin.yaml.
+# The binary path here is illustrative — the plugin subprocess is only
+# spawned at first Execute/HealthCheck, not at config load time.
+name: my-code-reviewer
+version: "0.1.0"
+description: "Illustrative subprocess plugin manifest"
+binary: ./bin/my-code-reviewer
+env:
+  - PATH
+  - HOME
+on_failure: retryable
+rpc_timeout: 30s
+shutdown_timeout: 5s
+max_restarts: 5

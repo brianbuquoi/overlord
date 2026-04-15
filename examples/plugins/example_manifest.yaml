@@ -1,0 +1,45 @@
+# Example subprocess plugin manifest for Overlord.
+#
+# Place this file (or a copy of it) somewhere on disk and reference it from a
+# pipeline config via:
+#
+#   agents:
+#     - id: external-reviewer
+#       provider: plugin
+#       manifest: ./plugins/my-code-reviewer/manifest.yaml
+#
+# The subprocess plugin system runs each plugin as an isolated OS process and
+# communicates over newline-delimited JSON-RPC 2.0 on stdin/stdout. See
+# docs/plugin-security.md for the full security model.
+
+name: example-reviewer
+version: "1.0.0"
+description: "Example subprocess plugin that echoes its input."
+
+# Path to the executable. Relative paths are resolved against the directory
+# containing this manifest file.
+binary: ./bin/example-reviewer
+args: ["--quiet"]
+
+# Environment variables the subprocess is allowed to inherit from Overlord's
+# environment. Anything not listed here is stripped — plugins do NOT inherit
+# ANTHROPIC_API_KEY, DATABASE_URL, etc. by default.
+env:
+  - PATH
+  - HOME
+
+# How execute() failures are surfaced to the broker.
+#   retryable     → broker will retry according to stage retry policy (default)
+#   non_retryable → task fails immediately, no retry
+on_failure: retryable
+
+# RPC call timeout (per-call). Plugins that do not respond within this window
+# produce a retryable error.
+rpc_timeout: 30s
+
+# Time to wait for graceful SIGTERM before the subprocess is SIGKILL-ed.
+shutdown_timeout: 5s
+
+# Maximum number of automatic restarts after the subprocess exits.
+#   0 = unlimited, N = at most N restarts before the agent is marked unhealthy.
+max_restarts: 5

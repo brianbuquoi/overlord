@@ -1,0 +1,50 @@
+# Example Overlord pipeline that uses a subprocess plugin agent.
+#
+# Subprocess plugins are isolated OS processes that communicate with Overlord
+# over newline-delimited JSON-RPC 2.0 on stdin/stdout. See
+# docs/plugin-security.md for the full security model.
+
+version: "1"
+
+schema_registry:
+  - name: review_input
+    version: "v1"
+    path: ../../schemas/review_input_v1.json
+  - name: review_output
+    version: "v1"
+    path: ../../schemas/review_output_v1.json
+
+pipelines:
+  - name: external-review
+    concurrency: 4
+    store: memory
+    stages:
+      - id: review
+        agent: external-reviewer
+        input_schema:
+          name: review_input
+          version: "v1"
+        output_schema:
+          name: review_output
+          version: "v1"
+        timeout: 1m
+        retry:
+          max_attempts: 3
+          backoff: exponential
+          base_delay: 2s
+        on_success: done
+        on_failure: dead-letter
+
+agents:
+  - id: external-reviewer
+    provider: plugin
+    # Path to the plugin manifest YAML. See examples/plugins/example_manifest.yaml
+    # for the supported fields.
+    manifest: ./plugins/my-code-reviewer/manifest.yaml
+    # SystemPrompt is forwarded to the plugin subprocess as `system_prompt`
+    # inside each execute RPC request. The plugin decides how to apply it.
+    system_prompt: "You are an expert code reviewer. Reply in structured JSON."
+
+stores:
+  memory:
+    max_tasks: 1000

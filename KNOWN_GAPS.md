@@ -146,14 +146,21 @@ and sent to the LLM API without any guardrail.
 **Recommendation:** Enforce max system_prompt length (e.g., 512KB) during config
 validation.
 
-### SEC4-007: Plugin file paths not validated against directory traversal
+### SEC4-007: Plugin file paths not validated against directory traversal — RESOLVED
 **Location:** `internal/plugin/loader.go` — `resolvePaths()`
 **Severity:** Medium
+**Status:** Resolved
 **Description:** Plugin `files:` list entries are passed to `os.Stat()` and
 `plugin.Open()` without validating against `../` sequences. Requires config file
 access (trusted), but defense-in-depth gap.
-**Recommendation:** Reject paths containing `..` or resolve to absolute and verify
-within an allowed directory.
+**Resolution:** A new subprocess-based plugin system (`provider: "plugin"`) has
+been introduced alongside the existing `.so` loader. Subprocess plugins run in
+isolated OS processes communicating via JSON-RPC 2.0 over stdin/stdout with
+manifest-validated binary paths (name may not contain path separators),
+explicit environment allow-listing, and Linux seccomp-BPF documentation for
+defense-in-depth. See `docs/plugin-security.md`. The `.so` loader remains for
+trusted operators; untrusted integrations should prefer the subprocess
+provider.
 
 ### KG-004: Redis state index is not pipeline-scoped for dead-letter bulk ops — RESOLVED
 **Location:** `internal/store/redis/redis.go` — `listTasksFromStatePipelineIndex`
@@ -345,7 +352,7 @@ without a total count.
 | SEC4-004 | No max length on path parameters | Low | Accepted |
 | SEC4-005 | No length limit on query filter params | Low | Accepted |
 | SEC4-006 | No config-level system_prompt size limit | Medium | Open |
-| SEC4-007 | Plugin paths not traversal-checked | Medium | Open |
+| SEC4-007 | Plugin paths not traversal-checked | Medium | Resolved |
 | SEC4-008 | Replay dead-letter phantom PENDING | High | Resolved |
 | SEC4-008b | Concurrent replay semantics: N-winner read-only claim | Medium | Resolved |
 | SEC4-008c | Replay claim consumed before Submit succeeds strands task (FAILED+DL=false) | High | Resolved |

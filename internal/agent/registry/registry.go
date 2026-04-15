@@ -88,6 +88,9 @@ func NewFromConfigWithPlugins(cfg config.Agent, plugins map[string]pluginapi.Age
 			ID:    cfg.ID,
 			Model: cfg.Model,
 		}), nil
+
+	case "plugin":
+		return internalplugin.LoadAndCreate(cfg, logger)
 	}
 
 	// Check plugins.
@@ -104,7 +107,7 @@ func NewFromConfigWithPlugins(cfg config.Agent, plugins map[string]pluginapi.Age
 	}
 
 	return nil, fmt.Errorf(
-		"unknown agent provider %q for agent %q — valid providers: anthropic, openai, openai-responses, google, ollama, copilot",
+		"unknown agent provider %q for agent %q — valid providers: anthropic, openai, openai-responses, google, ollama, copilot, plugin",
 		cfg.Provider, cfg.ID,
 	)
 }

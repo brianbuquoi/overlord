@@ -188,6 +188,10 @@ type Agent struct {
 	Timeout      Duration           `yaml:"timeout"`
 	RetryBudget  *RetryBudgetConfig `yaml:"retry_budget,omitempty"`
 	Extra        map[string]any     `yaml:"extra,omitempty"` // arbitrary provider-specific config (passed to plugins)
+	// ManifestPath is the path to a subprocess-plugin manifest file. Only
+	// consulted when Provider == "plugin". Resolved relative to the process
+	// working directory.
+	ManifestPath string `yaml:"manifest,omitempty"`
 }
 
 // AuthConfig holds authentication settings.
