@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -170,10 +171,15 @@ func TestDeadLetterReplay_PreservesPayload(t *testing.T) {
 		t.Fatalf("expected 0 attempts on replayed task, got %d", newTask.Attempts)
 	}
 
-	// Verify original task is unchanged.
+	// ClaimForReplay transitions the original task out of FAILED+dead-letter
+	// and into PENDING as part of its atomic claim, so the original is no
+	// longer available for re-replay. Verify the claim actually happened.
 	origAfter, _ := st.GetTask(context.Background(), taskID)
-	if origAfter.State != broker.TaskStateFailed {
-		t.Fatalf("original task should still be FAILED, got %s", origAfter.State)
+	if origAfter.State != broker.TaskStatePending {
+		t.Fatalf("original task should be PENDING after claim, got %s", origAfter.State)
+	}
+	if origAfter.RoutedToDeadLetter {
+		t.Fatal("original task should have routed_to_dead_letter cleared after claim")
 	}
 }
 
@@ -268,6 +274,59 @@ func TestDeadLetterReplayAll(t *testing.T) {
 	}
 }
 
+// replay-all must page past the first maxListLimit (1000) tasks.
+// Seeds 1050 dead-letter tasks and asserts all are replayed.
+func TestDeadLetterReplayAll_BeyondFirstPage(t *testing.T) {
+	srv, b, st := newDeadLetterTestServer(t)
+	defer srv.Shutdown(context.Background())
+
+	const seeded = 1050
+	seedDeadLetterTasks(t, b, st, seeded, 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/replay-all?pipeline_id=test-pipeline", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp replayAllResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Count != seeded {
+		t.Fatalf("expected all %d tasks replayed, got %d", seeded, resp.Count)
+	}
+	if resp.Truncated {
+		t.Fatalf("did not expect truncation at %d tasks, got truncated=true", seeded)
+	}
+}
+
+// discard-all must page past the first maxListLimit (1000) tasks.
+func TestDeadLetterDiscardAll_BeyondFirstPage(t *testing.T) {
+	srv, b, st := newDeadLetterTestServer(t)
+	defer srv.Shutdown(context.Background())
+
+	const seeded = 1050
+	seedDeadLetterTasks(t, b, st, seeded, 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/discard-all?pipeline_id=test-pipeline", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp discardAllResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Count != seeded {
+		t.Fatalf("expected all %d tasks discarded, got %d", seeded, resp.Count)
+	}
+	if resp.Truncated {
+		t.Fatalf("did not expect truncation at %d tasks, got truncated=true", seeded)
+	}
+}
+
 // Test 12: replay-all rate limit.
 func TestDeadLetterReplayAll_RateLimit(t *testing.T) {
 	srv, b, st := newDeadLetterTestServer(t)
@@ -289,6 +348,53 @@ func TestDeadLetterReplayAll_RateLimit(t *testing.T) {
 	srv.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Concurrent replay requests for the same task must produce exactly one
+// success (202) and N-1 conflicts (409) — the ClaimForReplay path is
+// atomic, so no duplicate replays are enqueued under contention.
+func TestReplayDeadLetter_Concurrent(t *testing.T) {
+	srv, b, st := newDeadLetterTestServer(t)
+	defer srv.Shutdown(context.Background())
+
+	failedIDs, _ := seedDeadLetterTasks(t, b, st, 1, 0)
+	taskID := failedIDs[0]
+
+	const N = 20
+	var wg sync.WaitGroup
+	codes := make([]int, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/"+taskID+"/replay", nil)
+			w := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(w, req)
+			codes[i] = w.Code
+		}(i)
+	}
+	wg.Wait()
+
+	ok, conflict, other := 0, 0, 0
+	for _, c := range codes {
+		switch c {
+		case http.StatusAccepted:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			other++
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("expected exactly 1 accepted replay under contention, got %d (conflict=%d other=%d)", ok, conflict, other)
+	}
+	if conflict != N-1 {
+		t.Fatalf("expected %d conflicts, got %d (accepted=%d other=%d)", N-1, conflict, ok, other)
+	}
+	if other != 0 {
+		t.Fatalf("expected no other status codes, got %d", other)
 	}
 }
 
