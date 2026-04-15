@@ -234,63 +234,162 @@ func (p *PostgresStore) UpdateTask(ctx context.Context, taskID string, update br
 // callers all race the same UPDATE but only one row satisfies the predicate
 // once the winner commits, so the losers affect 0 rows and receive
 // ErrTaskNotReplayable.
+//
+// The UPDATE and the existence check are collapsed into a single CTE-backed
+// statement so NOT_FOUND vs NOT_REPLAYABLE disambiguation is atomic within
+// one MVCC snapshot — a concurrent DELETE cannot slip between the two reads.
 func (p *PostgresStore) ClaimForReplay(ctx context.Context, taskID string) (*broker.Task, error) {
-	updateQuery := fmt.Sprintf(`UPDATE %s
-		SET state = 'REPLAY_PENDING', routed_to_dead_letter = false, updated_at = NOW()
-		WHERE id = $1 AND state = 'FAILED' AND routed_to_dead_letter = true
-		RETURNING %s`, p.table, selectColumns)
+	query := fmt.Sprintf(`WITH attempted AS (
+		UPDATE %s
+		SET state = 'REPLAY_PENDING',
+		    routed_to_dead_letter = false,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND state = 'FAILED'
+		  AND routed_to_dead_letter = true
+		RETURNING %s
+	),
+	current_state AS (
+		SELECT state FROM %s WHERE id = $1
+	)
+	SELECT attempted.id,
+	       attempted.pipeline_id, attempted.stage_id,
+	       attempted.input_schema_name, attempted.input_schema_version,
+	       attempted.output_schema_name, attempted.output_schema_version,
+	       attempted.payload, attempted.metadata, attempted.state,
+	       attempted.attempts, attempted.max_attempts,
+	       attempted.created_at, attempted.updated_at, attempted.expires_at,
+	       attempted.routed_to_dead_letter, attempted.cross_stage_transitions,
+	       current_state.state AS _current_state
+	FROM attempted
+	FULL OUTER JOIN current_state ON true`, p.table, selectColumns, p.table)
 
-	row := p.pool.QueryRow(ctx, updateQuery, taskID)
-	task, err := scanTask(row)
-	if err == nil {
-		return task, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("postgres: claim for replay: %w", err)
-	}
+	var (
+		id, pipelineID, stageID                                           *string
+		inputSchemaName, inputSchemaVersion                               *string
+		outputSchemaName, outputSchemaVersion                             *string
+		payloadBytes, metadataBytes                                       []byte
+		state                                                             *string
+		attempts, maxAttempts, crossStageTransitions                      *int
+		createdAt, updatedAt, expiresAt                                   *time.Time
+		routedToDeadLetter                                                *bool
+		currentState                                                      *string
+	)
 
-	// UPDATE matched zero rows: distinguish NOT FOUND from NOT REPLAYABLE.
-	existsQuery := fmt.Sprintf(`SELECT state FROM %s WHERE id = $1`, p.table)
-	var state string
-	err = p.pool.QueryRow(ctx, existsQuery, taskID).Scan(&state)
+	err := p.pool.QueryRow(ctx, query, taskID).Scan(
+		&id, &pipelineID, &stageID,
+		&inputSchemaName, &inputSchemaVersion,
+		&outputSchemaName, &outputSchemaVersion,
+		&payloadBytes, &metadataBytes, &state,
+		&attempts, &maxAttempts,
+		&createdAt, &updatedAt, &expiresAt,
+		&routedToDeadLetter, &crossStageTransitions,
+		&currentState,
+	)
 	if err != nil {
+		// Both CTEs empty → task does not exist.
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, store.ErrTaskNotFound
 		}
-		return nil, fmt.Errorf("postgres: claim for replay exists-check: %w", err)
+		return nil, fmt.Errorf("postgres: claim for replay: %w", err)
 	}
-	return nil, store.ErrTaskNotReplayable
+
+	// Row returned with attempted side NULL: task exists but did not satisfy
+	// the claim predicate (wrong state or already claimed by a concurrent caller).
+	if id == nil {
+		return nil, store.ErrTaskNotReplayable
+	}
+
+	task := &broker.Task{
+		ID:                    *id,
+		PipelineID:            derefString(pipelineID),
+		StageID:               derefString(stageID),
+		InputSchemaName:       derefString(inputSchemaName),
+		InputSchemaVersion:    derefString(inputSchemaVersion),
+		OutputSchemaName:      derefString(outputSchemaName),
+		OutputSchemaVersion:   derefString(outputSchemaVersion),
+		Payload:               json.RawMessage(payloadBytes),
+		State:                 broker.TaskState(derefString(state)),
+		Attempts:              derefInt(attempts),
+		MaxAttempts:           derefInt(maxAttempts),
+		CreatedAt:             derefTime(createdAt),
+		UpdatedAt:             derefTime(updatedAt),
+		ExpiresAt:             derefTime(expiresAt),
+		RoutedToDeadLetter:    derefBool(routedToDeadLetter),
+		CrossStageTransitions: derefInt(crossStageTransitions),
+	}
+	if len(metadataBytes) > 0 {
+		if err := json.Unmarshal(metadataBytes, &task.Metadata); err != nil {
+			return nil, fmt.Errorf("postgres: claim for replay unmarshal metadata: %w", err)
+		}
+	}
+	return task, nil
 }
 
 // RollbackReplayClaim atomically reverts a REPLAY_PENDING task to
 // FAILED+RoutedToDeadLetter=true. Used by the replay handler when Submit fails
 // after a successful claim.
+//
+// Like ClaimForReplay, this uses a single CTE-backed statement so the
+// UPDATE and the existence check see a consistent MVCC snapshot and the
+// NOT_FOUND vs NOT_REPLAY_PENDING disambiguation cannot be perturbed by a
+// concurrent DELETE between round trips.
 func (p *PostgresStore) RollbackReplayClaim(ctx context.Context, taskID string) error {
-	updateQuery := fmt.Sprintf(`UPDATE %s
-		SET state = 'FAILED', routed_to_dead_letter = true, updated_at = NOW()
+	query := fmt.Sprintf(`WITH attempted AS (
+		UPDATE %s
+		SET state = 'FAILED',
+		    routed_to_dead_letter = true,
+		    updated_at = NOW()
 		WHERE id = $1 AND state = 'REPLAY_PENDING'
-		RETURNING id`, p.table)
+		RETURNING id
+	),
+	current_state AS (
+		SELECT state FROM %s WHERE id = $1
+	)
+	SELECT attempted.id, current_state.state AS _current_state
+	FROM attempted
+	FULL OUTER JOIN current_state ON true`, p.table, p.table)
 
-	var gotID string
-	err := p.pool.QueryRow(ctx, updateQuery, taskID).Scan(&gotID)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("postgres: rollback replay claim: %w", err)
-	}
-
-	// UPDATE matched zero rows: distinguish NOT FOUND from NOT_REPLAY_PENDING.
-	existsQuery := fmt.Sprintf(`SELECT state FROM %s WHERE id = $1`, p.table)
-	var state string
-	err = p.pool.QueryRow(ctx, existsQuery, taskID).Scan(&state)
+	var gotID, currentState *string
+	err := p.pool.QueryRow(ctx, query, taskID).Scan(&gotID, &currentState)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.ErrTaskNotFound
 		}
-		return fmt.Errorf("postgres: rollback replay claim exists-check: %w", err)
+		return fmt.Errorf("postgres: rollback replay claim: %w", err)
+	}
+	if gotID != nil {
+		return nil
 	}
 	return store.ErrTaskNotReplayPending
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func derefInt(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func derefBool(p *bool) bool {
+	if p == nil {
+		return false
+	}
+	return *p
+}
+
+func derefTime(p *time.Time) time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	return *p
 }
 
 func (p *PostgresStore) GetTask(ctx context.Context, taskID string) (*broker.Task, error) {

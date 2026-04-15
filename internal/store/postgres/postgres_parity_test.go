@@ -207,6 +207,34 @@ func TestPostgres_ClaimForReplay_Concurrent(t *testing.T) {
 	}
 }
 
+// TestPostgres_ClaimForReplay_SingleRoundTrip documents the contract that
+// ClaimForReplay must execute as a single SQL statement — not a conditional
+// UPDATE followed by a separate SELECT — so the NOT_FOUND vs NOT_REPLAYABLE
+// disambiguation is atomic within one MVCC snapshot. A concurrent DELETE
+// between two round trips would otherwise make a NOT_REPLAYABLE task look
+// like NOT_FOUND. The implementation in postgres.go collapses both into a
+// CTE-backed statement with FULL OUTER JOIN; this test asserts the happy
+// path still succeeds. The comment is the contract record.
+func TestPostgres_ClaimForReplay_SingleRoundTrip(t *testing.T) {
+	s, _, _ := setupParityTest(t)
+	ctx := context.Background()
+	task := parityTask(uuid.New().String(), "p1", "s1", broker.TaskStateFailed)
+	task.RoutedToDeadLetter = true
+	if err := s.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimForReplay(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed.State != broker.TaskStateReplayPending {
+		t.Errorf("claimed state: got %s want REPLAY_PENDING", claimed.State)
+	}
+	if claimed.ID != task.ID {
+		t.Errorf("claimed id: got %s want %s", claimed.ID, task.ID)
+	}
+}
+
 // TestPostgres_ClaimForReplay_TransitionsToReplayPending verifies the claim
 // updates the task's state to REPLAY_PENDING (not just flips the flag).
 func TestPostgres_ClaimForReplay_TransitionsToReplayPending(t *testing.T) {
