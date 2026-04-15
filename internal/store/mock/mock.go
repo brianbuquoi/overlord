@@ -46,10 +46,14 @@ func New() *Store {
 	return &Store{mem: memory.New()}
 }
 
-// NewWithFailingSubmit returns a mock store where EnqueueTask returns
-// ErrInjected for any task whose ID is in failIDs. All other task IDs
-// delegate to the underlying memory store. This is the common pattern
-// for exercising per-task failure paths in bulk handlers like replay-all.
+// NewWithFailingSubmit returns a mock Store where EnqueueTask returns
+// ErrInjected for the specified task IDs. The match is on the task ID
+// at enqueue time.
+//
+// Note: for handlers that generate new task IDs at submission time
+// (such as replay-all), the original dead-letter task ID will not match
+// the newly-generated ID. In those cases, set OnEnqueueTask directly
+// with a call-count gate or other logic instead of using this constructor.
 func NewWithFailingSubmit(failIDs ...string) *Store {
 	m := New()
 	fail := toSet(failIDs)
@@ -62,9 +66,13 @@ func NewWithFailingSubmit(failIDs ...string) *Store {
 	return m
 }
 
-// NewWithFailingUpdate returns a mock store where UpdateTask returns
-// ErrInjected for any task whose ID is in failIDs. All other task IDs
-// delegate to the underlying memory store.
+// NewWithFailingUpdate returns a mock Store where UpdateTask returns
+// ErrInjected for the specified task IDs. The match is on the task ID
+// at update time.
+//
+// Note: if the handler being tested generates or transforms task IDs
+// before calling UpdateTask, set OnUpdateTask directly instead of
+// using this constructor.
 func NewWithFailingUpdate(failIDs ...string) *Store {
 	m := New()
 	fail := toSet(failIDs)

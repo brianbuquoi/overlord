@@ -328,13 +328,13 @@ type replayResponse struct {
 }
 
 type replayAllResponse struct {
-	Count     int  `json:"count"`
+	Processed int  `json:"processed"`
 	Failed    int  `json:"failed,omitempty"`
 	Truncated bool `json:"truncated,omitempty"`
 }
 
 type discardAllResponse struct {
-	Count     int  `json:"count"`
+	Processed int  `json:"processed"`
 	Failed    int  `json:"failed,omitempty"`
 	Truncated bool `json:"truncated,omitempty"`
 }
@@ -487,10 +487,11 @@ func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Reques
 	count := 0
 	failed := 0
 	truncated := false
+	// ClaimForReplay flips RoutedToDeadLetter to false, so claimed tasks
+	// do not reappear on subsequent pages. No failedIDs guard is needed here.
 	for count < maxBulkOperationTasks {
-		// ClaimForReplay flips RoutedToDeadLetter to false on each claimed
-		// task, so successfully replayed tasks drop out of the filter
-		// (matches discard-all's pattern). We fetch offset=0 each iteration.
+		// Successfully replayed tasks drop out of the filter because the
+		// claim flipped RoutedToDeadLetter. We fetch offset=0 each iteration.
 		page, err := s.broker.Store().ListTasks(r.Context(), broker.TaskFilter{
 			PipelineID:         &pipelineID,
 			State:              &failedState,
@@ -549,7 +550,7 @@ func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Reques
 		)
 	}
 
-	writeJSON(w, http.StatusAccepted, replayAllResponse{Count: count, Failed: failed, Truncated: truncated})
+	writeJSON(w, http.StatusAccepted, replayAllResponse{Processed: count, Failed: failed, Truncated: truncated})
 }
 
 func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Request) {
@@ -575,9 +576,12 @@ func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Reque
 	}
 
 	count := 0
-	failed := 0
 	truncated := false
 	state := broker.TaskStateDiscarded
+	// failedIDs tracks task IDs that have already failed so that tasks
+	// which reappear on subsequent pages (because discard did not remove
+	// them from the filter) are not retried or double-counted.
+	failedIDs := make(map[string]struct{})
 	for count < maxBulkOperationTasks {
 		page, err := s.broker.Store().ListTasks(r.Context(), broker.TaskFilter{
 			PipelineID:         &pipelineID,
@@ -598,13 +602,16 @@ func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Reque
 				truncated = true
 				break
 			}
+			if _, already := failedIDs[task.ID]; already {
+				continue
+			}
 			if err := s.broker.Store().UpdateTask(r.Context(), task.ID, broker.TaskUpdate{State: &state}); err != nil {
 				logger.Warn("discard-all: failed to discard task",
 					"task_id", task.ID,
 					"pipeline_id", task.PipelineID,
 					"error", err.Error(),
 				)
-				failed++
+				failedIDs[task.ID] = struct{}{}
 				continue
 			}
 			count++
@@ -625,7 +632,7 @@ func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Reque
 		)
 	}
 
-	writeJSON(w, http.StatusOK, discardAllResponse{Count: count, Failed: failed, Truncated: truncated})
+	writeJSON(w, http.StatusOK, discardAllResponse{Processed: count, Failed: len(failedIDs), Truncated: truncated})
 }
 
 // --- Helpers ---

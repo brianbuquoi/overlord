@@ -274,8 +274,8 @@ func TestDeadLetterReplayAll(t *testing.T) {
 
 	var resp replayAllResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Count != 3 {
-		t.Fatalf("expected 3 replayed tasks, got %d", resp.Count)
+	if resp.Processed != 3 {
+		t.Fatalf("expected 3 replayed tasks, got %d", resp.Processed)
 	}
 
 	for _, id := range failedIDs {
@@ -303,8 +303,8 @@ func TestDeadLetterReplayAll(t *testing.T) {
 	}
 	var resp2 replayAllResponse
 	json.Unmarshal(w.Body.Bytes(), &resp2)
-	if resp2.Count != 0 {
-		t.Fatalf("second replay-all: expected 0 claimed tasks, got %d", resp2.Count)
+	if resp2.Processed != 0 {
+		t.Fatalf("second replay-all: expected 0 claimed tasks, got %d", resp2.Processed)
 	}
 }
 
@@ -327,8 +327,8 @@ func TestDeadLetterReplayAll_BeyondFirstPage(t *testing.T) {
 
 	var resp replayAllResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Count != seeded {
-		t.Fatalf("expected all %d tasks replayed, got %d", seeded, resp.Count)
+	if resp.Processed != seeded {
+		t.Fatalf("expected all %d tasks replayed, got %d", seeded, resp.Processed)
 	}
 	if resp.Truncated {
 		t.Fatalf("did not expect truncation at %d tasks, got truncated=true", seeded)
@@ -353,8 +353,8 @@ func TestDeadLetterDiscardAll_BeyondFirstPage(t *testing.T) {
 
 	var resp discardAllResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Count != seeded {
-		t.Fatalf("expected all %d tasks discarded, got %d", seeded, resp.Count)
+	if resp.Processed != seeded {
+		t.Fatalf("expected all %d tasks discarded, got %d", seeded, resp.Processed)
 	}
 	if resp.Truncated {
 		t.Fatalf("did not expect truncation at %d tasks, got truncated=true", seeded)
@@ -500,8 +500,8 @@ func TestDeadLetterDiscardAll(t *testing.T) {
 
 	var resp discardAllResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Count != 3 {
-		t.Fatalf("expected 3 discarded, got %d", resp.Count)
+	if resp.Processed != 3 {
+		t.Fatalf("expected 3 discarded, got %d", resp.Processed)
 	}
 
 	// Verify all are DISCARDED.
@@ -782,8 +782,8 @@ func TestReplayAll_PerTaskFailure(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.Count != 3 {
-		t.Errorf("processed (count): got %d want 3", resp.Count)
+	if resp.Processed != 3 {
+		t.Errorf("processed: got %d want 3", resp.Processed)
 	}
 	if resp.Failed != 2 {
 		t.Errorf("failed: got %d want 2", resp.Failed)
@@ -838,30 +838,29 @@ func TestDiscardAll_PerTaskFailure(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.Count != 3 {
-		t.Errorf("processed (count): got %d want 3", resp.Count)
+	if resp.Processed != 3 {
+		t.Errorf("processed: got %d want 3", resp.Processed)
 	}
-	// discard-all re-lists on each iteration and retries any tasks still
-	// in FAILED+dead-letter state (unlike replay-all, which claims each
-	// task out of the filter). Two stuck IDs therefore surface twice: once
-	// in iteration 1 (mixed in with the 3 that succeed) and once in
-	// iteration 2 (both fail, no progress, loop breaks). failed is 4, and
-	// the warn log contains 4 matching lines for 2 unique task IDs.
-	if resp.Failed != 4 {
-		t.Errorf("failed: got %d want 4", resp.Failed)
+	// Handler tracks failedIDs so tasks that reappear on subsequent pages
+	// (because a failed discard does not remove them from the filter) are
+	// not retried. failed is the count of distinct failing IDs.
+	if resp.Failed != 2 {
+		t.Errorf("failed: got %d want 2", resp.Failed)
 	}
 	if resp.Truncated {
 		t.Errorf("truncated: got true want false")
 	}
 
+	// Each failing task ID must be logged exactly once — the failedIDs guard
+	// prevents a retry that would emit a second warn line.
 	warnCount := strings.Count(logBuf.String(), `"msg":"discard-all: failed to discard task"`)
-	if warnCount != 4 {
-		t.Errorf("discard-all warn log lines: got %d want 4 (logs: %s)", warnCount, logBuf.String())
+	if warnCount != 2 {
+		t.Errorf("discard-all warn log lines: got %d want 2 (logs: %s)", warnCount, logBuf.String())
 	}
-	// Distinct failing task IDs in the log: still 2.
 	for id := range failSet {
-		if !strings.Contains(logBuf.String(), `"task_id":"`+id+`"`) {
-			t.Errorf("expected warn log for failed task %s", id)
+		occurrences := strings.Count(logBuf.String(), `"task_id":"`+id+`"`)
+		if occurrences != 1 {
+			t.Errorf("failed task %s: warn log occurrences got %d want 1", id, occurrences)
 		}
 	}
 }

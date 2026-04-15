@@ -283,8 +283,8 @@ func TestDeadLetter_EmptyQueue(t *testing.T) {
 		}
 		var resp replayAllResponse
 		json.Unmarshal(w.Body.Bytes(), &resp)
-		if resp.Count != 0 {
-			t.Fatalf("expected count 0, got %d", resp.Count)
+		if resp.Processed != 0 {
+			t.Fatalf("expected count 0, got %d", resp.Processed)
 		}
 	})
 
@@ -298,8 +298,8 @@ func TestDeadLetter_EmptyQueue(t *testing.T) {
 		}
 		var resp discardAllResponse
 		json.Unmarshal(w.Body.Bytes(), &resp)
-		if resp.Count != 0 {
-			t.Fatalf("expected count 0, got %d", resp.Count)
+		if resp.Processed != 0 {
+			t.Fatalf("expected count 0, got %d", resp.Processed)
 		}
 	})
 }
