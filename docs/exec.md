@@ -111,6 +111,13 @@ stores:
 
 `pipelines/code_review.yaml`:
 
+> Schema paths in a pipeline file are resolved **relative to the pipeline
+> file's own directory**, not the infra config's directory. In the layout
+> above, `code_review.yaml` lives in `pipelines/`, so the schema path
+> `../schemas/code_submission_v1.json` walks up one level and then into
+> `schemas/`. Use `filepath.Abs`-friendly relative paths or absolute
+> paths — both work; absolute paths pass through unchanged.
+
 ```yaml
 version: "1"
 schema_registry:
@@ -167,3 +174,28 @@ in-flight work to drain. If you send SIGINT (Ctrl+C) while waiting, it
 prints the task ID and a replay hint to stderr, then exits with code 2 —
 the task may still be in-flight and can be inspected with
 `overlord status` or replayed later.
+
+## Task lifecycle on exec exit
+
+When `overlord exec` exits due to `--timeout` expiry or SIGINT (Ctrl+C),
+the underlying task continues running in the store and broker. It is
+**not** cancelled. Specifically:
+
+- The task will complete (or fail) independently of the exec process.
+- The task ID is printed to stderr on exit. Look it up later with:
+
+  ```bash
+  overlord status --config ./infra.yaml --task <task-id>
+  ```
+
+- If the task fails, replay it from the dead-letter queue:
+
+  ```bash
+  overlord dead-letter replay --config ./infra.yaml --task <task-id>
+  ```
+
+For deployments using the in-memory store, tasks do **not** persist across
+process restarts. If `exec` exits before the task completes (timeout,
+SIGINT, or process kill), the task is lost. Use the Redis or Postgres
+store for production runs where you need to recover from interrupted
+exec invocations.

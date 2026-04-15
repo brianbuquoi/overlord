@@ -111,8 +111,14 @@ func runExecCmd(t *testing.T, args ...string) (exitCode int, stdout, stderr stri
 	}
 	var ee *execExitError
 	if errors.As(err, &ee) {
+		// Mirror main()'s behavior: print the error message to stderr so
+		// tests can assert against the same output a user would see.
+		if ee.msg != "" {
+			fmt.Fprintln(&errBuf, "Error:", ee.msg)
+		}
 		return ee.code, outBuf.String(), errBuf.String()
 	}
+	fmt.Fprintln(&errBuf, "Error:", err)
 	return 1, outBuf.String(), errBuf.String()
 }
 
@@ -206,6 +212,61 @@ func TestExec_OutputJSON(t *testing.T) {
 	}
 	if v["response"] != "ok" {
 		t.Errorf("unexpected payload: %v", v)
+	}
+}
+
+func TestExec_PayloadFromSymlink(t *testing.T) {
+	srv := ollamaServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(ollamaOKResponse(`{"response":"ok"}`)))
+	})
+	cfg := writeExecTestYAML(t, srv.URL)
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.json")
+	if err := os.WriteFile(target, []byte(`{"request":"hi"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr := runExecCmd(t,
+		"--config", cfg,
+		"--id", "test-pipeline",
+		"--payload", "@"+link,
+		"--timeout", "5s",
+	)
+	if code != execExitConfig {
+		t.Fatalf("expected exit %d, got %d\nstderr: %s", execExitConfig, code, stderr)
+	}
+	if !strings.Contains(stderr, "symlink") {
+		t.Errorf("expected stderr to mention 'symlink', got: %s", stderr)
+	}
+}
+
+func TestExec_PayloadFileNotFound(t *testing.T) {
+	srv := ollamaServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(ollamaOKResponse(`{"response":"ok"}`)))
+	})
+	cfg := writeExecTestYAML(t, srv.URL)
+
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	code, _, stderr := runExecCmd(t,
+		"--config", cfg,
+		"--id", "test-pipeline",
+		"--payload", "@"+missing,
+		"--timeout", "5s",
+	)
+	if code != execExitConfig {
+		t.Fatalf("expected exit %d, got %d\nstderr: %s", execExitConfig, code, stderr)
+	}
+	if !strings.Contains(stderr, "payload file not found") {
+		t.Errorf("expected human-readable not-found message, got: %s", stderr)
+	}
+	// Don't expose wrapped Go errno like "no such file or directory: open ...".
+	if strings.Contains(stderr, "open ") && strings.Contains(stderr, ": no such") {
+		t.Errorf("error message leaks raw Go error: %s", stderr)
 	}
 }
 

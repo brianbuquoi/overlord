@@ -69,6 +69,13 @@ func main() {
 			}
 			os.Exit(ee.code)
 		}
+		var sw *submitWaitError
+		if errors.As(err, &sw) {
+			if sw.msg != "" {
+				fmt.Fprintln(os.Stderr, "Error:", sw.msg)
+			}
+			os.Exit(sw.ExitCode())
+		}
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
@@ -482,11 +489,11 @@ issues without consuming API quota.`,
 			}
 
 			if pipelineFile != "" {
-				pf, err := config.LoadPipelineFile(pipelineFile)
+				pf, pfPath, err := config.LoadPipelineFile(pipelineFile)
 				if err != nil {
 					return err
 				}
-				if err := pf.MergeInto(cfg); err != nil {
+				if err := pf.MergeInto(cfg, pfPath); err != nil {
 					return err
 				}
 			}
@@ -590,6 +597,14 @@ func dryRunSubmit(cfg *config.Config, configPath, pipelineID string, payload jso
 	return nil
 }
 
+// pollTask waits for a task to reach a terminal state and returns an
+// outcome-shaped error so callers (submit --wait) can map state →
+// exit-code consistently with `overlord exec`.
+//
+//	DONE, REPLAYED              → nil (exit 0)
+//	FAILED, DEAD-LETTER         → submitWaitError{code:1}
+//	DISCARDED                   → submitWaitError{code:1}
+//	timeout                     → submitWaitError{code:2}
 func pollTask(ctx context.Context, b *broker.Broker, taskID string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -600,23 +615,44 @@ func pollTask(ctx context.Context, b *broker.Broker, taskID string, timeout time
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for task %s", taskID)
+			return &submitWaitError{code: 2, msg: fmt.Sprintf("timeout waiting for task %s", taskID)}
 		case <-ticker.C:
 			task, err := b.GetTask(ctx, taskID)
 			if err != nil {
 				continue
 			}
-			if task.State == broker.TaskStateDone || task.State == broker.TaskStateFailed {
-				out, _ := json.MarshalIndent(task, "", "  ")
-				fmt.Println(string(out))
-				if task.State == broker.TaskStateFailed {
-					return fmt.Errorf("task %s failed", taskID)
-				}
+			if !task.State.IsTerminal() {
+				continue
+			}
+			out, _ := json.MarshalIndent(task, "", "  ")
+			fmt.Println(string(out))
+			switch task.State {
+			case broker.TaskStateDone, broker.TaskStateReplayed:
 				return nil
+			case broker.TaskStateDiscarded:
+				return &submitWaitError{code: 1, msg: fmt.Sprintf("task %s was discarded", taskID)}
+			case broker.TaskStateFailed:
+				if task.RoutedToDeadLetter {
+					return &submitWaitError{code: 1, msg: fmt.Sprintf("task %s failed and was dead-lettered (replay with: overlord dead-letter replay --task %s)", taskID, taskID)}
+				}
+				return &submitWaitError{code: 1, msg: fmt.Sprintf("task %s failed", taskID)}
+			default:
+				return &submitWaitError{code: 1, msg: fmt.Sprintf("task %s ended in state %s", taskID, task.State)}
 			}
 		}
 	}
 }
+
+// submitWaitError carries an exit code from pollTask out to the cobra
+// command so submit --wait can map terminal state to a meaningful exit
+// code without leaking cobra's usage banner.
+type submitWaitError struct {
+	code int
+	msg  string
+}
+
+func (e *submitWaitError) Error() string { return e.msg }
+func (e *submitWaitError) ExitCode() int { return e.code }
 
 // --- status command ---
 
@@ -743,7 +779,7 @@ func watchTask(ctx context.Context, b *broker.Broker, taskID string, w interface
 }
 
 func isTerminal(s broker.TaskState) bool {
-	return s == broker.TaskStateDone || s == broker.TaskStateFailed || s == broker.TaskStateDiscarded
+	return s.IsTerminal()
 }
 
 // --- validate command ---

@@ -125,11 +125,11 @@ func runExec(cmd *cobra.Command, a execArgs) error {
 	}
 
 	if a.pipelineFile != "" {
-		pf, err := config.LoadPipelineFile(a.pipelineFile)
+		pf, pfPath, err := config.LoadPipelineFile(a.pipelineFile)
 		if err != nil {
 			return &execExitError{code: execExitConfig, msg: err.Error()}
 		}
-		if err := pf.MergeInto(cfg); err != nil {
+		if err := pf.MergeInto(cfg, pfPath); err != nil {
 			return &execExitError{code: execExitConfig, msg: err.Error()}
 		}
 	}
@@ -225,7 +225,8 @@ func runExec(cmd *cobra.Command, a execArgs) error {
 
 	writeExecOutput(stdout, stderr, final, a.output, a.quiet, start)
 
-	if final.State == broker.TaskStateDone {
+	switch final.State {
+	case broker.TaskStateDone, broker.TaskStateReplayed:
 		return nil
 	}
 
@@ -268,17 +269,11 @@ func waitForTerminal(ctx context.Context, sigCh <-chan os.Signal, b *broker.Brok
 				lastAttempts = task.Attempts
 			}
 
-			if isExecTerminal(task.State) {
+			if task.State.IsTerminal() {
 				return task, 0
 			}
 		}
 	}
-}
-
-func isExecTerminal(s broker.TaskState) bool {
-	return s == broker.TaskStateDone ||
-		s == broker.TaskStateFailed ||
-		s == broker.TaskStateDiscarded
 }
 
 func writeExecOutput(stdout, stderr io.Writer, task *broker.Task, format string, quiet bool, start time.Time) {
@@ -287,9 +282,14 @@ func writeExecOutput(stdout, stderr io.Writer, task *broker.Task, format string,
 		stdout.Write(append(indentJSON(task.Payload), '\n'))
 	default:
 		if !quiet {
-			if task.State == broker.TaskStateDone {
+			switch task.State {
+			case broker.TaskStateDone:
 				fmt.Fprintf(stderr, "✓ Completed in %s\n", elapsed(start))
-			} else {
+			case broker.TaskStateReplayed:
+				fmt.Fprintf(stderr, "↻ Task %s was replayed (a new task carries the retry)\n", task.ID)
+			case broker.TaskStateDiscarded:
+				fmt.Fprintf(stderr, "✗ Task %s was discarded\n", task.ID)
+			default:
 				fmt.Fprintf(stderr, "✗ Task %s (state: %s)\n", task.ID, task.State)
 				if reason, ok := task.Metadata["failure_reason"]; ok {
 					fmt.Fprintf(stderr, "  Reason: %v\n", reason)
@@ -334,9 +334,9 @@ func orDash(s broker.TaskState) string {
 func parsePayload(payload string) (json.RawMessage, error) {
 	var raw json.RawMessage
 	if strings.HasPrefix(payload, "@") {
-		data, err := os.ReadFile(strings.TrimPrefix(payload, "@"))
+		data, err := readPayloadFile(strings.TrimPrefix(payload, "@"))
 		if err != nil {
-			return nil, fmt.Errorf("cannot read payload file: %w", err)
+			return nil, err
 		}
 		raw = json.RawMessage(data)
 	} else {
@@ -346,4 +346,29 @@ func parsePayload(payload string) (json.RawMessage, error) {
 		return nil, fmt.Errorf("payload is not valid JSON (use --payload @file.json to read from a file)")
 	}
 	return raw, nil
+}
+
+// readPayloadFile reads a payload from a file path with the same hardening
+// applied to config and pipeline file loading: rejects symlinks and
+// non-regular files. Errors are human-readable rather than wrapped Go
+// stat errors.
+func readPayloadFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("payload file not found: %s", path)
+		}
+		return nil, fmt.Errorf("cannot access payload file %s: %v", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("payload file must not be a symlink: %s", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("payload file must be a regular file: %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read payload file %s: %v", path, err)
+	}
+	return data, nil
 }

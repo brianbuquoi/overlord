@@ -37,6 +37,25 @@ const (
 	TaskStateReplayed TaskState = "REPLAYED"
 )
 
+// IsTerminal returns true if the task state is one from which no further
+// state transitions occur under normal operation.
+//
+// Terminal states: DONE, FAILED, DISCARDED, REPLAYED.
+//
+// FAILED with RoutedToDeadLetter=true is the dead-letter terminal form
+// (there is no separate DEAD_LETTER state — the flag distinguishes it
+// from non-dead-lettered failures). REPLAY_PENDING is transitional, not
+// terminal: it resolves to REPLAYED on Submit success or back to
+// FAILED+RoutedToDeadLetter=true on rollback.
+func (s TaskState) IsTerminal() bool {
+	switch s {
+	case TaskStateDone, TaskStateFailed, TaskStateDiscarded, TaskStateReplayed:
+		return true
+	default:
+		return false
+	}
+}
+
 // Task is the unit of work that flows through a pipeline.
 type Task struct {
 	ID                    string          `json:"id"`
