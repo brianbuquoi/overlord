@@ -186,26 +186,6 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		Temperature: temp,
 	}
 
-	var systemPreview, userPreview string
-	var systemLen, userLen int
-	for _, m := range messages {
-		if m.Role == "system" && systemPreview == "" {
-			systemPreview = agent.Truncate(m.Content, 200)
-			systemLen = len(m.Content)
-		}
-		if m.Role == "user" && userPreview == "" {
-			userPreview = agent.Truncate(m.Content, 200)
-			userLen = len(m.Content)
-		}
-	}
-	a.logger.Debug("openai request body",
-		"agent_id", a.cfg.ID,
-		"system_prompt_length", systemLen,
-		"user_message_length", userLen,
-		"system_prompt_preview", systemPreview,
-		"user_message_preview", userPreview,
-	)
-
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, a.nonRetryableErr(fmt.Errorf("marshal request: %w", err))
@@ -245,12 +225,6 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 	}
 
 	output := result.Choices[0].Message.Content
-
-	a.logger.Debug("openai raw response",
-		"agent_id", a.cfg.ID,
-		"raw_length", len(output),
-		"raw_preview", agent.Truncate(output, 200),
-	)
 
 	a.logger.Info("openai request completed",
 		"agent_id", a.cfg.ID,

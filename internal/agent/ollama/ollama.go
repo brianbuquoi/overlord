@@ -167,23 +167,6 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		reqBody.Options = &opts
 	}
 
-	var sysText, userText string
-	for _, m := range messages {
-		if m.Role == "system" && sysText == "" {
-			sysText = m.Content
-		}
-		if m.Role == "user" && userText == "" {
-			userText = m.Content
-		}
-	}
-	a.logger.Debug("ollama request body",
-		"agent_id", a.cfg.ID,
-		"system_prompt_length", len(sysText),
-		"user_message_length", len(userText),
-		"system_prompt_preview", agent.Truncate(sysText, 200),
-		"user_message_preview", agent.Truncate(userText, 200),
-	)
-
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, a.nonRetryableErr(fmt.Errorf("marshal request: %w", err))
@@ -221,12 +204,6 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 	if output == "" {
 		return nil, a.retryableErr(fmt.Errorf("empty content in response"))
 	}
-
-	a.logger.Debug("ollama raw response",
-		"agent_id", a.cfg.ID,
-		"raw_length", len(output),
-		"raw_preview", agent.Truncate(output, 200),
-	)
 
 	a.logger.Info("ollama request completed",
 		"agent_id", a.cfg.ID,
