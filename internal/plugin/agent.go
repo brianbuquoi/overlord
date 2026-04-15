@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/brianbuquoi/overlord/internal/agent"
@@ -460,7 +461,7 @@ func (a *Agent) Stop() error {
 		_ = stdin.Close()
 	}
 	// Graceful SIGTERM first.
-	_ = cmd.Process.Signal(os.Interrupt)
+	_ = cmd.Process.Signal(syscall.SIGTERM)
 
 	select {
 	case <-exited:

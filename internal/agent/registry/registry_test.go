@@ -233,7 +233,6 @@ func (f *fakeAgent) Execute(ctx context.Context, task *broker.Task) (*broker.Tas
 func (f *fakeAgent) HealthCheck(ctx context.Context) error { return nil }
 
 type fakeStoppable struct {
-	fakeAgent
 	id      string
 	stopped bool
 }

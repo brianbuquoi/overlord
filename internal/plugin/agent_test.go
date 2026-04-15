@@ -251,7 +251,7 @@ func TestAgent_Stop(t *testing.T) {
 }
 
 // TestPluginAgent_Stop_SendsSIGTERM: a plugin that exits cleanly on stdin EOF
-// / SIGINT (the default echo plugin behavior) is stopped by Stop() within the
+// / SIGTERM (the default echo plugin behavior) is stopped by Stop() within the
 // configured shutdown_timeout. We record the PID before Stop and verify the
 // process is gone afterwards.
 func TestPluginAgent_Stop_SendsSIGTERM(t *testing.T) {
