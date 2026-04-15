@@ -147,6 +147,36 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRecoverTask transitions a task stranded in REPLAY_PENDING back to
+// FAILED+RoutedToDeadLetter=true. Used to recover from a double-failure
+// where both Submit and RollbackReplayClaim failed during replay.
+func (s *Server) handleRecoverTask(w http.ResponseWriter, r *http.Request) {
+	taskID := pathParam(r.URL.Path, "/v1/tasks/", "/recover")
+	if taskID == "" {
+		writeError(w, http.StatusBadRequest, "missing task_id in path", "INVALID_PATH")
+		return
+	}
+
+	if err := s.broker.Store().RollbackReplayClaim(r.Context(), taskID); err != nil {
+		if errors.Is(err, store.ErrTaskNotFound) {
+			writeError(w, http.StatusNotFound, "task not found", "TASK_NOT_FOUND")
+			return
+		}
+		if errors.Is(err, store.ErrTaskNotReplayPending) {
+			writeError(w, http.StatusConflict, "task is not in REPLAY_PENDING state", "TASK_NOT_REPLAY_PENDING")
+			return
+		}
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to recover task", "RECOVER_FAILED", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"task_id": taskID,
+		"status":  "recovered",
+		"message": "Task transitioned from REPLAY_PENDING to FAILED. It is now visible in the dead-letter queue and can be replayed.",
+	})
+}
+
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	taskID := strings.TrimPrefix(r.URL.Path, "/v1/tasks/")
 	if taskID == "" || strings.Contains(taskID, "/") {
@@ -411,7 +441,7 @@ func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) 
 	newTask, err := s.broker.Submit(r.Context(), task.PipelineID, task.Payload)
 	if err != nil {
 		if rbErr := s.broker.Store().RollbackReplayClaim(r.Context(), task.ID); rbErr != nil {
-			logger.Error("replay rollback failed: task may be stranded in REPLAY_PENDING",
+			logger.Error("replay double-failure: task stranded in REPLAY_PENDING — recover via POST /v1/tasks/{id}/recover",
 				"task_id", task.ID,
 				"submit_error", err.Error(),
 				"rollback_error", rbErr.Error(),

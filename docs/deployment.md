@@ -349,7 +349,7 @@ keys of 72 bytes or fewer.
 | Scope | Endpoints |
 |-------|-----------|
 | read  | GET /v1/tasks, GET /v1/tasks/{id}, GET /v1/pipelines, GET /v1/health, WS /v1/stream, GET /v1/dead-letter |
-| write | All read endpoints + POST /v1/pipelines/{id}/tasks, POST /v1/dead-letter/{id}/replay, POST /v1/dead-letter/{id}/discard |
+| write | All read endpoints + POST /v1/pipelines/{id}/tasks, POST /v1/dead-letter/{id}/replay, POST /v1/dead-letter/{id}/discard, POST /v1/tasks/{id}/recover |
 | admin | All write endpoints + POST /v1/dead-letter/replay-all, POST /v1/dead-letter/discard-all |
 
 Write scope implies read. Admin scope implies all.

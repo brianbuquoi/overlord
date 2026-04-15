@@ -64,3 +64,37 @@ $ curl -sS -X POST https://overlord.example.com/v1/ws-token \
 
 $ wscat "wss://overlord.example.com/v1/stream?token=a1b2c3…"
 ```
+
+---
+
+## `POST /v1/tasks/{id}/recover`
+
+Recovers a task stranded in REPLAY_PENDING state by transitioning it back to
+FAILED with RoutedToDeadLetter=true. Use this when a replay operation failed
+at both the Submit and RollbackReplayClaim steps, leaving the task invisible
+to dead-letter listing and unreachable by replay-all.
+
+### Request
+
+```
+POST /v1/tasks/{id}/recover
+Authorization: Bearer <api-key>
+```
+
+Write scope required. No request body.
+
+### Response 200
+
+```json
+{
+  "task_id": "<id>",
+  "status": "recovered",
+  "message": "Task transitioned from REPLAY_PENDING to FAILED. It is now visible in the dead-letter queue and can be replayed."
+}
+```
+
+### Error responses
+
+- `404 Not Found` — task does not exist (`TASK_NOT_FOUND`)
+- `409 Conflict` — task is not in REPLAY_PENDING state (`TASK_NOT_REPLAY_PENDING`)
+- `500 Internal Server Error` — recovery failed (`RECOVER_FAILED`)

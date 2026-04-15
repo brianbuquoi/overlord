@@ -139,7 +139,7 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/v1/pipelines/", s.routePipelines)
-	mux.HandleFunc("/v1/tasks/", s.handleGetTask)
+	mux.HandleFunc("/v1/tasks/", s.routeTasks)
 	mux.HandleFunc("/v1/tasks", s.handleListTasks)
 	mux.HandleFunc("/v1/health", s.handleHealth)
 	mux.HandleFunc("/v1/stream", s.handleStream)
@@ -218,6 +218,25 @@ func (s *Server) routePipelines(w http.ResponseWriter, r *http.Request) {
 	// GET /v1/pipelines
 	if r.Method == http.MethodGet && (path == "/v1/pipelines" || path == "/v1/pipelines/") {
 		s.handleListPipelines(w, r)
+		return
+	}
+
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED")
+}
+
+// routeTasks dispatches /v1/tasks/* based on method and path shape.
+func (s *Server) routeTasks(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+
+	// POST /v1/tasks/{taskID}/recover
+	if r.Method == http.MethodPost && strings.HasSuffix(path, "/recover") {
+		s.handleRecoverTask(w, r)
+		return
+	}
+
+	// GET /v1/tasks/{taskID}
+	if r.Method == http.MethodGet {
+		s.handleGetTask(w, r)
 		return
 	}
 

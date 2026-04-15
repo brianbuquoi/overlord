@@ -22,9 +22,13 @@ const (
 	// TaskStateReplayPending is set atomically by ClaimForReplay. The task
 	// remains in this state until Submit succeeds (→ REPLAYED) or the handler
 	// rolls back (→ FAILED with RoutedToDeadLetter=true). A task stuck in
-	// REPLAY_PENDING indicates a submission failure that was not rolled back —
-	// recoverable by an operator setting the task back to FAILED via the
-	// admin API.
+	// REPLAY_PENDING indicates a double-failure (Submit failed AND
+	// RollbackReplayClaim failed).
+	//
+	// Recovery: POST /v1/tasks/{id}/recover (write scope required), or the
+	// equivalent `overlord dead-letter recover --task <id>` CLI command.
+	// This transitions the task back to FAILED+RoutedToDeadLetter=true,
+	// making it visible in the dead-letter queue and replayable again.
 	TaskStateReplayPending TaskState = "REPLAY_PENDING"
 
 	// TaskStateReplayed is the terminal state for a task that was successfully

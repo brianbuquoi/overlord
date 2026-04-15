@@ -1064,7 +1064,7 @@ func TestReplayDeadLetter_SubmitAndRollbackFail(t *testing.T) {
 	}
 
 	logs := logBuf.String()
-	if !strings.Contains(logs, `"msg":"replay rollback failed: task may be stranded in REPLAY_PENDING"`) {
+	if !strings.Contains(logs, `"msg":"replay double-failure: task stranded in REPLAY_PENDING — recover via POST /v1/tasks/{id}/recover"`) {
 		t.Errorf("expected stranded-task Error log, got: %s", logs)
 	}
 	if !strings.Contains(logs, `"submit_error"`) || !strings.Contains(logs, `"rollback_error"`) {

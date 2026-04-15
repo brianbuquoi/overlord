@@ -1209,3 +1209,105 @@ func TestCLIReplayAll_EmptySet(t *testing.T) {
 		t.Errorf("stderr should not contain confirmation prompt when set is empty; got: %q", stderr.String())
 	}
 }
+
+// seedReplayPendingTask puts a task into REPLAY_PENDING via ClaimForReplay,
+// matching the state left behind by a double-failure during replay.
+func seedReplayPendingTask(t *testing.T, b *broker.Broker) string {
+	t.Helper()
+	original := deadLetterTask(t, b)
+	if _, err := b.Store().ClaimForReplay(t.Context(), original.ID); err != nil {
+		t.Fatalf("ClaimForReplay: %v", err)
+	}
+	return original.ID
+}
+
+func TestCLIRecover_HappyPath(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskID := seedReplayPendingTask(t, b)
+
+	msg, err := recoverTaskCLI(t.Context(), b, taskID)
+	if err != nil {
+		t.Fatalf("recoverTaskCLI: %v", err)
+	}
+	if !strings.Contains(msg, "Recovered task "+taskID) {
+		t.Errorf("output missing success message; got: %q", msg)
+	}
+
+	got, err := b.Store().GetTask(t.Context(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != broker.TaskStateFailed {
+		t.Errorf("state: got %s want FAILED", got.State)
+	}
+	if !got.RoutedToDeadLetter {
+		t.Errorf("RoutedToDeadLetter: got false want true")
+	}
+}
+
+func TestCLIRecover_NotFound(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = recoverTaskCLI(t.Context(), b, "nonexistent-task-id")
+	if err == nil {
+		t.Fatal("expected error for missing task")
+	}
+	if !strings.Contains(err.Error(), "nonexistent-task-id not found") {
+		t.Errorf("expected clean not-found error, got: %v", err)
+	}
+}
+
+// TestCLIRecover_CommandRegistered verifies the cobra subcommand exists.
+func TestCLIRecover_CommandRegistered(t *testing.T) {
+	root := rootCmd()
+	sub, _, err := root.Find([]string{"dead-letter", "recover"})
+	if err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if sub.Use != "recover" {
+		t.Errorf("expected recover command, got %q", sub.Use)
+	}
+}
+
+func TestCLIRecover_WrongState(t *testing.T) {
+	configPath := writeTestYAML(t)
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildBroker(cfg, nil, configPath, newLogger(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Task in FAILED+DL state, not REPLAY_PENDING.
+	task := deadLetterTask(t, b)
+
+	_, err = recoverTaskCLI(t.Context(), b, task.ID)
+	if err == nil {
+		t.Fatal("expected error for wrong state")
+	}
+	if !strings.Contains(err.Error(), "not in REPLAY_PENDING state") {
+		t.Errorf("expected wrong-state error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "current state: FAILED") {
+		t.Errorf("expected current state in error, got: %v", err)
+	}
+}

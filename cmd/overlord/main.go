@@ -1347,6 +1347,65 @@ func deadLetterCmd() *cobra.Command {
 	cmd.AddCommand(deadLetterReplayAllCmd())
 	cmd.AddCommand(deadLetterDiscardCmd())
 	cmd.AddCommand(deadLetterDiscardAllCmd())
+	cmd.AddCommand(deadLetterRecoverCmd())
+	return cmd
+}
+
+// recoverTaskCLI is the core recovery logic shared between the cobra
+// command RunE and unit tests. It invokes RollbackReplayClaim and returns
+// user-facing messages keyed off the sentinel error classes.
+func recoverTaskCLI(ctx context.Context, b *broker.Broker, taskID string) (string, error) {
+	if err := b.Store().RollbackReplayClaim(ctx, taskID); err != nil {
+		if errors.Is(err, store.ErrTaskNotFound) {
+			return "", fmt.Errorf("Task %s not found.", taskID)
+		}
+		if errors.Is(err, store.ErrTaskNotReplayPending) {
+			state := "unknown"
+			if t, gerr := b.Store().GetTask(ctx, taskID); gerr == nil && t != nil {
+				state = string(t.State)
+			}
+			return "", fmt.Errorf("Task %s is not in REPLAY_PENDING state (current state: %s). No action taken.", taskID, state)
+		}
+		return "", fmt.Errorf("recover failed: %w", err)
+	}
+	return fmt.Sprintf("Recovered task %s. Task is now in FAILED state and visible in the dead-letter queue.\n", taskID), nil
+}
+
+// deadLetterRecoverCmd transitions a task stranded in REPLAY_PENDING back to
+// FAILED+RoutedToDeadLetter=true, making it visible in the dead-letter queue
+// and replayable again.
+func deadLetterRecoverCmd() *cobra.Command {
+	var configPath string
+	var taskID string
+
+	cmd := &cobra.Command{
+		Use:   "recover",
+		Short: "Recover a task stranded in REPLAY_PENDING state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger()
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				return fmtConfigError(configPath, err)
+			}
+
+			b, err := buildBroker(cfg, nil, configPath, logger, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			msg, err := recoverTaskCLI(cmd.Context(), b, taskID)
+			if err != nil {
+				return err
+			}
+			fmt.Fprint(cmd.OutOrStdout(), msg)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
+	cmd.Flags().StringVar(&taskID, "task", "", "task ID to recover")
+	cmd.MarkFlagRequired("config")
+	cmd.MarkFlagRequired("task")
 	return cmd
 }
 
@@ -1432,7 +1491,9 @@ func replayDeadLetterTask(ctx context.Context, b *broker.Broker, taskID string, 
 		if rbErr := b.Store().RollbackReplayClaim(ctx, task.ID); rbErr != nil {
 			fmt.Fprintf(errOut, "WARNING: replay rollback failed for task %s: %v (rollback error: %v)\n",
 				task.ID, err, rbErr)
-			fmt.Fprintf(errOut, "Task %s may be stranded in REPLAY_PENDING state — manual recovery required\n", task.ID)
+			fmt.Fprintf(errOut, "Task %s is stranded in REPLAY_PENDING state.\n", task.ID)
+			fmt.Fprintf(errOut, "Recovery: POST /v1/tasks/%s/recover (or use: overlord dead-letter recover --task %s)\n",
+				task.ID, task.ID)
 		}
 		return nil, fmt.Errorf("failed to submit replay task: %w", err)
 	}
