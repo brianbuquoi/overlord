@@ -44,21 +44,23 @@ func setupPostgresTest(t *testing.T) (*pgxpool.Pool, string) {
 	}
 
 	_, err = pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+safeTable+` (
-		id                    TEXT PRIMARY KEY,
-		pipeline_id           TEXT NOT NULL,
-		stage_id              TEXT NOT NULL,
-		input_schema_name     TEXT NOT NULL DEFAULT '',
-		input_schema_version  TEXT NOT NULL DEFAULT '',
-		output_schema_name    TEXT NOT NULL DEFAULT '',
-		output_schema_version TEXT NOT NULL DEFAULT '',
-		payload               JSONB,
-		metadata              JSONB,
-		state                 TEXT NOT NULL DEFAULT 'PENDING',
-		attempts              INTEGER NOT NULL DEFAULT 0,
-		max_attempts          INTEGER NOT NULL DEFAULT 1,
-		created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-		updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-		expires_at            TIMESTAMPTZ
+		id                      TEXT PRIMARY KEY,
+		pipeline_id             TEXT NOT NULL,
+		stage_id                TEXT NOT NULL,
+		input_schema_name       TEXT NOT NULL DEFAULT '',
+		input_schema_version    TEXT NOT NULL DEFAULT '',
+		output_schema_name      TEXT NOT NULL DEFAULT '',
+		output_schema_version   TEXT NOT NULL DEFAULT '',
+		payload                 JSONB,
+		metadata                JSONB,
+		state                   TEXT NOT NULL DEFAULT 'PENDING',
+		attempts                INTEGER NOT NULL DEFAULT 0,
+		max_attempts            INTEGER NOT NULL DEFAULT 1,
+		created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+		expires_at              TIMESTAMPTZ,
+		routed_to_dead_letter   BOOLEAN NOT NULL DEFAULT FALSE,
+		cross_stage_transitions INTEGER NOT NULL DEFAULT 0
 	)`)
 	if err != nil {
 		t.Fatalf("create table: %v", err)

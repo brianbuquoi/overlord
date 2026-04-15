@@ -693,8 +693,8 @@ func TestRedis_ListTasksStateIndex(t *testing.T) {
 	}
 }
 
-// TestRedis_ClaimForReplay_HappyPath verifies the atomic transition from
-// FAILED+dead-letter to PENDING, including the per-state index swap.
+// TestRedis_ClaimForReplay_HappyPath verifies that ClaimForReplay returns
+// the task without mutating it — the original remains in FAILED+dead-letter.
 func TestRedis_ClaimForReplay_HappyPath(t *testing.T) {
 	t.Parallel()
 	s, _, _ := newRedisTestStore(t, "claim-ok:")
@@ -727,14 +727,23 @@ func TestRedis_ClaimForReplay_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if claimed.State != broker.TaskStatePending {
-		t.Errorf("state: got %s want PENDING", claimed.State)
+	if claimed.State != broker.TaskStateFailed {
+		t.Errorf("state: got %s want FAILED (no mutation)", claimed.State)
 	}
-	if claimed.RoutedToDeadLetter {
-		t.Errorf("routed_to_dead_letter should be cleared")
+	if !claimed.RoutedToDeadLetter {
+		t.Errorf("routed_to_dead_letter should remain set (no mutation)")
 	}
-	if claimed.Attempts != 0 {
-		t.Errorf("attempts: got %d want 0", claimed.Attempts)
+	if claimed.Attempts != 3 {
+		t.Errorf("attempts: got %d want 3 (no mutation)", claimed.Attempts)
+	}
+
+	stored, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get stored: %v", err)
+	}
+	if stored.State != broker.TaskStateFailed || !stored.RoutedToDeadLetter || stored.Attempts != 3 {
+		t.Errorf("stored task mutated: state=%s dl=%v attempts=%d",
+			stored.State, stored.RoutedToDeadLetter, stored.Attempts)
 	}
 }
 
@@ -768,9 +777,10 @@ func TestRedis_ClaimForReplay_NotReplayable(t *testing.T) {
 	}
 }
 
-// Concurrent ClaimForReplay calls for the same task must produce exactly
-// one winner. The Lua script runs atomically in Redis, serialising claims.
-func TestRedis_ClaimForReplay_ConcurrentSingleWinner(t *testing.T) {
+// Concurrent ClaimForReplay calls all succeed without mutating the stored
+// task. Because the Lua script is pure-read, there is no CAS and no loser
+// cohort — every caller sees the same FAILED+dead-lettered task.
+func TestRedis_ClaimForReplay_ConcurrentNoMutation(t *testing.T) {
 	t.Parallel()
 	s, _, _ := newRedisTestStore(t, "claim-race:")
 	ctx := context.Background()
@@ -802,15 +812,18 @@ func TestRedis_ClaimForReplay_ConcurrentSingleWinner(t *testing.T) {
 	}
 	wg.Wait()
 
-	won := 0
-	for _, e := range errs {
-		if e == nil {
-			won++
-		} else if e != store.ErrTaskNotReplayable {
-			t.Errorf("unexpected error from loser: %v", e)
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("goroutine %d: unexpected error %v", i, e)
 		}
 	}
-	if won != 1 {
-		t.Fatalf("expected exactly 1 winner, got %d", won)
+
+	stored, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get stored: %v", err)
+	}
+	if stored.State != broker.TaskStateFailed || !stored.RoutedToDeadLetter {
+		t.Errorf("stored task mutated by concurrent claims: state=%s dl=%v",
+			stored.State, stored.RoutedToDeadLetter)
 	}
 }

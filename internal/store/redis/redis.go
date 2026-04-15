@@ -296,19 +296,15 @@ func (r *RedisStore) UpdateTask(ctx context.Context, taskID string, update broke
 	return nil
 }
 
-// claimForReplayScript atomically verifies a task is in FAILED+dead-lettered
-// state and transitions it to PENDING, updating per-state indexes in the
-// same round-trip. Concurrent callers for the same taskID see exactly one
-// success; the rest observe "NOT_REPLAYABLE".
+// claimForReplayScript verifies a task is in FAILED+dead-lettered state and
+// returns the task JSON unchanged. The script performs no mutations — it is
+// a pure read with state validation, wrapped in a script only so the check
+// and read are a single Redis round-trip.
 //
 //	KEYS[1] = task key
-//	KEYS[2] = state index key for FAILED (source)
-//	KEYS[3] = state index key for PENDING (destination)
-//	ARGV[1] = updated_at timestamp (RFC3339Nano)
-//	ARGV[2] = score for ZADD (unix seconds as string)
 //
-// Returns: the updated task JSON on success, "TASK_NOT_FOUND" or
-// "NOT_REPLAYABLE" on the failure paths.
+// Returns: the task JSON on success, or "TASK_NOT_FOUND" / "NOT_REPLAYABLE"
+// on the failure paths.
 const claimForReplayScript = `
 local data = redis.call('GET', KEYS[1])
 if not data then
@@ -318,41 +314,20 @@ local task = cjson.decode(data)
 if task.state ~= 'FAILED' or not task.routed_to_dead_letter then
   return 'NOT_REPLAYABLE'
 end
-task.state = 'PENDING'
-task.routed_to_dead_letter = false
-task.attempts = 0
-task.updated_at = ARGV[1]
-local newData = cjson.encode(task)
-local pttl = redis.call('PTTL', KEYS[1])
-if pttl and tonumber(pttl) and tonumber(pttl) > 0 then
-  redis.call('SET', KEYS[1], newData, 'PX', tonumber(pttl))
-else
-  redis.call('SET', KEYS[1], newData)
-end
-redis.call('ZREM', KEYS[2], task.id)
-redis.call('ZADD', KEYS[3], tonumber(ARGV[2]), task.id)
-return newData
+return data
 `
 
 var claimForReplay = redis.NewScript(claimForReplayScript)
 
-// ClaimForReplay atomically transitions a FAILED+dead-lettered task to
-// PENDING via a Lua script, producing a single-winner outcome under
-// concurrent requests.
+// ClaimForReplay validates that taskID refers to a FAILED+dead-lettered task
+// and returns a copy of it. The original task is not mutated — its state
+// remains FAILED with RoutedToDeadLetter = true. Callers are expected to
+// submit a new task with the returned payload; this leaves the original as
+// an auditable record of the failed attempt and avoids the phantom-PENDING
+// bug that resulted from transitioning it back to PENDING on replay.
 func (r *RedisStore) ClaimForReplay(ctx context.Context, taskID string) (*broker.Task, error) {
-	now := time.Now()
-	nowStr := now.UTC().Format(time.RFC3339Nano)
-	score := float64(now.UnixNano()) / 1e9
-	scoreStr := fmt.Sprintf("%f", score)
-
 	res, err := claimForReplay.Run(ctx, r.client,
-		[]string{
-			r.taskKey(taskID),
-			r.stateIndexKey(broker.TaskStateFailed),
-			r.stateIndexKey(broker.TaskStatePending),
-		},
-		nowStr,
-		scoreStr,
+		[]string{r.taskKey(taskID)},
 	).Result()
 	if err != nil {
 		return nil, fmt.Errorf("redis: claim for replay: %w", err)

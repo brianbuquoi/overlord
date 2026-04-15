@@ -51,9 +51,12 @@ type Store interface {
 	UpdateTask(ctx context.Context, taskID string, update TaskUpdate) error
 	GetTask(ctx context.Context, taskID string) (*Task, error)
 	ListTasks(ctx context.Context, filter TaskFilter) (*ListTasksResult, error)
-	// ClaimForReplay atomically claims a dead-lettered task for replay,
-	// transitioning it from FAILED+dead-lettered to PENDING. Returns the
-	// updated task, or a not-replayable/not-found error.
+	// ClaimForReplay validates the task is in a replayable state (FAILED +
+	// RoutedToDeadLetter = true) and returns it. It does not mutate state;
+	// the original task remains in its terminal dead-lettered form. The
+	// caller is responsible for submitting a new task with the returned
+	// payload. Returns ErrTaskNotReplayable / ErrTaskNotFound on the
+	// failure paths.
 	ClaimForReplay(ctx context.Context, taskID string) (*Task, error)
 }
 

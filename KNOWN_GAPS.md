@@ -155,16 +155,19 @@ access (trusted), but defense-in-depth gap.
 **Recommendation:** Reject paths containing `..` or resolve to absolute and verify
 within an allowed directory.
 
-### SEC4-008: Replay dead-letter TOCTOU race
-**Location:** `internal/api/handlers.go` — `handleReplayDeadLetter()`
+### KG-004: Redis state index is not pipeline-scoped for dead-letter bulk ops
+**Location:** `internal/store/redis/redis.go` — `listTasksFromStateIndex`
 **Severity:** Medium
-**Description:** GetTask → state check → Submit is not atomic. A concurrent discard
-between check and submit could result in replaying a task that was just discarded.
-**Recommendation:** Use atomic compare-and-swap or lock the task during replay.
-The atomic Lua-script infrastructure introduced for the Redis UpdateTask rewrite
-(resolved SEC-012) makes this fixable cheaply: a `ClaimForReplay` script that
-checks state and transitions to PENDING in one round-trip follows the same
-pattern already in place.
+**Description:** `ListTasks` with a state filter reads the entire per-state
+ZSET and filters/paginates in Go. `replay-all` and `discard-all` call this in
+a loop, so on large dead-letter backlogs each page iteration performs a full
+state-scan and MGET of every FAILED task id across every pipeline. Under an
+accumulating backlog this becomes an authenticated DoS footgun — the cost
+grows O(total_failed) per page fetched. Fixing properly requires a
+two-dimensional state×pipeline index (`tasks:state:{state}:pipe:{id}` ZSETs).
+**Recommendation:** Defer until dead-letter backlog volume justifies the
+schema change; monitor ListTasks latency under state filter.
+**Status:** Open — known scale limit; acceptable for current deployments.
 
 ### SEC4-010: IPv6 brute force tracking per /128 (not /64)
 **Location:** `internal/auth/auth.go` — `RecordFailure()`, `internal/api/middleware.go` — `clientIP()`
@@ -331,7 +334,7 @@ without a total count.
 | SEC4-005 | No length limit on query filter params | Low | Accepted |
 | SEC4-006 | No config-level system_prompt size limit | Medium | Open |
 | SEC4-007 | Plugin paths not traversal-checked | Medium | Open |
-| SEC4-008 | Replay dead-letter TOCTOU race | Medium | Open |
+| SEC4-008 | Replay dead-letter phantom PENDING | High | Resolved |
 | SEC4-009 | UpdateTask allows arbitrary state transitions | Low | Accepted |
 | SEC4-010 | IPv6 brute force tracking per /128 | Medium | Open |
 | SEC4-011 | CI build missing -trimpath | Low | Accepted |
@@ -345,6 +348,7 @@ without a total count.
 | KG-001 | Lua cjson round-trip shifts numeric encoding | Low | Open |
 | KG-002 | Per-state index is flat (not 2D) | Low | Open |
 | KG-003 | ListTasks total-count over-reports with certain filters | Low | Open |
+| KG-004 | Redis state index not pipeline-scoped for bulk ops | Medium | Open |
 
 ---
 
@@ -357,6 +361,8 @@ without a total count.
 | SEC-012 | Redis UpdateTask not atomic | Medium | Atomic cjson Lua script merges updates server-side in one round-trip |
 | — | Redis terminal tasks removed from sorted-set index | Medium | Terminal tasks retained with TTL expiry instead of eviction |
 | — | Redis ListTasks full-scan on state filter | Medium | Per-state secondary index replaces full-scan filtering |
+| SEC4-008 | Single-task replay mutates original dead-lettered task to PENDING without re-enqueueing, leaving a phantom pending task | High | `ClaimForReplay` is now a pure read-only validator across Redis/Memory/Postgres; the original stays in FAILED+dead-lettered state and replay submits a new task |
+| — | Postgres store drift: `ClaimForReplay` ignored `RoutedToDeadLetter`; `UpdateTask` and `ListTasks` ignored `RoutedToDeadLetter`, `CrossStageTransitions`, and dead-letter/discarded filters | High | Postgres schema extended (migration 003) with `routed_to_dead_letter` and `cross_stage_transitions` columns; Postgres `ClaimForReplay`/`UpdateTask`/`ListTasks` now match Redis and Memory semantics |
 
 ---
 

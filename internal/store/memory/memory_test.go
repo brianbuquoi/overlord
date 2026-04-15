@@ -346,14 +346,25 @@ func TestClaimForReplay_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if claimed.State != broker.TaskStatePending {
-		t.Errorf("state: got %s want PENDING", claimed.State)
+	// ClaimForReplay is read-only — the returned task mirrors the stored
+	// one and no fields are rewritten.
+	if claimed.State != broker.TaskStateFailed {
+		t.Errorf("state: got %s want FAILED (no mutation)", claimed.State)
 	}
-	if claimed.RoutedToDeadLetter {
-		t.Errorf("routed_to_dead_letter should be cleared")
+	if !claimed.RoutedToDeadLetter {
+		t.Errorf("routed_to_dead_letter should remain set (no mutation)")
 	}
-	if claimed.Attempts != 0 {
-		t.Errorf("attempts: got %d want 0", claimed.Attempts)
+	if claimed.Attempts != 3 {
+		t.Errorf("attempts: got %d want 3 (no mutation)", claimed.Attempts)
+	}
+
+	// Verify the stored task was not mutated either.
+	stored, err := m.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get stored: %v", err)
+	}
+	if stored.State != broker.TaskStateFailed || !stored.RoutedToDeadLetter || stored.Attempts != 3 {
+		t.Errorf("stored task mutated: state=%s dl=%v attempts=%d", stored.State, stored.RoutedToDeadLetter, stored.Attempts)
 	}
 }
 
@@ -387,9 +398,10 @@ func TestClaimForReplay_NotReplayable(t *testing.T) {
 	}
 }
 
-// Under concurrent claims, exactly one goroutine wins and the others see
-// ErrTaskNotReplayable because the winner has already transitioned state.
-func TestClaimForReplay_ConcurrentSingleWinner(t *testing.T) {
+// ClaimForReplay is read-only, so concurrent callers all succeed and none
+// observe ErrTaskNotReplayable. The stored task is not mutated by any of
+// the concurrent claims.
+func TestClaimForReplay_ConcurrentNoMutation(t *testing.T) {
 	m := New()
 	ctx := context.Background()
 	task := newTask("p1", "s1")
@@ -401,30 +413,28 @@ func TestClaimForReplay_ConcurrentSingleWinner(t *testing.T) {
 
 	const N = 50
 	var wg sync.WaitGroup
-	wins := make([]bool, N)
 	errs := make([]error, N)
 	for i := 0; i < N; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := m.ClaimForReplay(ctx, task.ID)
-			errs[i] = err
-			wins[i] = err == nil
+			_, errs[i] = m.ClaimForReplay(ctx, task.ID)
 		}(i)
 	}
 	wg.Wait()
 
-	won := 0
-	for i, w := range wins {
-		if w {
-			won++
-			continue
-		}
-		if errs[i] != store.ErrTaskNotReplayable {
-			t.Errorf("loser goroutine got unexpected error: %v", errs[i])
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: unexpected error %v", i, err)
 		}
 	}
-	if won != 1 {
-		t.Fatalf("expected exactly 1 winner, got %d", won)
+
+	stored, err := m.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get stored: %v", err)
+	}
+	if stored.State != broker.TaskStateFailed || !stored.RoutedToDeadLetter {
+		t.Errorf("stored task mutated by concurrent claims: state=%s dl=%v",
+			stored.State, stored.RoutedToDeadLetter)
 	}
 }

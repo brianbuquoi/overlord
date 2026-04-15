@@ -143,13 +143,13 @@ func (m *MemoryStore) UpdateTask(_ context.Context, taskID string, update broker
 	return nil
 }
 
-// ClaimForReplay atomically transitions a FAILED+dead-lettered task to
-// PENDING. Concurrent callers for the same task will see one success and
-// the rest receive ErrTaskNotReplayable — the write lock serialises the
-// check-and-transition.
+// ClaimForReplay validates that taskID refers to a FAILED+dead-lettered task
+// and returns a copy of it. It does not mutate the stored task — the
+// original remains in its terminal FAILED state with RoutedToDeadLetter
+// still set. Callers submit a new task from the returned payload.
 func (m *MemoryStore) ClaimForReplay(_ context.Context, taskID string) (*broker.Task, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	task, ok := m.tasks[taskID]
 	if !ok {
@@ -162,10 +162,6 @@ func (m *MemoryStore) ClaimForReplay(_ context.Context, taskID string) (*broker.
 		return nil, store.ErrTaskNotReplayable
 	}
 
-	task.State = broker.TaskStatePending
-	task.RoutedToDeadLetter = false
-	task.Attempts = 0
-	task.UpdatedAt = time.Now()
 	return copyTask(task), nil
 }
 

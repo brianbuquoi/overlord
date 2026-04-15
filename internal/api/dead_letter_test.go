@@ -171,15 +171,16 @@ func TestDeadLetterReplay_PreservesPayload(t *testing.T) {
 		t.Fatalf("expected 0 attempts on replayed task, got %d", newTask.Attempts)
 	}
 
-	// ClaimForReplay transitions the original task out of FAILED+dead-letter
-	// and into PENDING as part of its atomic claim, so the original is no
-	// longer available for re-replay. Verify the claim actually happened.
+	// Replay must not mutate the original dead-lettered task. The original
+	// is an audit record of the failed attempt; a new task carries the
+	// retry. Previously, ClaimForReplay flipped the original to PENDING,
+	// leaving a phantom task no worker ever executed.
 	origAfter, _ := st.GetTask(context.Background(), taskID)
-	if origAfter.State != broker.TaskStatePending {
-		t.Fatalf("original task should be PENDING after claim, got %s", origAfter.State)
+	if origAfter.State != broker.TaskStateFailed {
+		t.Fatalf("original task should remain FAILED after replay, got %s", origAfter.State)
 	}
-	if origAfter.RoutedToDeadLetter {
-		t.Fatal("original task should have routed_to_dead_letter cleared after claim")
+	if !origAfter.RoutedToDeadLetter {
+		t.Fatal("original task should still have routed_to_dead_letter set after replay")
 	}
 }
 
@@ -252,12 +253,13 @@ func TestDeadLetterDiscard_Immutability(t *testing.T) {
 	}
 }
 
-// Test 11: replay-all replays only the target pipeline.
+// Test 11: replay-all replays only the target pipeline and leaves each
+// original task in its terminal FAILED+dead-lettered state.
 func TestDeadLetterReplayAll(t *testing.T) {
 	srv, b, st := newDeadLetterTestServer(t)
 	defer srv.Shutdown(context.Background())
 
-	seedDeadLetterTasks(t, b, st, 3, 0)
+	failedIDs, _ := seedDeadLetterTasks(t, b, st, 3, 0)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/replay-all?pipeline_id=test-pipeline", nil)
 	w := httptest.NewRecorder()
@@ -271,6 +273,19 @@ func TestDeadLetterReplayAll(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp.Count != 3 {
 		t.Fatalf("expected 3 replayed tasks, got %d", resp.Count)
+	}
+
+	for _, id := range failedIDs {
+		orig, err := st.GetTask(context.Background(), id)
+		if err != nil {
+			t.Fatalf("fetch original %s: %v", id, err)
+		}
+		if orig.State != broker.TaskStateFailed {
+			t.Errorf("original %s: state=%s want FAILED after replay-all", id, orig.State)
+		}
+		if !orig.RoutedToDeadLetter {
+			t.Errorf("original %s: RoutedToDeadLetter cleared after replay-all", id)
+		}
 	}
 }
 
@@ -351,9 +366,13 @@ func TestDeadLetterReplayAll_RateLimit(t *testing.T) {
 	}
 }
 
-// Concurrent replay requests for the same task must produce exactly one
-// success (202) and N-1 conflicts (409) — the ClaimForReplay path is
-// atomic, so no duplicate replays are enqueued under contention.
+// Concurrent replay requests for the same dead-lettered task leave the
+// original task untouched — ClaimForReplay is a pure read-only validator
+// and does not mutate the stored task. Each call submits a fresh task, so
+// N concurrent requests yield N accepted replays and zero duplicates of
+// the original's identity. This is the intended semantics after the
+// phantom-PENDING fix: the original is an audit record, replays are
+// independent fresh attempts.
 func TestReplayDeadLetter_Concurrent(t *testing.T) {
 	srv, b, st := newDeadLetterTestServer(t)
 	defer srv.Shutdown(context.Background())
@@ -364,6 +383,7 @@ func TestReplayDeadLetter_Concurrent(t *testing.T) {
 	const N = 20
 	var wg sync.WaitGroup
 	codes := make([]int, N)
+	newIDs := make([]string, N)
 	for i := 0; i < N; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -372,29 +392,48 @@ func TestReplayDeadLetter_Concurrent(t *testing.T) {
 			w := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(w, req)
 			codes[i] = w.Code
+			if w.Code == http.StatusAccepted {
+				var resp replayResponse
+				_ = json.Unmarshal(w.Body.Bytes(), &resp)
+				newIDs[i] = resp.TaskID
+			}
 		}(i)
 	}
 	wg.Wait()
 
-	ok, conflict, other := 0, 0, 0
-	for _, c := range codes {
+	ok, other := 0, 0
+	unique := make(map[string]struct{})
+	for i, c := range codes {
 		switch c {
 		case http.StatusAccepted:
 			ok++
-		case http.StatusConflict:
-			conflict++
+			if newIDs[i] == "" {
+				t.Errorf("accepted replay %d missing new task ID", i)
+			}
+			if newIDs[i] == taskID {
+				t.Errorf("replay %d returned the original task ID %s", i, taskID)
+			}
+			unique[newIDs[i]] = struct{}{}
 		default:
 			other++
 		}
 	}
-	if ok != 1 {
-		t.Fatalf("expected exactly 1 accepted replay under contention, got %d (conflict=%d other=%d)", ok, conflict, other)
+	if ok != N {
+		t.Fatalf("expected all %d concurrent replays accepted (read-only claim), got %d accepted, %d other", N, ok, other)
 	}
-	if conflict != N-1 {
-		t.Fatalf("expected %d conflicts, got %d (accepted=%d other=%d)", N-1, conflict, ok, other)
+	if len(unique) != N {
+		t.Fatalf("expected %d distinct new task IDs, got %d", N, len(unique))
 	}
-	if other != 0 {
-		t.Fatalf("expected no other status codes, got %d", other)
+
+	orig, err := st.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("fetch original: %v", err)
+	}
+	if orig.State != broker.TaskStateFailed {
+		t.Fatalf("original task state after concurrent replays: got %s, want FAILED", orig.State)
+	}
+	if !orig.RoutedToDeadLetter {
+		t.Fatal("original task should still have routed_to_dead_letter set after concurrent replays")
 	}
 }
 
