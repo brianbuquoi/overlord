@@ -715,23 +715,30 @@ func TestExecute_JSONOutput_MarkdownFenced(t *testing.T) {
 	}
 }
 
-func TestExecute_JSONOutput_PlainText_Rejected(t *testing.T) {
+func TestExecute_JSONOutput_PlainText_Wrapped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, jsonTextResponse("This is the review"))
 	}))
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
-	_, err := a.Execute(context.Background(), testTask())
-	ae := mustAgentError(t, err)
-	if !ae.Retryable {
-		t.Error("plain-text output must be retryable")
+	res, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("non-JSON text should wrap, not fail: %v", err)
 	}
-	if !strings.Contains(ae.Error(), "JSON") && !strings.Contains(ae.Error(), "json") {
-		t.Errorf("error should mention JSON, got: %s", ae.Error())
+	var out map[string]any
+	if err := json.Unmarshal(res.Payload, &out); err != nil {
+		t.Fatalf("payload not an object: %v", err)
+	}
+	if out["text"] != "This is the review" {
+		t.Errorf("wrapped text: got %v", out["text"])
 	}
 }
 
+// Empty text content is rejected by the adapter itself (before reaching
+// ParseJSONObjectOutput): an empty response envelope likely means a
+// transient upstream hiccup and should retry, not wrap to an empty
+// object payload.
 func TestExecute_JSONOutput_Empty_Rejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, jsonTextResponse(""))
@@ -746,17 +753,23 @@ func TestExecute_JSONOutput_Empty_Rejected(t *testing.T) {
 	}
 }
 
-func TestExecute_JSONOutput_Array_Rejected(t *testing.T) {
+func TestExecute_JSONOutput_Array_Wrapped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, jsonTextResponse("[1, 2, 3]"))
 	}))
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
-	_, err := a.Execute(context.Background(), testTask())
-	ae := mustAgentError(t, err)
-	if !ae.Retryable {
-		t.Error("array output must be retryable (must be an object)")
+	res, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("array should wrap, not fail: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(res.Payload, &out); err != nil {
+		t.Fatalf("payload not an object: %v", err)
+	}
+	if out["text"] != "[1, 2, 3]" {
+		t.Errorf("wrapped text: got %v", out["text"])
 	}
 }
 

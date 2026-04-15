@@ -1,13 +1,16 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 	"github.com/brianbuquoi/overlord/internal/config"
 	"github.com/brianbuquoi/overlord/internal/contract"
 	"github.com/brianbuquoi/overlord/internal/store/memory"
+	"github.com/brianbuquoi/overlord/internal/store/mock"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -698,5 +702,166 @@ func TestReplayAllLimiter_HardCap(t *testing.T) {
 	// Next call with a new key should be rejected.
 	if limiter.allow("one-more-pipeline") {
 		t.Fatal("expected rejection when at hard cap")
+	}
+}
+
+// newDeadLetterTestServerWithStore builds a test server backed by an
+// arbitrary broker.Store (e.g. the mock). Seeding helpers that target the
+// memory-backed tasks keep working because the mock delegates to memory by
+// default.
+func newDeadLetterTestServerWithStore(t *testing.T, st broker.Store, logger *slog.Logger) (*Server, *broker.Broker) {
+	t.Helper()
+	cfg := testConfig()
+	agents := map[string]broker.Agent{
+		"agent-1": &stubAgent{id: "agent-1", provider: "anthropic", healthy: true},
+		"agent-2": &stubAgent{id: "agent-2", provider: "openai", healthy: true},
+	}
+	reg, _ := contract.NewRegistry(nil, "")
+	b := broker.New(cfg, st, agents, reg, logger, nil, nil)
+	srv := NewServer(b, logger, nil, "")
+	return srv, b
+}
+
+// seedDeadLetterTasksInStore seeds the mock store with dead-lettered tasks
+// via the broker and the mock's memory backend. Returns the seeded task IDs.
+func seedDeadLetterTasksInStore(t *testing.T, b *broker.Broker, m *memory.MemoryStore, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		task, err := b.Submit(ctx, "test-pipeline", json.RawMessage(fmt.Sprintf(`{"input":"fail-%d"}`, i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := broker.TaskStateFailed
+		dl := true
+		if err := m.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &state, RoutedToDeadLetter: &dl}); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, task.ID)
+	}
+	return ids
+}
+
+// TestReplayAll_PerTaskFailure verifies the replay-all handler reports
+// per-task enqueue failures in `failed` and continues through the rest
+// of the page rather than aborting. An injected store pretends the first
+// two new submissions fail; the remaining three succeed.
+func TestReplayAll_PerTaskFailure(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	mstore := mock.New()
+	srv, b := newDeadLetterTestServerWithStore(t, mstore, logger)
+	defer srv.Shutdown(context.Background())
+
+	ids := seedDeadLetterTasksInStore(t, b, mstore.Memory(), 5)
+	if len(ids) != 5 {
+		t.Fatalf("seeded %d tasks, want 5", len(ids))
+	}
+
+	// After seeding, fail the first 2 replay submissions (new task IDs are
+	// fresh so we gate on call count, not ID).
+	var calls atomic.Int32
+	mem := mstore.Memory()
+	mstore.OnEnqueueTask = func(ctx context.Context, stageID string, task *broker.Task) error {
+		if calls.Add(1) <= 2 {
+			return mock.ErrInjected
+		}
+		return mem.EnqueueTask(ctx, stageID, task)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/replay-all?pipeline_id=test-pipeline", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status: got %d want 202: %s", w.Code, w.Body.String())
+	}
+	var resp replayAllResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Count != 3 {
+		t.Errorf("processed (count): got %d want 3", resp.Count)
+	}
+	if resp.Failed != 2 {
+		t.Errorf("failed: got %d want 2", resp.Failed)
+	}
+	if resp.Truncated {
+		t.Errorf("truncated: got true want false")
+	}
+
+	// Two Warn log lines should have been emitted for the failed submits.
+	warnCount := strings.Count(logBuf.String(), `"msg":"replay-all: failed to submit replay task"`)
+	if warnCount != 2 {
+		t.Errorf("replay-all warn log lines: got %d want 2 (logs: %s)", warnCount, logBuf.String())
+	}
+}
+
+// TestDiscardAll_PerTaskFailure verifies the discard-all handler reports
+// per-task update failures in `failed` and continues processing.
+func TestDiscardAll_PerTaskFailure(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	mstore := mock.New()
+	srv, b := newDeadLetterTestServerWithStore(t, mstore, logger)
+	defer srv.Shutdown(context.Background())
+
+	ids := seedDeadLetterTasksInStore(t, b, mstore.Memory(), 5)
+	if len(ids) != 5 {
+		t.Fatalf("seeded %d tasks, want 5", len(ids))
+	}
+
+	// Pick 2 specific task IDs to fail on UpdateTask (only the discard
+	// transition: we filter on the target state).
+	failSet := map[string]struct{}{ids[0]: {}, ids[1]: {}}
+	mem := mstore.Memory()
+	mstore.OnUpdateTask = func(ctx context.Context, taskID string, update broker.TaskUpdate) error {
+		if update.State != nil && *update.State == broker.TaskStateDiscarded {
+			if _, bad := failSet[taskID]; bad {
+				return mock.ErrInjected
+			}
+		}
+		return mem.UpdateTask(ctx, taskID, update)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/discard-all?pipeline_id=test-pipeline", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200: %s", w.Code, w.Body.String())
+	}
+	var resp discardAllResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Count != 3 {
+		t.Errorf("processed (count): got %d want 3", resp.Count)
+	}
+	// discard-all re-lists on each iteration and retries any tasks still
+	// in FAILED+dead-letter state (unlike replay-all, which claims each
+	// task out of the filter). Two stuck IDs therefore surface twice: once
+	// in iteration 1 (mixed in with the 3 that succeed) and once in
+	// iteration 2 (both fail, no progress, loop breaks). failed is 4, and
+	// the warn log contains 4 matching lines for 2 unique task IDs.
+	if resp.Failed != 4 {
+		t.Errorf("failed: got %d want 4", resp.Failed)
+	}
+	if resp.Truncated {
+		t.Errorf("truncated: got true want false")
+	}
+
+	warnCount := strings.Count(logBuf.String(), `"msg":"discard-all: failed to discard task"`)
+	if warnCount != 4 {
+		t.Errorf("discard-all warn log lines: got %d want 4 (logs: %s)", warnCount, logBuf.String())
+	}
+	// Distinct failing task IDs in the log: still 2.
+	for id := range failSet {
+		if !strings.Contains(logBuf.String(), `"task_id":"`+id+`"`) {
+			t.Errorf("expected warn log for failed task %s", id)
+		}
 	}
 }

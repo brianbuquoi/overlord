@@ -12,20 +12,21 @@ import (
 	"github.com/brianbuquoi/overlord/internal/broker"
 )
 
-// ParseJSONObjectOutput validates that an LLM adapter's extracted text output
-// is a JSON object, stripping a single pair of surrounding markdown code fences
-// if present. On success it returns the raw JSON bytes ready to be stored in
-// TaskResult.Payload. On failure it returns a descriptive error — callers wrap
-// it as a non-retryable AgentError so the broker routes the task to failure.
+// ParseJSONObjectOutput normalizes an LLM adapter's extracted text output
+// into a JSON object payload. Surrounding markdown code fences are stripped.
+// If the cleaned text decodes as a JSON object it is returned unchanged so
+// downstream schema validation sees the model's structured response
+// verbatim. Any other input — JSON arrays, scalars, plain text, empty
+// strings — is wrapped as {"text": "<raw>"} using the original unmodified
+// text, giving downstream validation a consistent object shape regardless
+// of which adapter produced the output.
 //
-// The broker validates task payloads against JSONSchema output schemas, which
-// require an object at the root. Rejecting non-object output here gives a
-// clear provider-level error instead of a generic contract violation.
+// Returning an error is effectively impossible: the wrap step marshals a
+// map with a fixed key and the raw string, which json.Marshal cannot fail
+// on. The signature preserves the error return so callers can continue to
+// treat it as a fallible step without further churn.
 func ParseJSONObjectOutput(text string) (json.RawMessage, error) {
 	cleaned := strings.TrimSpace(text)
-	if cleaned == "" {
-		return nil, fmt.Errorf("model output is empty")
-	}
 	if strings.HasPrefix(cleaned, "```") {
 		if idx := strings.Index(cleaned, "\n"); idx != -1 {
 			cleaned = cleaned[idx+1:]
@@ -35,18 +36,15 @@ func ParseJSONObjectOutput(text string) (json.RawMessage, error) {
 		}
 		cleaned = strings.TrimSpace(cleaned)
 	}
-	if cleaned == "" {
-		return nil, fmt.Errorf("model output is empty after stripping code fences")
-	}
 	var obj map[string]interface{}
-	if err := json.Unmarshal([]byte(cleaned), &obj); err != nil {
-		raw := text
-		if len(raw) > 200 {
-			raw = raw[:200]
-		}
-		return nil, fmt.Errorf("model output is not a valid JSON object: %v (raw: %s)", err, raw)
+	if err := json.Unmarshal([]byte(cleaned), &obj); err == nil {
+		return json.RawMessage(cleaned), nil
 	}
-	return json.RawMessage(cleaned), nil
+	wrapped, err := json.Marshal(map[string]any{"text": text})
+	if err != nil {
+		return nil, fmt.Errorf("wrap non-JSON output: %w", err)
+	}
+	return wrapped, nil
 }
 
 // Truncate returns the first n characters of s, appending "...(truncated)" if
