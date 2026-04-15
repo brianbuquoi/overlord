@@ -329,11 +329,13 @@ type replayResponse struct {
 
 type replayAllResponse struct {
 	Count     int  `json:"count"`
+	Failed    int  `json:"failed,omitempty"`
 	Truncated bool `json:"truncated,omitempty"`
 }
 
 type discardAllResponse struct {
 	Count     int  `json:"count"`
+	Failed    int  `json:"failed,omitempty"`
 	Truncated bool `json:"truncated,omitempty"`
 }
 
@@ -483,15 +485,17 @@ func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Reques
 	}
 
 	count := 0
-	offset := 0
+	failed := 0
 	truncated := false
 	for count < maxBulkOperationTasks {
+		// ClaimForReplay flips RoutedToDeadLetter to false on each claimed
+		// task, so successfully replayed tasks drop out of the filter
+		// (matches discard-all's pattern). We fetch offset=0 each iteration.
 		page, err := s.broker.Store().ListTasks(r.Context(), broker.TaskFilter{
 			PipelineID:         &pipelineID,
 			State:              &failedState,
 			RoutedToDeadLetter: &deadLetter,
 			Limit:              maxListLimit,
-			Offset:             offset,
 		})
 		if err != nil {
 			s.writeInternalError(w, r, http.StatusInternalServerError, "failed to list dead-letter tasks", "LIST_DEAD_LETTER_FAILED", err)
@@ -500,16 +504,41 @@ func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Reques
 		if len(page.Tasks) == 0 {
 			break
 		}
+		progressed := false
 		for _, task := range page.Tasks {
 			if count >= maxBulkOperationTasks {
 				truncated = true
 				break
 			}
-			if _, err := s.broker.Submit(r.Context(), task.PipelineID, task.Payload); err == nil {
-				count++
+			claimed, err := s.broker.Store().ClaimForReplay(r.Context(), task.ID)
+			if err != nil {
+				// Concurrent claim or state drift — log and move on so a
+				// transient skip does not block the rest of the page.
+				logger.Warn("replay-all: failed to claim task",
+					"task_id", task.ID,
+					"pipeline_id", task.PipelineID,
+					"error", err.Error(),
+				)
+				failed++
+				continue
 			}
+			if _, err := s.broker.Submit(r.Context(), claimed.PipelineID, claimed.Payload); err != nil {
+				logger.Warn("replay-all: failed to submit replay task",
+					"task_id", task.ID,
+					"pipeline_id", task.PipelineID,
+					"error", err.Error(),
+				)
+				failed++
+				continue
+			}
+			count++
+			progressed = true
 		}
-		offset += len(page.Tasks)
+		if !progressed {
+			// Every task in this page failed to be processed. Break to
+			// avoid a tight loop over the same unclaimable entries.
+			break
+		}
 	}
 	if count >= maxBulkOperationTasks {
 		truncated = true
@@ -520,7 +549,7 @@ func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Reques
 		)
 	}
 
-	writeJSON(w, http.StatusAccepted, replayAllResponse{Count: count, Truncated: truncated})
+	writeJSON(w, http.StatusAccepted, replayAllResponse{Count: count, Failed: failed, Truncated: truncated})
 }
 
 func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Request) {
@@ -546,6 +575,7 @@ func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Reque
 	}
 
 	count := 0
+	failed := 0
 	truncated := false
 	state := broker.TaskStateDiscarded
 	for count < maxBulkOperationTasks {
@@ -568,10 +598,17 @@ func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Reque
 				truncated = true
 				break
 			}
-			if err := s.broker.Store().UpdateTask(r.Context(), task.ID, broker.TaskUpdate{State: &state}); err == nil {
-				count++
-				progressed = true
+			if err := s.broker.Store().UpdateTask(r.Context(), task.ID, broker.TaskUpdate{State: &state}); err != nil {
+				logger.Warn("discard-all: failed to discard task",
+					"task_id", task.ID,
+					"pipeline_id", task.PipelineID,
+					"error", err.Error(),
+				)
+				failed++
+				continue
 			}
+			count++
+			progressed = true
 		}
 		// If no task in the current page could be updated, break to avoid an
 		// infinite loop (e.g. a permissions or store error that won't recover).
@@ -588,7 +625,7 @@ func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Reque
 		)
 	}
 
-	writeJSON(w, http.StatusOK, discardAllResponse{Count: count, Truncated: truncated})
+	writeJSON(w, http.StatusOK, discardAllResponse{Count: count, Failed: failed, Truncated: truncated})
 }
 
 // --- Helpers ---
@@ -634,6 +671,14 @@ func (s *Server) handleIssueWSToken(w http.ResponseWriter, r *http.Request) {
 		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to issue ws token", "WS_TOKEN_FAILED", err)
 		return
 	}
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Info("ws-token issued",
+		"request_id", r.Header.Get(requestIDHeader),
+		"expires_in", ttl,
+	)
 	writeJSON(w, http.StatusOK, wsTokenResponse{Token: token, ExpiresIn: ttl})
 }
 

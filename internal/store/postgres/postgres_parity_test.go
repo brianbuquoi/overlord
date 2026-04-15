@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,23 +130,80 @@ func TestPostgres_ClaimForReplay_RequiresDeadLettered(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 	if claimed.State != broker.TaskStateFailed {
-		t.Errorf("returned state: got %s want FAILED", claimed.State)
+		t.Errorf("returned state: got %s want FAILED (unchanged)", claimed.State)
 	}
-	if !claimed.RoutedToDeadLetter {
-		t.Error("returned RoutedToDeadLetter should remain true")
+	if claimed.RoutedToDeadLetter {
+		t.Error("returned RoutedToDeadLetter should be cleared by the claim")
 	}
 	if claimed.Attempts != 5 {
-		t.Errorf("returned Attempts: got %d want 5 (read-only)", claimed.Attempts)
+		t.Errorf("returned Attempts: got %d want 5", claimed.Attempts)
 	}
 
-	// Reread the stored row: no mutation.
+	// Reread the stored row: RoutedToDeadLetter is now false.
 	stored, err := s.GetTask(ctx, dl.ID)
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed || !stored.RoutedToDeadLetter || stored.Attempts != 5 {
-		t.Errorf("stored mutated: state=%s dl=%v attempts=%d",
+	if stored.State != broker.TaskStateFailed || stored.RoutedToDeadLetter || stored.Attempts != 5 {
+		t.Errorf("stored: state=%s dl=%v attempts=%d, want FAILED/false/5",
 			stored.State, stored.RoutedToDeadLetter, stored.Attempts)
+	}
+
+	// A second claim on the same task must fail: the flip is the claim token.
+	if _, err := s.ClaimForReplay(ctx, dl.ID); err != store.ErrTaskNotReplayable {
+		t.Fatalf("second claim: got %v, want ErrTaskNotReplayable", err)
+	}
+}
+
+// TestPostgres_ClaimForReplay_Concurrent ensures that N concurrent claims on
+// the same task produce exactly one winner. The losing callers receive
+// ErrTaskNotReplayable once the winner's UPDATE commits.
+func TestPostgres_ClaimForReplay_Concurrent(t *testing.T) {
+	s, _, _ := setupParityTest(t)
+	ctx := context.Background()
+
+	task := parityTask(uuid.New().String(), "p1", "s1", broker.TaskStateFailed)
+	task.RoutedToDeadLetter = true
+	if err := s.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	const N = 20
+	errs := make([]error, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = s.ClaimForReplay(ctx, task.ID)
+		}(i)
+	}
+	wg.Wait()
+
+	wins, losses := 0, 0
+	for _, err := range errs {
+		switch err {
+		case nil:
+			wins++
+		case store.ErrTaskNotReplayable:
+			losses++
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if wins != 1 || losses != N-1 {
+		t.Fatalf("wins=%d losses=%d, want 1/%d", wins, losses, N-1)
+	}
+
+	stored, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get stored: %v", err)
+	}
+	if stored.State != broker.TaskStateFailed {
+		t.Errorf("stored state: got %s want FAILED", stored.State)
+	}
+	if stored.RoutedToDeadLetter {
+		t.Error("stored RoutedToDeadLetter should be cleared by the winner")
 	}
 }
 

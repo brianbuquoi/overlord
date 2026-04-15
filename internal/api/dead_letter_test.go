@@ -171,16 +171,15 @@ func TestDeadLetterReplay_PreservesPayload(t *testing.T) {
 		t.Fatalf("expected 0 attempts on replayed task, got %d", newTask.Attempts)
 	}
 
-	// Replay must not mutate the original dead-lettered task. The original
-	// is an audit record of the failed attempt; a new task carries the
-	// retry. Previously, ClaimForReplay flipped the original to PENDING,
-	// leaving a phantom task no worker ever executed.
+	// After a successful claim, the original task stays FAILED (audit
+	// record) but RoutedToDeadLetter is cleared — that flip is the claim
+	// token that makes concurrent replays idempotent.
 	origAfter, _ := st.GetTask(context.Background(), taskID)
 	if origAfter.State != broker.TaskStateFailed {
 		t.Fatalf("original task should remain FAILED after replay, got %s", origAfter.State)
 	}
-	if !origAfter.RoutedToDeadLetter {
-		t.Fatal("original task should still have routed_to_dead_letter set after replay")
+	if origAfter.RoutedToDeadLetter {
+		t.Fatal("original task RoutedToDeadLetter should be cleared after a successful replay")
 	}
 }
 
@@ -283,9 +282,25 @@ func TestDeadLetterReplayAll(t *testing.T) {
 		if orig.State != broker.TaskStateFailed {
 			t.Errorf("original %s: state=%s want FAILED after replay-all", id, orig.State)
 		}
-		if !orig.RoutedToDeadLetter {
-			t.Errorf("original %s: RoutedToDeadLetter cleared after replay-all", id)
+		if orig.RoutedToDeadLetter {
+			t.Errorf("original %s: RoutedToDeadLetter should be cleared after replay-all (claim token flipped)", id)
 		}
+	}
+
+	// A second replay-all call (under a fresh rate-limit window) must find
+	// zero dead-lettered tasks because the first call's ClaimForReplay flipped
+	// RoutedToDeadLetter to false on every claimed task.
+	srv.replayAllLimiter = newReplayAllRateLimiter()
+	req = httptest.NewRequest(http.MethodPost, "/v1/dead-letter/replay-all?pipeline_id=test-pipeline", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("second replay-all: expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp2 replayAllResponse
+	json.Unmarshal(w.Body.Bytes(), &resp2)
+	if resp2.Count != 0 {
+		t.Fatalf("second replay-all: expected 0 claimed tasks, got %d", resp2.Count)
 	}
 }
 
@@ -366,13 +381,11 @@ func TestDeadLetterReplayAll_RateLimit(t *testing.T) {
 	}
 }
 
-// Concurrent replay requests for the same dead-lettered task leave the
-// original task untouched — ClaimForReplay is a pure read-only validator
-// and does not mutate the stored task. Each call submits a fresh task, so
-// N concurrent requests yield N accepted replays and zero duplicates of
-// the original's identity. This is the intended semantics after the
-// phantom-PENDING fix: the original is an audit record, replays are
-// independent fresh attempts.
+// Concurrent replay requests for the same dead-lettered task must produce
+// exactly one winner. ClaimForReplay atomically flips RoutedToDeadLetter,
+// so N-1 concurrent callers see 409 Conflict once the winner's flip lands.
+// Exactly one new task is submitted into the pipeline — operators cannot
+// accidentally flood the pipeline by double-clicking or scripting retries.
 func TestReplayDeadLetter_Concurrent(t *testing.T) {
 	srv, b, st := newDeadLetterTestServer(t)
 	defer srv.Shutdown(context.Background())
@@ -401,12 +414,12 @@ func TestReplayDeadLetter_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	ok, other := 0, 0
+	accepted, conflict, other := 0, 0, 0
 	unique := make(map[string]struct{})
 	for i, c := range codes {
 		switch c {
 		case http.StatusAccepted:
-			ok++
+			accepted++
 			if newIDs[i] == "" {
 				t.Errorf("accepted replay %d missing new task ID", i)
 			}
@@ -414,15 +427,17 @@ func TestReplayDeadLetter_Concurrent(t *testing.T) {
 				t.Errorf("replay %d returned the original task ID %s", i, taskID)
 			}
 			unique[newIDs[i]] = struct{}{}
+		case http.StatusConflict:
+			conflict++
 		default:
 			other++
 		}
 	}
-	if ok != N {
-		t.Fatalf("expected all %d concurrent replays accepted (read-only claim), got %d accepted, %d other", N, ok, other)
+	if accepted != 1 || conflict != N-1 || other != 0 {
+		t.Fatalf("codes: accepted=%d conflict=%d other=%d; want 1/%d/0", accepted, conflict, N-1, other)
 	}
-	if len(unique) != N {
-		t.Fatalf("expected %d distinct new task IDs, got %d", N, len(unique))
+	if len(unique) != 1 {
+		t.Fatalf("expected exactly 1 new task ID, got %d", len(unique))
 	}
 
 	orig, err := st.GetTask(context.Background(), taskID)
@@ -432,8 +447,19 @@ func TestReplayDeadLetter_Concurrent(t *testing.T) {
 	if orig.State != broker.TaskStateFailed {
 		t.Fatalf("original task state after concurrent replays: got %s, want FAILED", orig.State)
 	}
-	if !orig.RoutedToDeadLetter {
-		t.Fatal("original task should still have routed_to_dead_letter set after concurrent replays")
+	if orig.RoutedToDeadLetter {
+		t.Fatal("original task RoutedToDeadLetter should be cleared after a successful replay")
+	}
+
+	// Exactly one new task was created: the store should hold the original
+	// FAILED task plus exactly one new PENDING task for that payload.
+	ctx := context.Background()
+	result, err := st.ListTasks(ctx, broker.TaskFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+	if result.Total != 2 {
+		t.Fatalf("expected 2 tasks in store (original + 1 replay), got %d", result.Total)
 	}
 }
 

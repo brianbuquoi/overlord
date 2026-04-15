@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 	"unsafe"
@@ -193,15 +194,19 @@ const maxTrackedIPs = 100_000
 // are rejected with 429 regardless of key validity.
 //
 // A background cleanup goroutine sweeps expired entries every 5 minutes.
-// If the number of tracked IPs exceeds maxTrackedIPs (100,000), new entries
-// are silently dropped (fail open) to prevent memory exhaustion.
+// The tracker caps itself at maxIPCap (default 100,000). Once the map
+// crosses 90% of that cap, RecordFailure bulk-evicts the least-recently-seen
+// live entries down to 80%, amortising the eviction cost so the hot path
+// is not penalised on every insert at saturation.
 type BruteForceTracker struct {
-	mu             sync.Mutex
-	failures       map[string]*ipFailures
-	maxFailures    int
-	windowDuration time.Duration
-	maxIPCap       int
-	logger         *slog.Logger
+	mu                sync.Mutex
+	failures          map[string]*ipFailures
+	maxFailures       int
+	windowDuration    time.Duration
+	maxIPCap          int
+	evictionThreshold int // 90% of maxIPCap; once reached, bulk-evict.
+	evictionTarget    int // 80% of maxIPCap; bulk eviction drops to this.
+	logger            *slog.Logger
 }
 
 type ipFailures struct {
@@ -223,6 +228,8 @@ func NewBruteForceTracker(maxFailures int, window time.Duration, opts ...BruteFo
 	for _, o := range opts {
 		o(t)
 	}
+	t.evictionThreshold = (t.maxIPCap * 9) / 10
+	t.evictionTarget = (t.maxIPCap * 8) / 10
 	return t
 }
 
@@ -311,12 +318,10 @@ func (t *BruteForceTracker) IsBlocked(ip string) bool {
 
 // RecordFailure records an authentication failure for the given IP. IPv6
 // addresses are coalesced to /64 to prevent subnet-spray bypass. When the
-// tracker is at or near capacity, RecordFailure evicts the
-// least-recently-seen entry to make room for a new one instead of failing
-// open. evictThreshold (default 90% of maxIPCap) controls how eagerly the
-// sweep runs: at or above the threshold a sweep is attempted on every new
-// insert, which both prunes expired entries and evicts a live entry if
-// the map is genuinely saturated.
+// tracker crosses evictionThreshold (90% of maxIPCap), a bulk sweep prunes
+// expired entries and, if still above evictionTarget (80% of maxIPCap),
+// evicts the oldest live entries. Evicting in bulk amortises the cost so
+// one eviction buys another ~10% of capacity before the next sweep.
 func (t *BruteForceTracker) RecordFailure(ip string) {
 	ip = normalizeIP(ip)
 	t.mu.Lock()
@@ -325,20 +330,11 @@ func (t *BruteForceTracker) RecordFailure(ip string) {
 	now := time.Now()
 	f, ok := t.failures[ip]
 	if !ok || now.After(f.windowEnd) {
-		// New insert path — evict/prune if we would otherwise exceed cap.
-		if !ok && len(t.failures) >= t.maxIPCap {
-			t.evictOldestLocked(now)
-		}
-		if !ok && len(t.failures) >= t.maxIPCap {
-			// Eviction failed to free a slot (map exceeds maxIPCap despite
-			// a sweep). Drop as a last resort and log it.
-			if t.logger != nil {
-				t.logger.Warn("brute force tracker at hard cap, dropping new IP",
-					"tracked_ips", len(t.failures),
-					"cap", t.maxIPCap,
-				)
-			}
-			return
+		// New insert path. Check eviction at 90% — this is the near-capacity
+		// threshold, not the hard cap. Evicting here prevents the map from
+		// saturating and forcing an eviction on every subsequent insert.
+		if !ok && len(t.failures) >= t.evictionThreshold {
+			t.bulkEvictLocked(now)
 		}
 		t.failures[ip] = &ipFailures{
 			count:     1,
@@ -352,45 +348,52 @@ func (t *BruteForceTracker) RecordFailure(ip string) {
 	f.lastSeen = now
 }
 
-// evictOldestLocked removes the least-recently-seen entry from the failures
-// map. Callers must hold t.mu. Also opportunistically drops expired entries
-// in the same sweep, which typically frees many slots at once under real
-// workloads — live-entry eviction only fires when the window is genuinely
-// saturated with non-expired entries.
-func (t *BruteForceTracker) evictOldestLocked(now time.Time) {
-	oldestIP := ""
-	var oldestSeen time.Time
-	expired := 0
+// bulkEvictLocked drops expired entries first, then — if the map is still
+// above evictionTarget — evicts the least-recently-seen live entries until
+// it falls back to evictionTarget. Callers must hold t.mu.
+func (t *BruteForceTracker) bulkEvictLocked(now time.Time) {
+	// Phase 1: expired entries.
+	pruned := 0
 	for ip, entry := range t.failures {
 		if now.After(entry.windowEnd) {
 			delete(t.failures, ip)
-			expired++
-			continue
-		}
-		if oldestIP == "" || entry.lastSeen.Before(oldestSeen) {
-			oldestIP = ip
-			oldestSeen = entry.lastSeen
+			pruned++
 		}
 	}
-	// If expired-entry pruning alone freed room, don't evict a live entry.
-	if expired > 0 && len(t.failures) < t.maxIPCap {
-		if t.logger != nil {
+	if len(t.failures) <= t.evictionTarget {
+		if t.logger != nil && pruned > 0 {
 			t.logger.Info("brute force tracker pruned expired entries",
-				"pruned", expired,
+				"pruned", pruned,
 				"tracked_ips", len(t.failures),
 			)
 		}
 		return
 	}
-	if oldestIP != "" {
-		delete(t.failures, oldestIP)
-		if t.logger != nil {
-			t.logger.Warn("brute force tracker evicted oldest entry",
-				"evicted_ip", oldestIP,
-				"last_seen", oldestSeen,
-				"tracked_ips", len(t.failures),
-			)
-		}
+
+	// Phase 2: sort remaining live entries by lastSeen and drop the oldest
+	// until we are back at evictionTarget.
+	type ipEntry struct {
+		ip       string
+		lastSeen time.Time
+	}
+	remaining := make([]ipEntry, 0, len(t.failures))
+	for ip, entry := range t.failures {
+		remaining = append(remaining, ipEntry{ip: ip, lastSeen: entry.lastSeen})
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i].lastSeen.Before(remaining[j].lastSeen) })
+	toEvict := len(t.failures) - t.evictionTarget
+	evicted := 0
+	for i := 0; i < toEvict && i < len(remaining); i++ {
+		delete(t.failures, remaining[i].ip)
+		evicted++
+	}
+	if t.logger != nil {
+		t.logger.Warn("brute force tracker evicting entries",
+			"evicted", evicted,
+			"pruned_expired", pruned,
+			"remaining", len(t.failures),
+			"capacity", t.maxIPCap,
+		)
 	}
 }
 

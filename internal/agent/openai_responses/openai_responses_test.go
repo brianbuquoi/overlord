@@ -215,12 +215,10 @@ func TestExecute_RequestTimeoutIsRetryable(t *testing.T) {
 	}
 }
 
-// A response whose output text is not valid JSON is a model-contract
-// violation surfaced as a retryable AgentError — same behaviour as the
-// sibling openai, anthropic, google, and ollama adapters. No silent
-// wrapping into {"text": "..."}; stage schema validation does the
-// enforcement.
-func TestExecute_NonJSONTextIsRetryable(t *testing.T) {
+// Non-JSON model output is wrapped as {"text": "<raw>"} so downstream
+// schema validation always sees an object at the root. This matches the
+// Responses API's typical use with models not explicitly prompted for JSON.
+func TestExecute_NonJSONTextIsWrapped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, responsesResponse{
 			ID: "r",
@@ -233,12 +231,164 @@ func TestExecute_NonJSONTextIsRetryable(t *testing.T) {
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
-	_, err := a.Execute(context.Background(), testTask())
-	var agentErr *agent.AgentError
-	if !errors.As(err, &agentErr) || !agentErr.Retryable {
-		t.Fatalf("expected retryable AgentError on non-JSON text, got %v", err)
+	res, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("expected success with fallback, got %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(res.Payload, &got); err != nil {
+		t.Fatalf("payload not a JSON object: %v (raw %s)", err, res.Payload)
+	}
+	if got["text"] != "hello world" {
+		t.Errorf("fallback payload text: got %v want %q", got["text"], "hello world")
 	}
 }
+
+// A plain scalar (non-object, non-array) is wrapped as {"text": "..."}.
+func TestExecute_PlainStringIsWrapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, responsesResponse{
+			ID: "r",
+			Output: []outputItem{{
+				Type: "message",
+				Content: []contentBlock{{Type: "output_text", Text: `"quoted string"`}},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	res, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(res.Payload, &got); err != nil {
+		t.Fatalf("payload not a JSON object: %v", err)
+	}
+	if got["text"] != `"quoted string"` {
+		t.Errorf("fallback text: got %v", got["text"])
+	}
+}
+
+// A JSON array at the root is wrapped as {"text": "[...]"} — only top-level
+// objects pass through unchanged.
+func TestExecute_JSONArrayIsWrapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, responsesResponse{
+			ID: "r",
+			Output: []outputItem{{
+				Type: "message",
+				Content: []contentBlock{{Type: "output_text", Text: `[1,2,3]`}},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	res, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(res.Payload, &got); err != nil {
+		t.Fatalf("payload must be an object after fallback: %v", err)
+	}
+	if got["text"] != `[1,2,3]` {
+		t.Errorf("fallback text: got %v", got["text"])
+	}
+}
+
+// A valid JSON object passes through untouched.
+func TestExecute_JSONObjectPassesThrough(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, responsesResponse{
+			ID: "r",
+			Output: []outputItem{{
+				Type: "message",
+				Content: []contentBlock{{Type: "output_text", Text: `{"k":"v"}`}},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	res, err := a.Execute(context.Background(), testTask())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if string(res.Payload) != `{"k":"v"}` {
+		t.Errorf("payload: got %s want %s", string(res.Payload), `{"k":"v"}`)
+	}
+}
+
+// A generic 4xx (not rate-limit, not context-length, not model-not-found)
+// should surface as a non-retryable AgentError.
+func TestExecute_Generic4xxIsNonRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: apiErrorDetail{
+			Message: "invalid request",
+			Code:    "invalid_request",
+		}})
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	_, err := a.Execute(context.Background(), testTask())
+	var agentErr *agent.AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("expected AgentError, got %T: %v", err, err)
+	}
+	if agentErr.Retryable {
+		t.Error("generic 4xx should be non-retryable")
+	}
+}
+
+// After a successful Execute, the structured log line must include model,
+// input_tokens, output_tokens, and latency_ms fields.
+func TestExecute_LogsStructuredFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, responsesResponse{
+			ID: "r",
+			Output: []outputItem{{
+				Type: "message",
+				Content: []contentBlock{{Type: "output_text", Text: `{"ok":true}`}},
+			}},
+			Usage: responsesUsage{InputTokens: 11, OutputTokens: 3},
+		})
+	}))
+	defer srv.Close()
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewJSONHandler(&writerFunc{write: func(p []byte) (int, error) {
+		buf.Write(p)
+		return len(p), nil
+	}}, nil))
+
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	a, err := New(Config{
+		ID: "t", Model: "codex-mini-latest", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	}, logger)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if _, err := a.Execute(context.Background(), testTask()); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	line := buf.String()
+	for _, want := range []string{`"model":"codex-mini-latest"`, `"input_tokens":11`, `"output_tokens":3`, `"latency_ms":`} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log line missing %q: %s", want, line)
+		}
+	}
+}
+
+// writerFunc adapts a function into an io.Writer for log capture.
+type writerFunc struct {
+	write func([]byte) (int, error)
+}
+
+func (w *writerFunc) Write(p []byte) (int, error) { return w.write(p) }
 
 func TestHealthCheck_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -245,9 +245,13 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 		a.metrics.AgentTokensTotal.WithLabelValues(providerName, a.cfg.Model, "output").Add(float64(result.Usage.OutputTokens))
 	}
 
-	payload, parseErr := agent.ParseJSONObjectOutput(output)
-	if parseErr != nil {
-		return nil, a.retryableErr(parseErr)
+	// Parse-then-fallback: the Responses API is often used with models that
+	// aren't explicitly prompted for JSON. If the raw text isn't a JSON
+	// object, wrap it as {"text": "<raw>"} so downstream schema validation
+	// receives a consistent envelope shape.
+	payload, err := parseOrWrap(output)
+	if err != nil {
+		return nil, a.nonRetryableErr(err)
 	}
 
 	return &broker.TaskResult{
@@ -261,6 +265,35 @@ func (a *Adapter) Execute(ctx context.Context, task *broker.Task) (*broker.TaskR
 			"latency_ms":    latencyMs,
 		},
 	}, nil
+}
+
+// parseOrWrap returns the raw bytes of a JSON object if the text already
+// decodes as one; otherwise it wraps the raw text as {"text": "<raw>"}.
+// Surrounding ``` code fences are stripped before the JSON attempt so
+// models that emit markdown still produce a proper object payload. Only
+// JSON *objects* pass through unchanged — JSON arrays and scalars are
+// wrapped so downstream schema validation (which requires an object root)
+// receives a consistent shape.
+func parseOrWrap(text string) (json.RawMessage, error) {
+	cleaned := strings.TrimSpace(text)
+	if strings.HasPrefix(cleaned, "```") {
+		if idx := strings.Index(cleaned, "\n"); idx != -1 {
+			cleaned = cleaned[idx+1:]
+		}
+		if idx := strings.LastIndex(cleaned, "```"); idx != -1 {
+			cleaned = cleaned[:idx]
+		}
+		cleaned = strings.TrimSpace(cleaned)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(cleaned), &obj); err == nil {
+		return json.RawMessage(cleaned), nil
+	}
+	wrapped, err := json.Marshal(map[string]any{"text": text})
+	if err != nil {
+		return nil, fmt.Errorf("wrap non-JSON output: %w", err)
+	}
+	return wrapped, nil
 }
 
 // extractOutputText walks the nested output[].content[] shape that the

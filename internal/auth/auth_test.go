@@ -412,40 +412,88 @@ func TestBruteForceTracker_CleanupSweep(t *testing.T) {
 	}
 }
 
-// Replaces the old fail-open test. When the tracker reaches its soft
-// threshold, RecordFailure evicts the least-recently-seen entry rather
-// than silently dropping the new IP. This keeps brute-force protection
-// effective under sustained IP-spray past the 100k cap.
-func TestBruteForce_EvictsOldestAtCapacity(t *testing.T) {
+// Near-capacity eviction: once the tracker has reached evictionThreshold
+// (90% of maxIPCap), the next insert bulk-evicts the oldest live entries
+// down to evictionTarget (80%) before admitting the new entry. This
+// amortises the hot-path cost — one eviction pass clears room for ~10% of
+// new entries before the next sweep.
+func TestBruteForce_NearCapacityEviction(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	cap := 10
+	const cap = 100 // thresholds: 90 (evict), 80 (target)
 	tracker := NewBruteForceTracker(3, time.Minute, WithMaxIPs(cap), WithLogger(logger))
 
-	// Fill the cap with 10 distinct IPs, each blocked.
-	for i := 0; i < cap; i++ {
-		ip := fmt.Sprintf("10.0.0.%d", i)
-		for j := 0; j < 3; j++ {
-			tracker.RecordFailure(ip)
-		}
+	// Fill to 90 — reaching the threshold does not itself evict; evictions
+	// fire on the next insert that would push past it.
+	for i := 0; i < 90; i++ {
+		tracker.RecordFailure(fmt.Sprintf("10.0.0.%d", i))
 	}
-	if got := tracker.TrackedIPs(); got != cap {
-		t.Fatalf("expected %d tracked IPs, got %d", cap, got)
+	if got := tracker.TrackedIPs(); got != 90 {
+		t.Fatalf("filled count: got %d want 90", got)
+	}
+	if strings.Contains(logBuf.String(), "evicting entries") {
+		t.Errorf("unexpected eviction at 90/100 — threshold is the insert-time check")
 	}
 
-	// Add an 11th IP — the evict path should free a slot for it.
-	for j := 0; j < 3; j++ {
-		tracker.RecordFailure("192.168.1.1")
+	// The 91st distinct insert sees len >= 90 and triggers a bulk eviction
+	// to evictionTarget (80). The new entry is then inserted, leaving 81.
+	tracker.RecordFailure("10.0.1.0")
+	got := tracker.TrackedIPs()
+	if got != 81 {
+		t.Fatalf("post-eviction count: got %d want 81 (evictionTarget 80 + new entry)", got)
 	}
-	if !tracker.IsBlocked("192.168.1.1") {
-		t.Error("new IP should be tracked and blockable post-eviction (not fail-open)")
-	}
-	if got := tracker.TrackedIPs(); got != cap {
-		t.Errorf("expected tracker to stay at cap %d after eviction, got %d", cap, got)
-	}
-	if !strings.Contains(logBuf.String(), "evicted oldest entry") {
+	if !strings.Contains(logBuf.String(), "evicting entries") {
 		t.Errorf("expected eviction log line, got: %s", logBuf.String())
+	}
+	// The oldest entry should have been evicted first.
+	if tracker.WindowEnd("10.0.0.0") != (time.Time{}) {
+		t.Error("oldest IP 10.0.0.0 should have been evicted")
+	}
+	if tracker.WindowEnd("10.0.1.0") == (time.Time{}) {
+		t.Error("newly inserted IP should still be tracked")
+	}
+}
+
+// After a bulk eviction at 90%, the tracker should accept another ~10% of
+// entries before the next eviction fires. That gap is what amortises the
+// hot-path cost under sustained IP-spray.
+func TestBruteForce_EvictionAmortization(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	const cap = 100
+	tracker := NewBruteForceTracker(3, time.Minute, WithMaxIPs(cap), WithLogger(logger))
+
+	// Fill 91 entries. The 91st insert (at len=90) triggers the first
+	// eviction → drops to 80, then admits → 81.
+	for i := 0; i < 91; i++ {
+		tracker.RecordFailure(fmt.Sprintf("10.0.0.%d", i))
+	}
+	if strings.Count(logBuf.String(), "evicting entries") != 1 {
+		t.Fatalf("expected 1 eviction after 91 inserts, got %d (log: %s)",
+			strings.Count(logBuf.String(), "evicting entries"), logBuf.String())
+	}
+	if got := tracker.TrackedIPs(); got != 81 {
+		t.Fatalf("after first eviction: got %d want 81", got)
+	}
+
+	// Add 8 more distinct entries — we are at 81..89, still below the 90
+	// threshold, so no new eviction fires.
+	for i := 0; i < 8; i++ {
+		tracker.RecordFailure(fmt.Sprintf("10.0.1.%d", i))
+	}
+	if strings.Count(logBuf.String(), "evicting entries") != 1 {
+		t.Errorf("unexpected second eviction before crossing threshold again: %s", logBuf.String())
+	}
+
+	// The next two inserts take us to 90, then the following insert
+	// triggers the second eviction.
+	tracker.RecordFailure("10.0.1.8")
+	tracker.RecordFailure("10.0.1.9")
+	tracker.RecordFailure("10.0.1.10")
+	if strings.Count(logBuf.String(), "evicting entries") != 2 {
+		t.Errorf("expected 2 evictions after crossing threshold twice, got log: %s", logBuf.String())
 	}
 }
 

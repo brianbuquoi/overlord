@@ -335,6 +335,7 @@ without a total count.
 | SEC4-006 | No config-level system_prompt size limit | Medium | Open |
 | SEC4-007 | Plugin paths not traversal-checked | Medium | Open |
 | SEC4-008 | Replay dead-letter phantom PENDING | High | Resolved |
+| SEC4-008b | Concurrent replay semantics: N-winner read-only claim | Medium | Resolved |
 | SEC4-009 | UpdateTask allows arbitrary state transitions | Low | Accepted |
 | SEC4-010 | IPv6 brute force tracking per /128 | Medium | Open |
 | SEC4-011 | CI build missing -trimpath | Low | Accepted |
@@ -362,6 +363,11 @@ without a total count.
 | — | Redis terminal tasks removed from sorted-set index | Medium | Terminal tasks retained with TTL expiry instead of eviction |
 | — | Redis ListTasks full-scan on state filter | Medium | Per-state secondary index replaces full-scan filtering |
 | SEC4-008 | Single-task replay mutates original dead-lettered task to PENDING without re-enqueueing, leaving a phantom pending task | High | `ClaimForReplay` is now a pure read-only validator across Redis/Memory/Postgres; the original stays in FAILED+dead-lettered state and replay submits a new task |
+| SEC4-008b | Concurrent replay requests for the same dead-lettered task each submitted duplicate tasks (N-winner read-only claim) | Medium | `ClaimForReplay` now atomically flips `RoutedToDeadLetter` from true to false across Redis/Memory/Postgres; exactly one caller wins, N-1 concurrent callers receive `ErrTaskNotReplayable` (409). Task state stays FAILED so the audit trail is preserved. replay-all now goes through `ClaimForReplay` too. |
+| — | OpenAI Responses adapter failed hard on non-JSON model output | Medium | Adapter now parses-then-falls-back: non-JSON text is wrapped as `{"text": "<raw>"}` so downstream schema validation always sees an object root |
+| — | ws-token endpoint missing issuance/consumption logging, concurrent upgrade test, and documentation | Low | Structured logs added on issue/consume/reject (without leaking token values); `TestWSToken_ConcurrentUpgrade` asserts single-winner semantics; `docs/api.md` documents the flow; misleading "periodic background sweep" comment corrected |
+| — | Brute-force tracker comments overstated near-capacity behavior; eviction only fired at hard cap | Medium | Tracker now evicts in bulk at 90% of `maxIPCap` down to 80%, amortising the hot-path cost. Comments updated to match. SEC4-010 (IPv6 /64 coalescing) already resolved — near-capacity behaviour is the remaining piece |
+| — | replay-all / discard-all silently ignored per-task failures | Low | Per-task failures now logged at Warn with `task_id`, `pipeline_id`, and `error`; response body now includes a `failed` count alongside `count` |
 | — | Postgres store drift: `ClaimForReplay` ignored `RoutedToDeadLetter`; `UpdateTask` and `ListTasks` ignored `RoutedToDeadLetter`, `CrossStageTransitions`, and dead-letter/discarded filters | High | Postgres schema extended (migration 003) with `routed_to_dead_letter` and `cross_stage_transitions` columns; Postgres `ClaimForReplay`/`UpdateTask`/`ListTasks` now match Redis and Memory semantics |
 
 ---

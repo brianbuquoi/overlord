@@ -210,7 +210,7 @@ func TestPostgres_IndexUsage(t *testing.T) {
 	}
 
 	// ANALYZE the table so the query planner has up-to-date statistics.
-	_, err := pool.Exec(ctx, "ANALYZE "+table)
+	_, err = pool.Exec(ctx, "ANALYZE "+table)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestPostgres_UpdateTaskNotFound(t *testing.T) {
 	}
 
 	state := broker.TaskStateExecuting
-	err := s.UpdateTask(ctx, "nonexistent-"+uuid.New().String(), broker.TaskUpdate{
+	err = s.UpdateTask(ctx, "nonexistent-"+uuid.New().String(), broker.TaskUpdate{
 		State: &state,
 	})
 	if err != store.ErrTaskNotFound {

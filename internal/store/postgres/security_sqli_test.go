@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/brianbuquoi/overlord/internal/broker"
 )
 
@@ -21,7 +23,13 @@ func TestSecurity_SQLInjection(t *testing.T) {
 		t.Skip("DATABASE_URL not set")
 	}
 
-	st, err := New(dsn, "overlord_tasks")
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	st, err := New(pool, "overlord_tasks")
 	if err != nil {
 		t.Fatal(err)
 	}

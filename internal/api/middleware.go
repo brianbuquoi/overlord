@@ -135,13 +135,22 @@ func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger 
 			// credit/debit because the token itself is single-use and random.
 			if isWebSocketUpgrade(r) && r.Header.Get("Authorization") == "" && wsTokens != nil {
 				qToken := r.URL.Query().Get("token")
-				if qToken != "" && wsTokens.consume(qToken) {
-					ctx := context.WithValue(r.Context(), authKeyContextKey, &auth.APIKey{
-						Name:   "ws-session",
-						Scopes: auth.ScopeSet{auth.ScopeRead: true},
-					})
-					next.ServeHTTP(w, r.WithContext(ctx))
-					return
+				if qToken != "" {
+					if wsTokens.consume(qToken) {
+						logger.Debug("ws-token consumed",
+							"request_id", r.Header.Get(requestIDHeader),
+						)
+						ctx := context.WithValue(r.Context(), authKeyContextKey, &auth.APIKey{
+							Name:   "ws-session",
+							Scopes: auth.ScopeSet{auth.ScopeRead: true},
+						})
+						next.ServeHTTP(w, r.WithContext(ctx))
+						return
+					}
+					logger.Warn("ws-token rejected",
+						"request_id", r.Header.Get(requestIDHeader),
+						"reason", "expired or already consumed or not found",
+					)
 				}
 				// Token missing or invalid: fall through to standard auth
 				// handling below, which will reject with a uniform 401.

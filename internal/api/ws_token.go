@@ -15,8 +15,10 @@ const wsTokenTTL = 30 * time.Second
 
 // wsTokenStore holds issued short-lived WebSocket session tokens. Tokens are
 // consumed on use — a successful WebSocket upgrade deletes the token from
-// the store so it cannot be reused. Expired tokens are pruned lazily on
-// every issue/consume call plus a periodic background sweep.
+// the store so it cannot be reused. Expired tokens are cleaned up lazily:
+// they are evicted on access (issue, consume) rather than by a background
+// sweep goroutine. Given the 30-second TTL and typical WebSocket connection
+// rates, lazy cleanup is sufficient to keep the map bounded.
 //
 // Tokens are ephemeral and never persisted; a restart invalidates all
 // outstanding tokens, which is acceptable behaviour — browsers reconnect

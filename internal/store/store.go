@@ -28,11 +28,13 @@ type Store interface {
 	UpdateTask(ctx context.Context, taskID string, update broker.TaskUpdate) error
 	GetTask(ctx context.Context, taskID string) (*broker.Task, error)
 	ListTasks(ctx context.Context, filter broker.TaskFilter) (*broker.ListTasksResult, error)
-	// ClaimForReplay validates that the task exists and is in a replayable
-	// state (FAILED and RoutedToDeadLetter = true). It does NOT mutate the
-	// task's state. Returns the task (for payload extraction) on success.
+	// ClaimForReplay atomically validates that the task is in a replayable
+	// state (state = FAILED and RoutedToDeadLetter = true) and clears
+	// RoutedToDeadLetter to false to prevent duplicate replay submissions.
+	// The task state is not changed. Returns the task (with RoutedToDeadLetter
+	// now false) on success.
 	// Returns ErrTaskNotFound if the task does not exist.
 	// Returns ErrTaskNotReplayable if the task exists but is not in a
-	// replayable state.
+	// replayable state (including tasks already claimed by a concurrent caller).
 	ClaimForReplay(ctx context.Context, taskID string) (*broker.Task, error)
 }

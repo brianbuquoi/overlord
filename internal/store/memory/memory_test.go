@@ -346,25 +346,28 @@ func TestClaimForReplay_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// ClaimForReplay is read-only — the returned task mirrors the stored
-	// one and no fields are rewritten.
 	if claimed.State != broker.TaskStateFailed {
-		t.Errorf("state: got %s want FAILED (no mutation)", claimed.State)
+		t.Errorf("state: got %s want FAILED (state unchanged)", claimed.State)
 	}
-	if !claimed.RoutedToDeadLetter {
-		t.Errorf("routed_to_dead_letter should remain set (no mutation)")
+	if claimed.RoutedToDeadLetter {
+		t.Errorf("routed_to_dead_letter should be cleared by the claim")
 	}
 	if claimed.Attempts != 3 {
-		t.Errorf("attempts: got %d want 3 (no mutation)", claimed.Attempts)
+		t.Errorf("attempts: got %d want 3", claimed.Attempts)
 	}
 
-	// Verify the stored task was not mutated either.
 	stored, err := m.GetTask(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed || !stored.RoutedToDeadLetter || stored.Attempts != 3 {
-		t.Errorf("stored task mutated: state=%s dl=%v attempts=%d", stored.State, stored.RoutedToDeadLetter, stored.Attempts)
+	if stored.State != broker.TaskStateFailed || stored.RoutedToDeadLetter || stored.Attempts != 3 {
+		t.Errorf("stored: state=%s dl=%v attempts=%d, want FAILED/false/3",
+			stored.State, stored.RoutedToDeadLetter, stored.Attempts)
+	}
+
+	// Second claim must fail: the flip is the claim token.
+	if _, err := m.ClaimForReplay(ctx, task.ID); err != store.ErrTaskNotReplayable {
+		t.Fatalf("second claim: got %v, want ErrTaskNotReplayable", err)
 	}
 }
 
@@ -398,9 +401,9 @@ func TestClaimForReplay_NotReplayable(t *testing.T) {
 	}
 }
 
-// ClaimForReplay is read-only, so concurrent callers all succeed and none
-// observe ErrTaskNotReplayable. The stored task is not mutated by any of
-// the concurrent claims.
+// Concurrent ClaimForReplay calls must produce exactly one winner; the
+// losers see ErrTaskNotReplayable once the winner flips the dead-letter
+// flag.
 func TestClaimForReplay_ConcurrentNoMutation(t *testing.T) {
 	m := New()
 	ctx := context.Background()
@@ -423,18 +426,29 @@ func TestClaimForReplay_ConcurrentNoMutation(t *testing.T) {
 	}
 	wg.Wait()
 
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("goroutine %d: unexpected error %v", i, err)
+	wins, losses := 0, 0
+	for _, err := range errs {
+		switch err {
+		case nil:
+			wins++
+		case store.ErrTaskNotReplayable:
+			losses++
+		default:
+			t.Errorf("unexpected error: %v", err)
 		}
+	}
+	if wins != 1 || losses != N-1 {
+		t.Fatalf("wins=%d losses=%d, want 1/%d", wins, losses, N-1)
 	}
 
 	stored, err := m.GetTask(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("get stored: %v", err)
 	}
-	if stored.State != broker.TaskStateFailed || !stored.RoutedToDeadLetter {
-		t.Errorf("stored task mutated by concurrent claims: state=%s dl=%v",
-			stored.State, stored.RoutedToDeadLetter)
+	if stored.State != broker.TaskStateFailed {
+		t.Errorf("stored state: got %s want FAILED", stored.State)
+	}
+	if stored.RoutedToDeadLetter {
+		t.Errorf("stored RoutedToDeadLetter should be cleared after a successful claim")
 	}
 }

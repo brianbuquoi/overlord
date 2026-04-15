@@ -139,7 +139,7 @@ func setupMultiInstanceEnv(t *testing.T) (
 					OutputSchema: config.StageSchemaRef{Name: "s1_out", Version: "v1"},
 					Timeout:      config.Duration{Duration: 10 * time.Second},
 					Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-					OnSuccess:    "stage2",
+					OnSuccess:    config.StaticOnSuccess("stage2"),
 					OnFailure:    "dead-letter",
 				},
 				{
@@ -149,7 +149,7 @@ func setupMultiInstanceEnv(t *testing.T) (
 					OutputSchema: config.StageSchemaRef{Name: "s2_out", Version: "v1"},
 					Timeout:      config.Duration{Duration: 10 * time.Second},
 					Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-					OnSuccess:    "stage3",
+					OnSuccess:    config.StaticOnSuccess("stage3"),
 					OnFailure:    "dead-letter",
 				},
 				{
@@ -159,7 +159,7 @@ func setupMultiInstanceEnv(t *testing.T) (
 					OutputSchema: config.StageSchemaRef{Name: "s3_out", Version: "v1"},
 					Timeout:      config.Duration{Duration: 10 * time.Second},
 					Retry:        config.RetryPolicy{MaxAttempts: 1, Backoff: "fixed", BaseDelay: config.Duration{Duration: 10 * time.Millisecond}},
-					OnSuccess:    "done",
+					OnSuccess:    config.StaticOnSuccess("done"),
 					OnFailure:    "dead-letter",
 				},
 			},

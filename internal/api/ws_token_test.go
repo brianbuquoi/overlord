@@ -1,9 +1,49 @@
 package api
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// The auth middleware must only admit the first caller that races to
+// consume a ws-token. Subsequent callers using the same token must be
+// rejected.
+func TestWSToken_ConcurrentUpgrade(t *testing.T) {
+	s := newWSTokenStore()
+	tok, _, err := s.issue()
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	const N = 20
+	var admitted, rejected atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if s.consume(tok) {
+				admitted.Add(1)
+			} else {
+				rejected.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if admitted.Load() != 1 {
+		t.Fatalf("admitted: got %d, want 1", admitted.Load())
+	}
+	if rejected.Load() != N-1 {
+		t.Fatalf("rejected: got %d, want %d", rejected.Load(), N-1)
+	}
+	// Token should now be fully consumed.
+	if s.consume(tok) {
+		t.Fatal("token should be fully consumed after the winner")
+	}
+}
 
 func TestWSTokenStore_IssueAndConsumeOnce(t *testing.T) {
 	s := newWSTokenStore()
