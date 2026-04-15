@@ -30,7 +30,7 @@ func TestAdversarial_KeyNotInLogs(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -77,7 +77,7 @@ func TestAdversarial_KeyNotInErrorResponse(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -129,7 +129,7 @@ func TestAdversarial_ScopeBoundaryMatrix(t *testing.T) {
 			w.WriteHeader(200)
 		}
 	})
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(inner)
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(inner)
 
 	// Full matrix as specified in test prompt.
 	type cell struct {
@@ -208,7 +208,7 @@ func TestAdversarial_ScopeEscalation(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(1000, time.Hour)
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(202)
 		}),
@@ -254,7 +254,7 @@ func TestAdversarial_WebSocket_NoToken(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Simulate WebSocket upgrade handler — in real code this would
 			// be the WS upgrader, but auth middleware runs BEFORE upgrade.
@@ -286,7 +286,7 @@ func TestAdversarial_WebSocket_ReadToken(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200) // Would be 101 with real upgrader.
 		}),
@@ -317,7 +317,7 @@ func TestAdversarial_WebSocket_InvalidToken(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -351,7 +351,7 @@ func TestAdversarial_WebSocket_QueryParamToken(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),

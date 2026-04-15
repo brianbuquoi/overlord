@@ -195,6 +195,10 @@
 
   // --- Auth ---
 
+  // The API key lives in sessionStorage to survive page reloads within a
+  // tab. XSS that runs in this origin could read it — a known limitation
+  // that a future iteration should replace with an HttpOnly session
+  // cookie plus server-side session state.
   function getStoredKey() {
     return sessionStorage.getItem('overlord_api_key');
   }
@@ -571,12 +575,25 @@
 
   // --- WebSocket ---
 
-  function connectWS() {
+  async function connectWS() {
     if (ws) { try { ws.close(); } catch(e) {} }
 
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var url = proto + '//' + location.host + '/v1/stream';
-    if (apiKey) url += '?token=' + encodeURIComponent(apiKey);
+
+    // If auth is enabled, mint a short-lived single-use session token via
+    // POST /v1/ws-token rather than sending the full API key in the URL.
+    // The API key would leak into proxy logs and browser history; the
+    // short-lived token expires in ~30s and is consumed on use.
+    if (apiKey) {
+      try {
+        var tokenResp = await apiFetch('/v1/ws-token', { method: 'POST' });
+        if (tokenResp.ok) {
+          var body = await tokenResp.json();
+          url += '?token=' + encodeURIComponent(body.token);
+        }
+      } catch(e) { /* proceed without token — server will reject if auth is on */ }
+    }
 
     ws = new WebSocket(url);
     var statusEl = document.getElementById('ws-status');

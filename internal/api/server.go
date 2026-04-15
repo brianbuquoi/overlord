@@ -78,6 +78,7 @@ type Server struct {
 	dashHandler      http.Handler
 	dashPath         string
 	dashEnabled      bool
+	wsTokens         *wsTokenStore
 }
 
 // NewServer creates a new API server. The metricsPath defaults to "/metrics"
@@ -106,6 +107,7 @@ func NewServerWithContext(ctx context.Context, b *broker.Broker, logger *slog.Lo
 		metricsPath:      metricsPath,
 		dashPath:         dashPath,
 		dashEnabled:      dashEnabled,
+		wsTokens:         newWSTokenStore(),
 	}
 	if dashEnabled {
 		dh, err := dashboard.New()
@@ -138,6 +140,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/tasks", s.handleListTasks)
 	mux.HandleFunc("/v1/health", s.handleHealth)
 	mux.HandleFunc("/v1/stream", s.handleStream)
+	mux.HandleFunc("/v1/ws-token", s.handleIssueWSToken)
 	mux.HandleFunc("/v1/dead-letter/", s.routeDeadLetter)
 	mux.HandleFunc("/v1/dead-letter", s.routeDeadLetterRoot)
 
@@ -180,7 +183,7 @@ func (s *Server) routes() http.Handler {
 	// dashboard serves static content and handles its own auth flow.
 	var handler http.Handler = inner
 	if s.authKeys != nil {
-		handler = authMiddleware(s.authKeys, s.bfTracker, s.logger, endpointScope)(handler)
+		handler = authMiddleware(s.authKeys, s.bfTracker, s.logger, endpointScope, s.wsTokens)(handler)
 		// Wrap so /metrics and dashboard bypass auth.
 		authed := handler
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

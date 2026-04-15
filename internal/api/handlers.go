@@ -603,6 +603,40 @@ func (s *Server) pipelineExists(pipelineID string) bool {
 	return false
 }
 
+// wsTokenResponse is the body returned by POST /v1/ws-token: a short-lived
+// single-use token for authenticating a subsequent WebSocket upgrade.
+type wsTokenResponse struct {
+	Token     string `json:"token"`
+	ExpiresIn int    `json:"expires_in"`
+}
+
+// handleIssueWSToken mints a short-lived WebSocket session token. The caller
+// must be authenticated with a normal API key via the Authorization header;
+// auth scope is enforced by the existing middleware (read scope is enough,
+// since the WebSocket stream is read-only).
+//
+// Rationale: WebSockets cannot carry custom headers from browsers, so the
+// dashboard used to append ?token=<apiKey> to the WebSocket URL. API keys
+// travelling in URLs leak into proxy logs, browser history, and TLS
+// debugging tooling. By minting a fresh, one-shot token scoped only to the
+// next WS upgrade we keep the long-lived API key off the URL entirely.
+func (s *Server) handleIssueWSToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED")
+		return
+	}
+	if s.wsTokens == nil {
+		writeError(w, http.StatusServiceUnavailable, "ws-token not configured", "WS_TOKEN_UNAVAILABLE")
+		return
+	}
+	token, ttl, err := s.wsTokens.issue()
+	if err != nil {
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to issue ws token", "WS_TOKEN_FAILED", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, wsTokenResponse{Token: token, ExpiresIn: ttl})
+}
+
 // pathParam extracts a parameter from a URL path between prefix and suffix.
 // E.g. pathParam("/v1/pipelines/my-pipe/tasks", "/v1/pipelines/", "/tasks") = "my-pipe"
 func pathParam(path, prefix, suffix string) string {

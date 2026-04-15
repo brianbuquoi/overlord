@@ -101,13 +101,12 @@ func AuthKeyFromContext(ctx context.Context) *auth.APIKey {
 // with scope checking and brute force protection. The required scope is
 // determined per-request by the scopeFn callback.
 //
-// For WebSocket upgrade requests, the Authorization header is preferred but
-// a ?token= query parameter is also accepted as a fallback. Browsers cannot
-// set custom headers on WebSocket connections, so the query parameter is the
-// only mechanism available to browser-based clients. The token is NOT logged
-// and callers should use wss:// in production to keep the URL off the wire
-// in cleartext.
-func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger *slog.Logger, scopeFn func(r *http.Request) auth.Scope) func(http.Handler) http.Handler {
+// For WebSocket upgrade requests, the Authorization header is preferred. If
+// absent, the middleware consumes a short-lived single-use WebSocket session
+// token from ?token= (minted via POST /v1/ws-token). Full API keys are
+// NEVER accepted via the query string — a leaked short-lived token expires
+// in seconds and cannot be replayed, while a long-lived API key can.
+func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger *slog.Logger, scopeFn func(r *http.Request) auth.Scope, wsTokens *wsTokenStore) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ip := clientIP(r)
@@ -130,15 +129,26 @@ func authMiddleware(keys []auth.APIKey, tracker *auth.BruteForceTracker, logger 
 				return
 			}
 
-			// Extract Bearer token from Authorization header.
-			// For WebSocket upgrades, fall back to ?token= query parameter
-			// since browsers cannot set headers on WebSocket connections.
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" && isWebSocketUpgrade(r) {
-				if qToken := r.URL.Query().Get("token"); qToken != "" {
-					authHeader = "Bearer " + qToken
+			// For WebSocket upgrades without an Authorization header, try a
+			// short-lived session token from the query string. On success,
+			// authenticate as a synthetic read-scoped session; no brute-force
+			// credit/debit because the token itself is single-use and random.
+			if isWebSocketUpgrade(r) && r.Header.Get("Authorization") == "" && wsTokens != nil {
+				qToken := r.URL.Query().Get("token")
+				if qToken != "" && wsTokens.consume(qToken) {
+					ctx := context.WithValue(r.Context(), authKeyContextKey, &auth.APIKey{
+						Name:   "ws-session",
+						Scopes: auth.ScopeSet{auth.ScopeRead: true},
+					})
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
 				}
+				// Token missing or invalid: fall through to standard auth
+				// handling below, which will reject with a uniform 401.
 			}
+
+			// Extract Bearer token from Authorization header.
+			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
 				tracker.RecordFailure(ip)
 				w.Header().Set("WWW-Authenticate", "Bearer")
@@ -217,6 +227,12 @@ func endpointScope(r *http.Request) auth.Scope {
 	// replay-all and discard-all require admin scope.
 	if path == "/v1/dead-letter/replay-all" || path == "/v1/dead-letter/discard-all" {
 		return auth.ScopeAdmin
+	}
+
+	// /v1/ws-token mints a read-only WebSocket session token; any
+	// authenticated caller (even read-scoped) should be able to stream.
+	if path == "/v1/ws-token" {
+		return auth.ScopeRead
 	}
 
 	if r.Method == http.MethodPost {

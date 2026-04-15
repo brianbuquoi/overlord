@@ -53,7 +53,7 @@ func TestAuthMiddleware_NoHeader(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute) // High limit so brute force doesn't interfere.
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -77,7 +77,7 @@ func TestAuthMiddleware_WrongScheme(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -99,7 +99,7 @@ func TestAuthMiddleware_ValidReadOnGET(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -121,7 +121,7 @@ func TestAuthMiddleware_ReadKeyOnPOST_Forbidden(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(202)
 		}),
@@ -143,7 +143,7 @@ func TestAuthMiddleware_WriteKeyOnPOST(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(202)
 		}),
@@ -165,7 +165,7 @@ func TestAuthMiddleware_WriteKeyOnGET(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -187,7 +187,7 @@ func TestAuthMiddleware_AdminOnAll(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == "POST" {
 				w.WriteHeader(202)
@@ -225,7 +225,7 @@ func TestAuthMiddleware_InvalidKey(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -261,7 +261,7 @@ func TestAuthMiddleware_BruteForce(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(10, 10*time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -308,7 +308,7 @@ func TestAuthMiddleware_ScopeEscalationHeaders(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 	logger := slog.Default()
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(202)
 		}),
@@ -342,7 +342,7 @@ func TestScopeMatrix(t *testing.T) {
 		}
 	})
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(inner)
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(inner)
 
 	type testCase struct {
 		method string
@@ -428,7 +428,7 @@ func TestAuthMiddleware_WriteScopeMethods(t *testing.T) {
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(inner)
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(inner)
 
 	// DELETE, PUT, PATCH should all require read scope (not write) per
 	// current endpointScope implementation.

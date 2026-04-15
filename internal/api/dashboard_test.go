@@ -334,9 +334,11 @@ func TestDashboard_MetricsRouteReturnsPrometheus(t *testing.T) {
 
 // --- Issue 1: WebSocket query-param auth for dashboard ---
 
-func TestDashboard_WebSocketAuthViaQueryParam(t *testing.T) {
-	// With auth enabled, a WebSocket upgrade request with ?token= and the
-	// Upgrade: websocket header should authenticate successfully.
+// With auth enabled, a WebSocket upgrade with a freshly-minted short-lived
+// token in ?token= should authenticate successfully. The raw API key is
+// NOT accepted in the query string anymore — callers must go through
+// POST /v1/ws-token first.
+func TestDashboard_WebSocketAuthViaShortLivedToken(t *testing.T) {
 	cfg := testConfig()
 	st := memory.New()
 	agents := map[string]broker.Agent{
@@ -358,15 +360,78 @@ func TestDashboard_WebSocketAuthViaQueryParam(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// Connect via WebSocket with token in query param.
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/stream?token=ws-test-key"
+	// Mint a short-lived token via /v1/ws-token.
+	mint, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/ws-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mint.Header.Set("Authorization", "Bearer ws-test-key")
+	mintResp, err := ts.Client().Do(mint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mintResp.Body.Close()
+	if mintResp.StatusCode != http.StatusOK {
+		t.Fatalf("mint token: expected 200, got %d", mintResp.StatusCode)
+	}
+	var tok wsTokenResponse
+	if err := json.NewDecoder(mintResp.Body).Decode(&tok); err != nil {
+		t.Fatal(err)
+	}
+	if tok.Token == "" || tok.ExpiresIn <= 0 {
+		t.Fatalf("bad token response: %+v", tok)
+	}
+
+	// Use the token to upgrade the WebSocket.
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/stream?token=" + tok.Token
 	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		t.Fatalf("WebSocket dial with query token failed: %v (status: %d)", err, resp.StatusCode)
+		t.Fatalf("WebSocket dial with short-lived token failed: %v (status: %d)", err, resp.StatusCode)
 	}
 	conn.Close()
+
+	// Reusing the same token must fail — single-use semantics.
+	_, resp2, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("expected reuse of consumed token to fail")
+	}
+	if resp2 != nil && resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on token reuse, got %d", resp2.StatusCode)
+	}
 }
 
+// A full API key passed via the WebSocket query string must be rejected —
+// only short-lived tokens are accepted there.
+func TestDashboard_WebSocketRejectsFullAPIKeyInQuery(t *testing.T) {
+	cfg := testConfig()
+	st := memory.New()
+	agents := map[string]broker.Agent{}
+	reg, _ := contract.NewRegistry(nil, "")
+	logger := slog.Default()
+	b := broker.New(cfg, st, agents, reg, logger, nil, nil)
+
+	hashed, _ := bcrypt.GenerateFromPassword([]byte("full-api-key"), bcrypt.MinCost)
+	keys := []auth.APIKey{
+		{Name: "full", HashedKey: hashed, Scopes: auth.ScopeSet{auth.ScopeRead: true}},
+	}
+	srv := NewServerWithContext(context.Background(), b, logger, nil, "", keys)
+	defer srv.Shutdown(context.Background())
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/stream?token=full-api-key"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("expected WS upgrade to fail when query token is a full API key")
+	}
+	if resp != nil && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+// An arbitrary unknown token in ?token= (no mint call made) must be
+// rejected — only a previously-issued short-lived token is valid.
 func TestDashboard_WebSocketAuthViaQueryParam_InvalidKey(t *testing.T) {
 	cfg := testConfig()
 	st := memory.New()

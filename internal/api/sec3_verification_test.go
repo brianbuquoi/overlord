@@ -266,7 +266,7 @@ func TestSEC3_AuthHeaderLogScrubbing(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	tracker := auth.NewBruteForceTracker(100, time.Minute)
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
@@ -441,7 +441,7 @@ func TestSEC3_ErrorResponseInfoDisclosure(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(1000, time.Hour)
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(202)
 		}),
@@ -513,7 +513,7 @@ func TestSEC3_401BodyUniformity(t *testing.T) {
 	tracker := auth.NewBruteForceTracker(10000, time.Hour)
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
 
-	handler := authMiddleware(keys, tracker, logger, endpointScope)(
+	handler := authMiddleware(keys, tracker, logger, endpointScope, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 		}),
