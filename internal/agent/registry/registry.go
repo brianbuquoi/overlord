@@ -11,6 +11,7 @@ import (
 	"github.com/brianbuquoi/overlord/internal/agent/google"
 	"github.com/brianbuquoi/overlord/internal/agent/ollama"
 	"github.com/brianbuquoi/overlord/internal/agent/openai"
+	openairesp "github.com/brianbuquoi/overlord/internal/agent/openai_responses"
 	"github.com/brianbuquoi/overlord/internal/config"
 	"github.com/brianbuquoi/overlord/internal/metrics"
 	internalplugin "github.com/brianbuquoi/overlord/internal/plugin"
@@ -41,6 +42,17 @@ func NewFromConfigWithPlugins(cfg config.Agent, plugins map[string]pluginapi.Age
 
 	case "openai":
 		return openai.New(openai.Config{
+			ID:           cfg.ID,
+			Model:        cfg.Model,
+			APIKeyEnv:    cfg.Auth.APIKeyEnv,
+			SystemPrompt: cfg.SystemPrompt,
+			Temperature:  cfg.Temperature,
+			MaxTokens:    cfg.MaxTokens,
+			Timeout:      cfg.Timeout.Duration,
+		}, logger, m...)
+
+	case "openai-responses":
+		return openairesp.New(openairesp.Config{
 			ID:           cfg.ID,
 			Model:        cfg.Model,
 			APIKeyEnv:    cfg.Auth.APIKeyEnv,
@@ -92,7 +104,7 @@ func NewFromConfigWithPlugins(cfg config.Agent, plugins map[string]pluginapi.Age
 	}
 
 	return nil, fmt.Errorf(
-		"unknown agent provider %q for agent %q — valid providers: anthropic, openai, google, ollama, copilot",
+		"unknown agent provider %q for agent %q — valid providers: anthropic, openai, openai-responses, google, ollama, copilot",
 		cfg.Provider, cfg.ID,
 	)
 }
