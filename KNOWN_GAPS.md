@@ -95,14 +95,6 @@ in docs/deployment.md.
 **Status:** Informational — no code change required. Document in deployment
 checklist.
 
-### SEC-012: Redis UpdateTask is not atomic (read-modify-write race)
-**Location:** `internal/store/redis/redis.go` — `UpdateTask()`
-**Severity:** Medium
-**Description:** GET → modify → SET without locking. Concurrent updates may cause
-lost writes. Unlike the Postgres store which uses `SELECT FOR UPDATE`, Redis has
-no equivalent row locking.
-**Recommendation:** Use a Lua script or WATCH/MULTI for atomic read-modify-write.
-
 ### SEC-013: Unbounded WebSocket client count
 **Location:** `internal/api/websocket.go` — `wsHub`
 **Severity:** Low
@@ -169,6 +161,10 @@ within an allowed directory.
 **Description:** GetTask → state check → Submit is not atomic. A concurrent discard
 between check and submit could result in replaying a task that was just discarded.
 **Recommendation:** Use atomic compare-and-swap or lock the task during replay.
+The atomic Lua-script infrastructure introduced for the Redis UpdateTask rewrite
+(resolved SEC-012) makes this fixable cheaply: a `ClaimForReplay` script that
+checks state and transitions to PENDING in one round-trip follows the same
+pattern already in place.
 
 ### SEC4-010: IPv6 brute force tracking per /128 (not /64)
 **Location:** `internal/auth/auth.go` — `RecordFailure()`, `internal/api/middleware.go` — `clientIP()`
@@ -271,6 +267,49 @@ internal scraping from your metrics infrastructure. A future
 enhancement could add a separate `--metrics-port` flag.
 **Status:** Informational — no code change required.
 
+### KG-001: Lua cjson round-trip shifts numeric encoding in payloads
+**Location:** `internal/store/redis/redis.go` — `updateTaskScript`
+**Severity:** Low
+**Description:** The atomic UpdateTask Lua script decodes the task JSON with
+`cjson.decode`, merges the update, and re-encodes with `cjson.encode`. This
+round-trip is not byte-identical: key order, whitespace, and the
+integer/float distinction are not preserved for numeric values inside
+`json.RawMessage` payload fields. Current Task schema stores payloads as
+`json.RawMessage` but comparison is always by semantic JSON equality, so this
+is acceptable today.
+**Recommendation:** Revisit if byte-identity of the payload becomes a
+requirement (e.g. for content-addressable hashing or downstream signature
+verification).
+**Status:** Open — acceptable tradeoff for atomicity.
+
+### KG-002: Per-state index is flat (not two-dimensional)
+**Location:** `internal/store/redis/redis.go` — per-state secondary indexes
+**Severity:** Low
+**Description:** The new per-state secondary index introduces one ZSET per
+state, aggregated across all pipelines. A `ListTasks` call that filters by
+both State and PipelineID reads the full state ZSET and filters in Go. If a
+single state accumulates a large cross-pipeline backlog (e.g. FAILED tasks
+across many pipelines), this becomes O(N) in the backlog size rather than
+O(result-set).
+**Recommendation:** If a large cross-pipeline backlog materializes in
+practice, add a two-dimensional state×pipeline index (`state:{state}:pipe:{id}`
+ZSETs).
+**Status:** Open — defer until an actual workload triggers it.
+
+### KG-003: ListTasks total-count over-reports with certain filters
+**Location:** `internal/store/redis/redis.go` — `ListTasks`
+**Severity:** Low
+**Description:** When `ListTasks` is called without a State filter, the total
+count reflects `ZCARD` of the base index prior to filtering. `RoutedToDeadLetter`
+and `IncludeDiscarded` are applied in Go after the range fetch, so the
+reported total may exceed the number of tasks actually matching those filters.
+This matches pre-existing Redis semantics (the old implementation had the same
+behavior) and is consistent across stores.
+**Recommendation:** If accurate totals are required for the dashboard pagination
+UI, add per-flag indexes or switch the dashboard to cursor-based pagination
+without a total count.
+**Status:** Open — matches prior semantics; low-priority.
+
 ---
 
 ## Tracking
@@ -278,7 +317,7 @@ enhancement could add a separate `--metrics-port` flag.
 | # | Title | Severity | Status |
 |---|-------|----------|--------|
 | SEC-010 | Predictable envelope delimiters | Medium | Open |
-| SEC-012 | Redis UpdateTask not atomic | Medium | Open |
+| SEC-012 | Redis UpdateTask not atomic | Medium | Resolved |
 | SEC-013 | Unbounded WebSocket client count | Low | Open |
 | SEC-014 | Token bucket cleanup goroutine leak | Low | Open |
 | SEC-015 | No DisallowUnknownFields | Informational | Accepted |
@@ -303,6 +342,21 @@ enhancement could add a separate `--metrics-port` flag.
 | SAN-001 | Sanitizer active detection covers 2 of 8 vector classes | Medium | Open |
 | SAN-002 | Base64 detector produces no sanitizer warnings | Low | Open |
 | SAN-003 | Sanitizer coverage is model-version dependent | Informational | Open |
+| KG-001 | Lua cjson round-trip shifts numeric encoding | Low | Open |
+| KG-002 | Per-state index is flat (not 2D) | Low | Open |
+| KG-003 | ListTasks total-count over-reports with certain filters | Low | Open |
+
+---
+
+## Resolved Post-v0.2.0
+
+| # | Title | Severity | Resolution |
+|---|-------|----------|------------|
+| — | Prompt/payload/output preview debug logging in adapters | High | Debug log lines removed from anthropic, google, openai, ollama adapters |
+| — | Raw internal errors returned in HTTP handler responses | High | `writeInternalError` helper introduced; all leak sites replaced; stable public messages and request IDs |
+| SEC-012 | Redis UpdateTask not atomic | Medium | Atomic cjson Lua script merges updates server-side in one round-trip |
+| — | Redis terminal tasks removed from sorted-set index | Medium | Terminal tasks retained with TTL expiry instead of eviction |
+| — | Redis ListTasks full-scan on state filter | Medium | Per-state secondary index replaces full-scan filtering |
 
 ---
 
