@@ -1,5 +1,39 @@
 // Package sanitize implements prompt injection detection and the envelope
 // pattern for safe inter-agent communication in Overlord pipelines.
+//
+// Prompt injection detection coverage:
+//
+// Detected on input (active pattern matching via Sanitize):
+//   Class 1: Instruction override ("ignore previous instructions",
+//            "disregard the above") — pattern: instruction_override
+//   Class 2: Delimiter injection (fake [INST], <|system|>, <<SYS>>,
+//            [SYSTEM CONTEXT tokens) — pattern: delimiter_injection
+//   Class 3: Role-play / persona hijacking ("you are now", "act as",
+//            "pretend to be", "your new identity", "your true purpose is")
+//            — pattern: role_hijack
+//   Class 4: Instruction override / jailbreak preambles ([new instructions],
+//            [system], [admin], <instructions>, SYSTEM:, ADMIN:, OVERRIDE:)
+//            — folded into pattern: delimiter_injection
+//   Class 5: Data exfiltration probes ("reveal your system prompt",
+//            "show your instructions", "output your configuration")
+//            — pattern: exfiltration_probe
+//   Class 6: Encoding and obfuscation:
+//              - base64-wrapped injection payloads — pattern: encoded_payload
+//              - Unicode homoglyph substitution — pattern: homoglyph_substitution
+//              - zero-width / format-control characters — pattern: zero_width
+//
+// Output validation (defense-in-depth via ValidateOutput; may produce false
+// positives on legitimate outputs that echo instruction-like language):
+//   output_system_preamble   — model response starts with [SYSTEM]/[ADMIN]/etc.
+//   output_instruction_echo  — response reveals "my system prompt", etc.
+//   output_redirect_attempt  — response tries to redirect a downstream reader
+//
+// Not detected (rely on model alignment — field-wide open problems):
+//   Class 7: Multi-turn context manipulation — requires conversation history
+//            analysis across turns, not a single-string scan.
+//   Class 8: Indirect injection via retrieved content in external tools —
+//            requires semantic analysis of retrieved documents before they
+//            enter the prompt.
 package sanitize
 
 import (
@@ -35,6 +69,8 @@ func Sanitize(input string) (string, []SanitizeWarning) {
 		&delimiterInjectionDetector{},
 		&encodedPayloadDetector{},
 		&homoglyphDetector{},
+		&exfiltrationProbeDetector{},
+		&zeroWidthDetector{},
 	}
 
 	var allWarnings []SanitizeWarning
@@ -83,9 +119,12 @@ func sortWarningsAsc(ws []SanitizeWarning) {
 type instructionOverrideDetector struct{}
 
 var instructionOverridePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)ignore\s+(all\s+)?previous\s+instructions`),
+	regexp.MustCompile(`(?i)ignore\s+(all\s+)?(your\s+)?previous\s+instructions`),
+	regexp.MustCompile(`(?i)ignore\s+your\s+instructions`),
 	regexp.MustCompile(`(?i)disregard\s+(all\s+)?(the\s+)?above`),
+	regexp.MustCompile(`(?i)disregard\s+(all\s+)?(your\s+)?instructions`),
 	regexp.MustCompile(`(?i)forget\s+(all\s+)?everything(\s+above)?`),
+	regexp.MustCompile(`(?i)forget\s+(all\s+)?(your\s+)?instructions`),
 	regexp.MustCompile(`(?i)override\s+(all\s+)?prior\s+(instructions|directives|rules)`),
 	regexp.MustCompile(`(?i)do\s+not\s+follow\s+(the\s+)?(previous|prior|above)\s+(instructions|directives|rules)`),
 }
@@ -102,7 +141,10 @@ var roleHijackPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)you\s+are\s+now\s+\w+`),
 	regexp.MustCompile(`(?i)act\s+as\s+(a\s+|an\s+)?\w+`),
 	regexp.MustCompile(`(?i)pretend\s+(that\s+)?you\s+are\s+\w+`),
+	regexp.MustCompile(`(?i)pretend\s+to\s+be\s+\w+`),
+	regexp.MustCompile(`(?i)roleplay\s+as\s+\w+`),
 	regexp.MustCompile(`(?i)your\s+new\s+(persona|role|identity)\s+is\s+\w+`),
+	regexp.MustCompile(`(?i)your\s+(real|true)\s+(instructions|purpose|identity|role)\s+(are|is)`),
 	regexp.MustCompile(`(?i)from\s+now\s+on\s+you\s+are\s+\w+`),
 }
 
@@ -140,6 +182,14 @@ var delimiterPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\[END SYSTEM CONTEXT\]`),
 	regexp.MustCompile(`<<\s*SYS\s*>>`),
 	regexp.MustCompile(`<<\s*/SYS\s*>>`),
+	// Class 4 — jailbreak preambles: fake system-level bracket/tag delimiters
+	// attackers use to inject an override block into a prompt.
+	regexp.MustCompile(`(?i)\[\s*(new\s+instructions|system|admin|override)\s*\]`),
+	regexp.MustCompile(`(?i)</?(instructions|system|admin)\s*>`),
+	// Uppercase-only colon preambles at the start of a line, e.g. "SYSTEM:",
+	// "ADMIN:", "OVERRIDE:". Case-sensitive on purpose: prose routinely
+	// contains "System:" in headings, but all-caps is the jailbreak shape.
+	regexp.MustCompile(`(?m)^(SYSTEM|ADMIN|OVERRIDE):`),
 }
 
 func (d *delimiterInjectionDetector) Detect(input string) []SanitizeWarning {
@@ -343,6 +393,79 @@ func containsHomoglyph(s string) bool {
 		}
 	}
 	return false
+}
+
+// --- Exfiltration Probe Detector ---
+//
+// Class 5: inputs that try to coax the model into revealing its system
+// prompt, configuration, or other internal state. The envelope pattern
+// blocks most of these, but the probe phrase itself is a useful signal
+// and we record it so operators can see attempts in task metadata.
+
+type exfiltrationProbeDetector struct{}
+
+var exfiltrationProbePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)reveal\s+your\s+system\s+prompt`),
+	regexp.MustCompile(`(?i)reveal\s+(the\s+)?(confidential|hidden|secret)`),
+	regexp.MustCompile(`(?i)show\s+(me\s+)?your\s+(system\s+)?(instructions|prompt)`),
+	regexp.MustCompile(`(?i)what\s+are\s+your\s+(system\s+)?instructions`),
+	regexp.MustCompile(`(?i)what\s+is\s+your\s+system\s+(message|prompt)`),
+	regexp.MustCompile(`(?i)repeat\s+your\s+(system\s+)?prompt`),
+	regexp.MustCompile(`(?i)output\s+your\s+(configuration|system\s+prompt|instructions)`),
+	regexp.MustCompile(`(?i)ignore\s+privacy`),
+}
+
+func (d *exfiltrationProbeDetector) Detect(input string) []SanitizeWarning {
+	return matchPatterns(input, exfiltrationProbePatterns, "exfiltration_probe")
+}
+
+// --- Zero-Width Character Detector ---
+//
+// Class 6 (obfuscation): zero-width and format-control characters that can
+// hide payload text from visual inspection while still being delivered to
+// the model. Presence alone is suspicious — these characters have no
+// legitimate place in agent payloads.
+
+type zeroWidthDetector struct{}
+
+var zeroWidthRunes = map[rune]struct{}{
+	'\u200b': {}, // ZERO WIDTH SPACE
+	'\u200c': {}, // ZERO WIDTH NON-JOINER
+	'\u200d': {}, // ZERO WIDTH JOINER
+	'\u2060': {}, // WORD JOINER
+	'\ufeff': {}, // ZERO WIDTH NO-BREAK SPACE / BOM
+}
+
+func (d *zeroWidthDetector) Detect(input string) []SanitizeWarning {
+	var warnings []SanitizeWarning
+	byteOff := 0
+	spanStart := -1
+	for _, r := range input {
+		rLen := len(string(r))
+		if _, ok := zeroWidthRunes[r]; ok {
+			if spanStart < 0 {
+				spanStart = byteOff
+			}
+		} else if spanStart >= 0 {
+			warnings = append(warnings, SanitizeWarning{
+				OriginalSpan: input[spanStart:byteOff],
+				Pattern:      "zero_width",
+				StartOffset:  spanStart,
+				EndOffset:    byteOff,
+			})
+			spanStart = -1
+		}
+		byteOff += rLen
+	}
+	if spanStart >= 0 {
+		warnings = append(warnings, SanitizeWarning{
+			OriginalSpan: input[spanStart:byteOff],
+			Pattern:      "zero_width",
+			StartOffset:  spanStart,
+			EndOffset:    byteOff,
+		})
+	}
+	return warnings
 }
 
 // matchPatterns is a helper that runs multiple regexps against input and

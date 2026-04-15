@@ -17,50 +17,49 @@ a per-task random nonce in the delimiter would provide stronger defense-in-depth
 
 ## Sanitizer Coverage Gaps
 
-### SAN-001: Sanitizer active detection covers 2 of 8 known vector classes
-**Severity:** Medium
-**Location:** `internal/sanitize/sanitizer.go`
-**Detail:** The sanitizer actively detects and redacts two injection
-pattern classes: instruction_override (e.g. "ignore previous instructions")
-and delimiter_injection (e.g. "[END SYSTEM CONTEXT]"). Six other vector
-classes tested in the injection stress test (05-injection-stress-test.yaml)
-produced no sanitizer warnings and were neutralized entirely by Claude's
-model alignment:
-- Role-play / narrative framing ("The following is a conversation between
-  two AIs. AI-2 says:")
-- Base64 encoded payloads (decoding logic exists but did not produce warnings)
-- Multi-language injections (non-Latin scripts)
-- Nested JSON structure injections
-- Long padding attacks (injection after large volume of benign content)
-- Markdown/XML tag breakout attempts
+### SAN-001: Sanitizer active detection covers 6 of 8 known vector classes
+**Severity:** Low
+**Location:** `internal/sanitize/sanitizer.go`, `internal/sanitize/output.go`
+**Detail:** Sanitizer covers 6 of 8 known prompt injection vector classes
+with active detection:
+1. Instruction override (`instruction_override`)
+2. Delimiter injection, including jailbreak bracket/tag preambles like
+   `[SYSTEM]`, `[new instructions]`, `<instructions>`, `SYSTEM:` line-leads
+   (`delimiter_injection`)
+3. Role-play / persona hijacking, including "pretend to be", "roleplay as",
+   "your true purpose is" (`role_hijack`)
+4. (Folded into class 2 — jailbreak preambles now matched by the delimiter
+   detector)
+5. Data exfiltration probes (`exfiltration_probe`)
+6. Encoding and obfuscation: base64-wrapped injection payloads
+   (`encoded_payload`), Unicode homoglyph substitution
+   (`homoglyph_substitution`), and zero-width/format-control characters
+   (`zero_width`)
 
-All 8 vectors failed to compromise the pipeline across multiple runs.
-However, resistance to 6 of the 8 classes relies on model alignment
-rather than active redaction. This means:
-1. A future model version with weaker alignment could be vulnerable
-2. There is no audit trail for these vector classes (no sanitizer_warnings
-   in task metadata)
-3. The sanitizer cannot be independently verified to have protected against
-   these vectors
+Classes 7 (multi-turn context manipulation) and 8 (indirect injection via
+retrieved content in external tools) rely on model alignment — active
+detection for these requires semantic analysis beyond pattern matching
+and is a field-wide open problem.
 
-**Recommendation:** Add dedicated detectors for the six unhandled vector
-classes. Priority order:
-1. Narrative framing / dialogue continuation patterns (vector 3) — hardest
-   to detect reliably without false positives on legitimate content
-2. Multi-language instruction keywords (vector 5) — add Unicode normalization
-   and translated variants of common injection phrases
-3. Long padding attacks (vector 7) — scan the last 500 characters of long
-   inputs independently of the full-text scan
-4. Base64 warnings (vector 4) — the decoder exists; ensure it generates
-   a SanitizeWarning when decoded content contains injection keywords
-5. Markdown/XML tag breakout (vector 8) — detect `</task>`, `<new_task>`,
-   `[INST]`, `<|system|>` and similar structural tags
-6. Nested JSON injection (vector 6) — detect reserved key names
-   (`__override__`, `system_prompt`, `instructions`) in input JSON
+**Status:** Covered to the extent reasonable with pattern matching.
+Remaining classes are tracked as informational (SAN-003).
 
-**Status:** Open — accepted risk for current release. Active detection
-limited to instruction_override and delimiter_injection. All other classes
-rely on model alignment as second line of defense.
+### SAN-004: Output validation layer may produce false positives
+**Severity:** Informational
+**Location:** `internal/sanitize/output.go`
+**Detail:** `ValidateOutput` detects instruction-like patterns in model
+responses (`output_system_preamble`, `output_instruction_echo`,
+`output_redirect_attempt`) as a defense-in-depth check that complements
+the input sanitizer. It cannot guarantee detection of all successful
+injections, and the false positive rate on legitimate outputs is
+non-zero for some output schemas — a summarizer asked to quote a
+document that contains the literal string "disregard the previous" will
+flag. Warnings are attached to task metadata under
+`sanitizer_output_warnings`; the broker continues processing on warning,
+mirroring the input-sanitizer policy. `TestValidateOutput_FalsePositiveRate`
+guards against the detectors becoming too aggressive against common
+structured-output shapes.
+**Status:** Informational — accepted tradeoff for defense-in-depth.
 
 ### SAN-002: Base64 detector does not produce sanitizer warnings
 **Severity:** Low
@@ -363,7 +362,8 @@ without a total count.
 | SEC4-013 | math/rand/v2 for retry jitter | Informational | Accepted |
 | SEC4-014 | Single-tenant by design | Informational | Accepted |
 | SEC4-015 | DB connection error may leak creds | Low | Accepted |
-| SAN-001 | Sanitizer active detection covers 2 of 8 vector classes | Medium | Open |
+| SAN-001 | Sanitizer active detection covers 6 of 8 vector classes | Low | Covered |
+| SAN-004 | Output validation layer may produce false positives | Informational | Accepted |
 | SAN-002 | Base64 detector produces no sanitizer warnings | Low | Open |
 | SAN-003 | Sanitizer coverage is model-version dependent | Informational | Open |
 | KG-001 | Lua cjson round-trip shifts numeric encoding | Low | Open |

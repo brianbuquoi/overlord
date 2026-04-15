@@ -633,6 +633,25 @@ func (b *Broker) processTask(ctx context.Context, pipelineID string, stage *conf
 		return
 	}
 
+	// --- Output validation (defense-in-depth) ---
+	// Scan the model's response for instruction-like patterns that may
+	// indicate a successful prompt injection slipped past the input
+	// sanitizer. Warnings are recorded but do not fail the task — this
+	// mirrors the input-sanitizer policy of attach-and-continue.
+	if outWarnings := sanitize.ValidateOutput(string(result.Payload)); len(outWarnings) > 0 {
+		b.logger.Warn("sanitizer output warnings",
+			"task_id", task.ID, "stage", stage.ID, "count", len(outWarnings),
+		)
+		b.mergeMetadata(ctx, task, map[string]any{
+			"sanitizer_output_warnings": sanitize.WarningsToJSON(outWarnings),
+		})
+		if b.metrics != nil {
+			for _, w := range outWarnings {
+				b.metrics.SanitizerRedactions.WithLabelValues(pipelineID, stage.ID, w.Pattern).Inc()
+			}
+		}
+	}
+
 	// --- Output contract validation ---
 	b.transition(ctx, task, TaskStateValidating)
 
@@ -1239,12 +1258,13 @@ func (b *Broker) transition(ctx context.Context, task *Task, state TaskState) {
 // not overwrite. This prevents a malicious agent from clearing sanitizer
 // warnings, overwriting failure reasons, or tampering with stage history.
 var reservedMetadataKeys = map[string]struct{}{
-	"sanitizer_warnings": {},
-	"failure_reason":     {},
-	"stage_history":      {},
-	"version_mismatch":   {},
-	"trace_id":           {},
-	"span_id":            {},
+	"sanitizer_warnings":        {},
+	"sanitizer_output_warnings": {},
+	"failure_reason":            {},
+	"stage_history":             {},
+	"version_mismatch":          {},
+	"trace_id":                  {},
+	"span_id":                   {},
 }
 
 // warningPatterns extracts just the Pattern field from each sanitizer warning
