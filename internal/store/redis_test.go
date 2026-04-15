@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -525,8 +526,9 @@ func TestRedis_ListTasksPipelineOnlyFilter(t *testing.T) {
 	}
 }
 
-// Test 9: UpdateTask with terminal state removes task from index.
-func TestRedis_UpdateTaskRemovesFromIndex(t *testing.T) {
+// Test 9: UpdateTask keeps terminal tasks in the primary index so historical
+// listing continues to work. Entries age out naturally via the task key TTL.
+func TestRedis_UpdateTaskKeepsTerminalInIndex(t *testing.T) {
 	t.Parallel()
 	s, _, client := newRedisTestStore(t, "term:")
 	ctx := context.Background()
@@ -545,14 +547,148 @@ func TestRedis_UpdateTaskRemovesFromIndex(t *testing.T) {
 		t.Fatalf("index should have 1 entry, got %d", count)
 	}
 
-	// Mark task as DONE.
 	done := broker.TaskStateDone
 	if err := s.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &done}); err != nil {
 		t.Fatal(err)
 	}
 
 	count, _ = client.ZCard(ctx, indexKey).Result()
-	if count != 0 {
-		t.Errorf("index should be empty after DONE, got %d", count)
+	if count != 1 {
+		t.Errorf("terminal task should remain in primary index, got count %d", count)
+	}
+
+	// The task must also be fetchable via ListTasks filtered by state.
+	state := broker.TaskStateDone
+	result, err := s.ListTasks(ctx, broker.TaskFilter{State: &state})
+	if err != nil {
+		t.Fatalf("list by DONE: %v", err)
+	}
+	found := false
+	for _, got := range result.Tasks {
+		if got.ID == task.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("terminal task should be listable via state index")
+	}
+}
+
+// Test 10: Concurrent UpdateTask calls on the same task ID — verifies the
+// atomic Lua script does not lose writes under racing updaters.
+//
+// The old GET→modify→SET pattern would silently drop attempts bumped by a
+// concurrent updater. With the Lua script, every successful call observes a
+// freshly loaded snapshot and applies its delta on top of it.
+func TestRedis_UpdateTaskConcurrentWrites(t *testing.T) {
+	t.Parallel()
+	s, _, _ := newRedisTestStore(t, "concurrent:")
+	ctx := context.Background()
+
+	task := newTask("pipe-conc", "stage-conc")
+	if err := s.EnqueueTask(ctx, "stage-conc", task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fire N concurrent metadata updates. Each writes a distinct key.
+	const n = 20
+	errCh := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			md := map[string]any{fmt.Sprintf("k%d", i): i}
+			errCh <- s.UpdateTask(ctx, task.ID, broker.TaskUpdate{Metadata: md})
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		if e != nil {
+			t.Fatalf("update: %v", e)
+		}
+	}
+
+	got, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// All N keys must be present: no update lost.
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if _, ok := got.Metadata[key]; !ok {
+			t.Errorf("metadata key %s missing — concurrent update was lost", key)
+		}
+	}
+}
+
+// Test 11: ListTasks with state filter reads from the per-state secondary
+// index and includes terminal tasks. Tasks whose state has moved appear only
+// under their current state.
+func TestRedis_ListTasksStateIndex(t *testing.T) {
+	t.Parallel()
+	s, _, client := newRedisTestStore(t, "stateidx:")
+	ctx := context.Background()
+
+	pipeline := "pipe-state-" + uuid.New().String()
+	stage := "stage-state-" + uuid.New().String()
+
+	var pendingIDs, doneIDs []string
+	for i := 0; i < 3; i++ {
+		task := newTask(pipeline, stage)
+		pendingIDs = append(pendingIDs, task.ID)
+		if err := s.EnqueueTask(ctx, stage, task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		task := newTask(pipeline, stage)
+		if err := s.EnqueueTask(ctx, stage, task); err != nil {
+			t.Fatal(err)
+		}
+		done := broker.TaskStateDone
+		if err := s.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &done}); err != nil {
+			t.Fatal(err)
+		}
+		doneIDs = append(doneIDs, task.ID)
+	}
+
+	pendingKey := fmt.Sprintf("stateidx:tasks:state:%s", broker.TaskStatePending)
+	doneKey := fmt.Sprintf("stateidx:tasks:state:%s", broker.TaskStateDone)
+	if c, _ := client.ZCard(ctx, pendingKey).Result(); c != int64(len(pendingIDs)) {
+		t.Errorf("pending state index: got %d members, want %d", c, len(pendingIDs))
+	}
+	if c, _ := client.ZCard(ctx, doneKey).Result(); c != int64(len(doneIDs)) {
+		t.Errorf("done state index: got %d members, want %d", c, len(doneIDs))
+	}
+
+	pendingState := broker.TaskStatePending
+	result, err := s.ListTasks(ctx, broker.TaskFilter{State: &pendingState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Tasks) != len(pendingIDs) {
+		t.Errorf("pending listing: got %d, want %d", len(result.Tasks), len(pendingIDs))
+	}
+	for _, task := range result.Tasks {
+		if task.State != broker.TaskStatePending {
+			t.Errorf("task %s has wrong state %s in pending list", task.ID, task.State)
+		}
+	}
+
+	doneState := broker.TaskStateDone
+	result, err = s.ListTasks(ctx, broker.TaskFilter{State: &doneState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Tasks) != len(doneIDs) {
+		t.Errorf("done listing: got %d, want %d", len(result.Tasks), len(doneIDs))
+	}
+	for _, task := range result.Tasks {
+		if task.State != broker.TaskStateDone {
+			t.Errorf("task %s has wrong state %s in done list", task.ID, task.State)
+		}
 	}
 }

@@ -3,8 +3,11 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -81,8 +84,9 @@ type healthResponse struct {
 }
 
 type errorResponse struct {
-	Error string `json:"error"`
-	Code  string `json:"code"`
+	Error     string `json:"error"`
+	Code      string `json:"code"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // --- Handlers ---
@@ -123,10 +127,10 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	task, err := s.broker.SubmitWithCarrier(r.Context(), pipelineID, req.Payload, carrier)
 	if err != nil {
 		if strings.Contains(err.Error(), "pipeline not found") {
-			writeError(w, http.StatusNotFound, err.Error(), "PIPELINE_NOT_FOUND")
+			s.writeInternalError(w, r, http.StatusNotFound, "pipeline not found", "PIPELINE_NOT_FOUND", err)
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error(), "SUBMIT_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to submit task", "SUBMIT_FAILED", err)
 		return
 	}
 
@@ -149,7 +153,7 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "task not found", "TASK_NOT_FOUND")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error(), "GET_TASK_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to fetch task", "GET_TASK_FAILED", err)
 		return
 	}
 
@@ -208,7 +212,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.broker.Store().ListTasks(r.Context(), filter)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "LIST_TASKS_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to list tasks", "LIST_TASKS_FAILED", err)
 		return
 	}
 	tasks := result.Tasks
@@ -347,7 +351,7 @@ func (s *Server) handleListDeadLetter(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.broker.Store().ListTasks(r.Context(), filter)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "LIST_DEAD_LETTER_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to list dead-letter tasks", "LIST_DEAD_LETTER_FAILED", err)
 		return
 	}
 	tasks := result.Tasks
@@ -370,7 +374,7 @@ func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusNotFound, "task not found", "TASK_NOT_FOUND")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error(), "GET_TASK_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to fetch task", "GET_TASK_FAILED", err)
 		return
 	}
 
@@ -381,7 +385,7 @@ func (s *Server) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) 
 
 	newTask, err := s.broker.Submit(r.Context(), task.PipelineID, task.Payload)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "REPLAY_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to replay task", "REPLAY_FAILED", err)
 		return
 	}
 
@@ -401,7 +405,7 @@ func (s *Server) handleDiscardDeadLetter(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusNotFound, "task not found", "TASK_NOT_FOUND")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error(), "GET_TASK_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to fetch task", "GET_TASK_FAILED", err)
 		return
 	}
 
@@ -416,7 +420,7 @@ func (s *Server) handleDiscardDeadLetter(w http.ResponseWriter, r *http.Request)
 
 	state := broker.TaskStateDiscarded
 	if err := s.broker.Store().UpdateTask(r.Context(), taskID, broker.TaskUpdate{State: &state}); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "DISCARD_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to discard task", "DISCARD_FAILED", err)
 		return
 	}
 
@@ -452,7 +456,7 @@ func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Reques
 		Limit:              maxListLimit,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "LIST_DEAD_LETTER_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to list dead-letter tasks", "LIST_DEAD_LETTER_FAILED", err)
 		return
 	}
 
@@ -487,7 +491,7 @@ func (s *Server) handleDiscardAllDeadLetter(w http.ResponseWriter, r *http.Reque
 		Limit:              maxListLimit,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "LIST_DEAD_LETTER_FAILED")
+		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to list dead-letter tasks", "LIST_DEAD_LETTER_FAILED", err)
 		return
 	}
 
@@ -541,4 +545,40 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, message, code string) {
 	writeJSON(w, status, errorResponse{Error: message, Code: code})
+}
+
+// writeInternalError logs the full internal error server-side and writes a
+// stable, opaque error message to the client. The request ID is included in
+// both the structured log line and the response body so operators can
+// correlate a client-visible failure with server logs without leaking the
+// underlying error string (which may expose store/provider internals).
+func (s *Server) writeInternalError(w http.ResponseWriter, r *http.Request, status int, publicMsg, code string, internalErr error) {
+	rid := r.Header.Get(requestIDHeader)
+	if rid == "" {
+		rid = shortRequestID()
+	}
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Error("handler error",
+		"request_id", rid,
+		"path", r.URL.Path,
+		"method", r.Method,
+		"status", status,
+		"code", code,
+		"public_msg", publicMsg,
+		"error", internalErr,
+	)
+	writeJSON(w, status, errorResponse{Error: publicMsg, Code: code, RequestID: rid})
+}
+
+// shortRequestID returns a short random hex string for correlating a
+// response with server logs when no upstream request ID was set.
+func shortRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "unknown"
+	}
+	return hex.EncodeToString(b[:])
 }
