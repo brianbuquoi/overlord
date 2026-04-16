@@ -1,10 +1,12 @@
 ---
 title: feat: `overlord init` scaffolder + first-class `mock` provider
 type: feat
-status: active
+status: completed
 date: 2026-04-16
+completed: 2026-04-16
 origin: docs/brainstorms/2026-04-16-overlord-init-requirements.md
 deepened: 2026-04-16
+pr: https://github.com/brianbuquoi/overlord/pull/1
 ---
 
 # feat: `overlord init` scaffolder + first-class `mock` provider
