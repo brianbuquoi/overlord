@@ -1,0 +1,3 @@
+{
+  "text": "Overlord is a Go-based orchestration engine for AI agent pipelines. Pipelines are defined entirely in YAML. Agents are stateless LLM adapters. The broker routes tasks between agents through typed, versioned stages, and schema versioning is a first-class concept in the YAML config. The sanitizer strips known injection patterns before wrapping agent output in an envelope that downstream agents must treat as data only."
+}

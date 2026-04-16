@@ -1,0 +1,4 @@
+{
+  "summary": "Overlord is a Go-based orchestration engine that routes tasks between LLM-backed agents via typed, versioned pipeline stages defined in YAML.",
+  "word_count": 22
+}

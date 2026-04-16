@@ -18,9 +18,11 @@ internal/agent/         → Agent interface + provider adapters
   google/               → Gemini API
   openai/               → OpenAI API (Codex, GPT-4o)
   ollama/               → Self-hosted via Ollama REST API
+  mock/                 → First-party fixture-keyed stub (demos + template CI)
   copilot/              → GitHub Copilot (STUB — no public API yet)
 internal/contract/      → JSONSchema I/O validation, schema version enforcement
 internal/sanitize/      → Prompt injection sanitizer (envelope pattern)
+internal/scaffold/      → Embedded project templates + writer (consumed by `overlord init`)
 internal/store/         → State store interface
   redis/                → Redis backend
   postgres/             → Postgres backend
@@ -38,6 +40,22 @@ docs/                   → Deployment and operations documentation
 **See also:** [docs/deployment.md](docs/deployment.md) for single-instance
 and multi-instance deployment guides, docker-compose examples, and known
 limitations.
+
+## CLI surface
+
+Top-level subcommands wired in `cmd/overlord/main.go`:
+
+- `run` — long-running server (HTTP API, WebSocket, broker workers, dashboard)
+- `exec` — single-task in-process execution; no HTTP bind (see [docs/exec.md](docs/exec.md))
+- `init` — scaffold a runnable project from an embedded template + auto-run a mock demo (see [docs/init.md](docs/init.md))
+- `submit` — submit a task via HTTP; optional `--wait`
+- `status`, `cancel` — task introspection and cancellation
+- `validate` — YAML parse + schema registry compile + contract compatibility
+- `health` — build agents and run each adapter's HealthCheck
+- `pipelines` — list and describe pipelines
+- `dead-letter` — list/replay/discard/recover dead-lettered tasks
+- `migrate` — schema migration framework (list/run/validate)
+- `completion` — shell completion scripts
 
 ## Core Principles
 
@@ -86,6 +104,18 @@ Zero runtime config. Everything — pipeline topology, agent bindings, prompts,
 timeouts, retry policies, schema refs — lives in YAML. Hot-reload is
 supported on SIGHUP.
 
+### Scaffolded projects and the runtime auth guardrail
+`overlord init` scaffolds projects with memory store + commented `auth:`
+block so the first-run demo is zero-friction. The runtime-level safety
+net is in `overlord run`: at startup, it emits a loud `slog.Warn` when
+`auth.enabled=false` AND the HTTP bind address is not loopback
+(`127.0.0.0/8`, `::1`, `localhost`). The warning names the bind address
+and links to `docs/deployment.md#authentication`. It does not refuse to
+start — local-dev users intentionally bind to LAN — but the log line is
+unmistakable. This guardrail is what makes the commented-auth pattern
+in scaffolded templates safe by default; see `docs/init.md` for the
+graduation path.
+
 ## Key Interfaces
 
 ```go
@@ -105,6 +135,24 @@ type Store interface {
     GetTask(ctx context.Context, taskID string) (*Task, error)
     ListTasks(ctx context.Context, filter TaskFilter) ([]*Task, error)
 }
+
+// Agent registry factory — widened in the mock-provider rollout to
+// accept the compiled contract registry + the filtered stage bindings
+// for the agent being constructed. The mock adapter consumes both for
+// constructor-time fixture validation (path containment, size cap,
+// schema check); every other built-in provider ignores them. Every
+// caller that builds agents (broker build, health, hot-reload, tests)
+// goes through this factory, so mock fixture validation fires
+// automatically for every code path.
+func NewFromConfigWithPlugins(
+    cfg config.Agent,
+    plugins map[string]pluginapi.AgentPlugin,
+    logger *slog.Logger,
+    registry *contract.Registry,
+    basePath string,
+    stages []config.Stage,
+    m ...*metrics.Metrics,
+) (agent.Agent, error)
 ```
 
 ## Task Lifecycle
@@ -170,7 +218,7 @@ pipelines:
 
 agents:
   - id: string
-    provider: anthropic | google | openai | ollama | copilot
+    provider: anthropic | google | openai | ollama | mock | copilot
     model: string
     auth:
       api_key_env: string      # env var name — never hardcode credentials
@@ -178,6 +226,11 @@ agents:
     temperature: float
     max_tokens: int
     timeout: duration
+    # mock provider only: fixtures map stage_id → relative JSON path.
+    # Fixtures are validated against the stage's output_schema at
+    # adapter construction time (see "Key Interfaces" below).
+    fixtures:
+      <stage_id>: fixtures/<name>.json
 
 auth:
   enabled: bool              # default: false (backward compatible)
@@ -272,3 +325,13 @@ the reverse proxy or firewall level in production.
 - Do not use os.Exit() inside cobra RunE — return errors instead
 - Do not bypass AuthMiddleware for new routes without explicit
   justification and a corresponding test
+- Do not strip the scaffolded `.gitignore` rules from
+  `internal/scaffold/templates/*/.gitignore` — they keep `.env` and
+  `*.overlord-init-bak` (which may contain prior credentials) out of
+  commits
+- Do not remove the `all:` prefix from the `//go:embed all:templates`
+  directive in `internal/scaffold/templates.go` — without it, Go
+  silently omits `.env.example` and `.gitignore` from the embedded tree
+- Do not silently weaken the runtime auth guardrail in
+  `overlord run` — it is the only thing catching the scaffolded
+  "commented auth + public bind" footgun at runtime

@@ -76,6 +76,17 @@ func main() {
 			}
 			os.Exit(sw.ExitCode())
 		}
+		var ie *initExitError
+		if errors.As(err, &ie) {
+			// Code 0/130 and the demo-success path should not print
+			// "Error:" to stderr; the command has already surfaced the
+			// user-facing message. Other failure classes get the prefix
+			// so CI logs are consistent with exec/submit.
+			if ie.Msg != "" && ie.Code != initExitInterrupted && ie.Code != initExitSuccess {
+				fmt.Fprintln(os.Stderr, "Error:", ie.Error())
+			}
+			os.Exit(ie.Code)
+		}
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
@@ -116,6 +127,7 @@ Quick start:
 
 	root.AddCommand(runCmd())
 	root.AddCommand(execCmd())
+	root.AddCommand(initCmd())
 	root.AddCommand(submitCmd())
 	root.AddCommand(statusCmd())
 	root.AddCommand(validateCmd())
@@ -231,10 +243,11 @@ func buildStore(cfg *config.Config, logger *slog.Logger) (broker.Store, error) {
 	}
 }
 
-func buildAgents(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, logger *slog.Logger, m *metrics.Metrics) (map[string]broker.Agent, error) {
+func buildAgents(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, logger *slog.Logger, reg *contract.Registry, basePath string, m *metrics.Metrics) (map[string]broker.Agent, error) {
 	agents := make(map[string]broker.Agent, len(cfg.Agents))
 	for _, ac := range cfg.Agents {
-		a, err := registry.NewFromConfigWithPlugins(ac, plugins, logger, m)
+		stages := registry.StagesForAgent(cfg.Pipelines, ac.ID)
+		a, err := registry.NewFromConfigWithPlugins(ac, plugins, logger, reg, basePath, stages, m)
 		if err != nil {
 			return nil, fmt.Errorf("agent %q: %w", ac.ID, err)
 		}
@@ -256,7 +269,7 @@ func buildBroker(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, c
 		return nil, fmt.Errorf("store: %w", err)
 	}
 
-	agents, err := buildAgents(cfg, plugins, logger, m)
+	agents, err := buildAgents(cfg, plugins, logger, reg, basePath, m)
 	if err != nil {
 		return nil, fmt.Errorf("agents: %w", err)
 	}
@@ -364,7 +377,12 @@ func runCmd() *cobra.Command {
 			// Start HTTP/WS API.
 			metricsPath := cfg.Observability.MetricsPath
 			srv := api.NewServerWithContext(ctx, b, logger, m, metricsPath, authKeys)
-			ln, err := net.Listen("tcp", ":"+port)
+			bindAddr := ":" + port
+			// Warn once at startup if auth is off on a non-loopback bind.
+			// Warn-only: local-dev users may intentionally bind to LAN.
+			// Not re-invoked on SIGHUP hot-reload (startup-only).
+			checkAuthGuardrail(logger, cfg, bindAddr)
+			ln, err := net.Listen("tcp", bindAddr)
 			if err != nil {
 				cancel()
 				return fmt.Errorf("listen: %w", err)
@@ -395,7 +413,7 @@ func runCmd() *cobra.Command {
 					logger.Error("hot-reload: plugins failed", "error", err)
 					return
 				}
-				newAgents, err := buildAgents(newCfg, reloadedPlugins, logger, m)
+				newAgents, err := buildAgents(newCfg, reloadedPlugins, logger, newReg, newBasePath, m)
 				if err != nil {
 					logger.Error("hot-reload: agents failed", "error", err)
 					return
@@ -465,6 +483,67 @@ func runCmd() *cobra.Command {
 	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port")
 	cmd.MarkFlagRequired("config")
 	return cmd
+}
+
+// authGuardrailDocURL is the canonical documentation link emitted by the
+// auth guardrail warning. Kept as a package-level constant so tests can
+// assert against the exact value without duplicating string literals.
+const authGuardrailDocURL = "https://github.com/brianbuquoi/overlord/blob/main/docs/deployment.md#authentication"
+
+// isLoopbackHost reports whether the given host string refers to a loopback
+// interface. Empty strings are treated as the implicit all-interfaces bind
+// (NOT loopback). "0.0.0.0" and "::" are explicitly non-loopback.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "":
+		// Empty host = implicit 0.0.0.0 / all-interfaces — NOT loopback.
+		return false
+	case "0.0.0.0", "::":
+		return false
+	case "localhost":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// bindHost extracts the host portion of a listen address. Accepts forms
+// like ":8080", "0.0.0.0:8080", "127.0.0.1:8080", "[::1]:8080", or a
+// bare host like "localhost". Returns the host portion; if no port is
+// present, returns the input as-is.
+func bindHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port — return as-is so callers can still classify.
+		return addr
+	}
+	return host
+}
+
+// checkAuthGuardrail emits a one-shot slog.Warn when auth is disabled and
+// the HTTP bind address is not loopback. It is warn-only — never refuses
+// to start — because local-dev users may intentionally bind to LAN. The
+// function is safe to call with a nil/zero Auth struct (missing auth:
+// block treated as Enabled=false).
+func checkAuthGuardrail(logger *slog.Logger, cfg *config.Config, bindAddr string) {
+	if cfg == nil {
+		return
+	}
+	if cfg.Auth.Enabled {
+		return
+	}
+	host := bindHost(bindAddr)
+	if isLoopbackHost(host) {
+		return
+	}
+	logger.Warn(
+		"auth is disabled on a non-loopback bind address — enable auth before serving this instance",
+		"auth_disabled", true,
+		"bind_address", bindAddr,
+		"doc", authGuardrailDocURL,
+	)
 }
 
 func pipelineStoreType(cfg *config.Config) string {
@@ -934,9 +1013,19 @@ func healthCmd() *cobra.Command {
 				return fmtConfigError(configPath, err)
 			}
 
+			// Build the contract registry so any mock agent in the
+			// config gets fixture-schema validation at construction time,
+			// matching the broker build path.
+			basePath := configBasePath(configPath)
+			reg, err := buildContractRegistry(cfg, basePath)
+			if err != nil {
+				return fmt.Errorf("contract registry: %w", err)
+			}
+
 			agents := make(map[string]agent.Agent, len(cfg.Agents))
 			for _, ac := range cfg.Agents {
-				a, err := registry.NewFromConfig(ac, logger)
+				stages := registry.StagesForAgent(cfg.Pipelines, ac.ID)
+				a, err := registry.NewFromConfigWithPlugins(ac, nil, logger, reg, basePath, stages)
 				if err != nil {
 					return fmt.Errorf("agent %q: %w", ac.ID, err)
 				}

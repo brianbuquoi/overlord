@@ -6,14 +6,16 @@ import (
 	"log/slog"
 
 	"github.com/brianbuquoi/overlord/internal/agent"
-	"github.com/brianbuquoi/overlord/internal/broker"
 	"github.com/brianbuquoi/overlord/internal/agent/anthropic"
 	"github.com/brianbuquoi/overlord/internal/agent/copilot"
 	"github.com/brianbuquoi/overlord/internal/agent/google"
+	mockagent "github.com/brianbuquoi/overlord/internal/agent/mock"
 	"github.com/brianbuquoi/overlord/internal/agent/ollama"
 	"github.com/brianbuquoi/overlord/internal/agent/openai"
 	openairesp "github.com/brianbuquoi/overlord/internal/agent/openai_responses"
+	"github.com/brianbuquoi/overlord/internal/broker"
 	"github.com/brianbuquoi/overlord/internal/config"
+	"github.com/brianbuquoi/overlord/internal/contract"
 	"github.com/brianbuquoi/overlord/internal/metrics"
 	internalplugin "github.com/brianbuquoi/overlord/internal/plugin"
 	pluginapi "github.com/brianbuquoi/overlord/pkg/plugin"
@@ -22,13 +24,34 @@ import (
 // NewFromConfig creates the appropriate Agent adapter based on the provider
 // field in the agent configuration. Built-in providers are checked first,
 // then loaded plugins.
+//
+// This is a convenience wrapper that constructs providers that need no
+// contract registry or stage bindings (every built-in LLM adapter). The
+// first-class mock provider is rejected here because it requires a
+// compiled registry + the filtered stages to validate fixtures — callers
+// that may encounter provider: "mock" must use NewFromConfigWithPlugins.
 func NewFromConfig(cfg config.Agent, logger *slog.Logger, m ...*metrics.Metrics) (agent.Agent, error) {
-	return NewFromConfigWithPlugins(cfg, nil, logger, m...)
+	return NewFromConfigWithPlugins(cfg, nil, logger, nil, "", nil, m...)
 }
 
 // NewFromConfigWithPlugins creates an Agent adapter, checking built-in
 // providers first and falling back to loaded plugins.
-func NewFromConfigWithPlugins(cfg config.Agent, plugins map[string]pluginapi.AgentPlugin, logger *slog.Logger, m ...*metrics.Metrics) (agent.Agent, error) {
+//
+// The registry, basePath, and stages parameters are consumed by the mock
+// provider for constructor-time fixture validation; every other built-in
+// adapter ignores them. stages must already be filtered to the bindings
+// that reference cfg.ID (that filtering is the caller's responsibility).
+// basePath is the directory that relative fixture paths resolve against
+// and should be the same value passed to contract.NewRegistry.
+func NewFromConfigWithPlugins(
+	cfg config.Agent,
+	plugins map[string]pluginapi.AgentPlugin,
+	logger *slog.Logger,
+	registry *contract.Registry,
+	basePath string,
+	stages []config.Stage,
+	m ...*metrics.Metrics,
+) (agent.Agent, error) {
 	switch cfg.Provider {
 	case "anthropic":
 		return anthropic.New(anthropic.Config{
@@ -90,6 +113,13 @@ func NewFromConfigWithPlugins(cfg config.Agent, plugins map[string]pluginapi.Age
 			Model: cfg.Model,
 		}), nil
 
+	case "mock":
+		return mockagent.New(mockagent.Config{
+			ID:       cfg.ID,
+			Fixtures: cfg.Fixtures,
+			BasePath: basePath,
+		}, logger, registry, stages, m...)
+
 	case "plugin":
 		return internalplugin.LoadAndCreate(cfg, logger)
 	}
@@ -108,9 +138,34 @@ func NewFromConfigWithPlugins(cfg config.Agent, plugins map[string]pluginapi.Age
 	}
 
 	return nil, fmt.Errorf(
-		"unknown agent provider %q for agent %q — valid providers: anthropic, openai, openai-responses, google, ollama, copilot, plugin",
+		"unknown agent provider %q for agent %q — valid providers: anthropic, openai, openai-responses, google, ollama, copilot, mock, plugin",
 		cfg.Provider, cfg.ID,
 	)
+}
+
+// StagesForAgent returns the subset of stages whose agent binding
+// references agentID — either as a single-agent stage or as a fan-out
+// participant. Callers pass the result to NewFromConfigWithPlugins so the
+// mock adapter constructor sees only the bindings relevant to its own ID.
+func StagesForAgent(pipelines []config.Pipeline, agentID string) []config.Stage {
+	var out []config.Stage
+	for _, p := range pipelines {
+		for _, s := range p.Stages {
+			if s.Agent == agentID {
+				out = append(out, s)
+				continue
+			}
+			if s.FanOut != nil {
+				for _, fa := range s.FanOut.Agents {
+					if fa.ID == agentID {
+						out = append(out, s)
+						break
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 // Stoppers returns all agents from the given registry map that implement

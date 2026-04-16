@@ -4,6 +4,73 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — `overlord init` scaffolder + first-class `mock` provider
+
+### Added
+- `overlord init <template> [dir]` scaffolds a runnable greenfield project
+  (combined `overlord.yaml`, schemas, fixtures, sample payload,
+  `.env.example`, `.gitignore`) and auto-runs a sample payload through the
+  generated pipeline. Zero credentials on first run. See
+  [docs/init.md](docs/init.md).
+- Two embedded templates ship in v1: `hello` (single-stage) and
+  `summarize` (2-stage linear chain). Templates live under
+  `internal/scaffold/templates/` and are embedded via
+  `//go:embed all:templates`.
+- First-party `mock` provider adapter (`internal/agent/mock/`). Loads
+  fixture files keyed by stage ID and returns their contents verbatim
+  from `Execute`. Fixtures are validated against the stage's
+  `output_schema` at agent-construction time (path containment check,
+  256 KiB size cap, schema validation). No broker-side hook; every code
+  path that constructs an agent gets validation automatically.
+- `init` flags: `--force`, `--overwrite`, `--no-run`,
+  `--non-interactive`. Exit codes 0/1/2/3/4/130 with the matrix
+  documented in `docs/init.md`.
+- `--overwrite` backs up colliding files to
+  `<name>.overlord-init-bak.<YYYYMMDDHHMMSS>[-<rand>]`. Repeated
+  `--force --overwrite` runs never silently clobber a prior backup.
+- Atomic scaffold: writes to a sibling tempdir + `os.Rename` on the
+  happy path; cross-filesystem fallback copies per file.
+- Symlink refusal on the target and on init-created files
+  (`O_NOFOLLOW` on POSIX; Windows uses open + fstat + inode compare).
+
+### Changed
+- `registry.NewFromConfigWithPlugins` signature widened to accept
+  `*contract.Registry`, `basePath string`, and
+  `[]config.Stage` (filtered to bindings referencing the agent being
+  constructed). Consumed by the mock adapter for inline fixture
+  validation; ignored by every other built-in provider. All in-repo
+  callers updated.
+- `overlord run` now emits a startup `WARN` when `auth.enabled=false`
+  AND the HTTP bind address is not loopback
+  (`127.0.0.0/8`, `::1`, `localhost`). Warn-only — does not refuse to
+  start. Runtime-level mitigation for the commented `auth:` block in
+  scaffolded projects.
+
+### Documentation
+- `docs/init.md` covers the template catalog, flag reference, exit
+  codes, file tree, first-run flow, mock-to-real migration, and the
+  production graduation path (including the runtime auth guardrail).
+- `README.md` quickstart rewritten to lead with `overlord init` (zero
+  API key on first run). The manual-authoring path remains in the
+  Configuration reference section for users who need split configs or
+  custom templates.
+- `CLAUDE.md` updated with the `init` CLI surface, `mock` provider,
+  `internal/scaffold/` package, widened factory signature, and
+  scaffolded-project runtime auth guardrail.
+- `docs/deployment.md` cross-references `docs/init.md` for the
+  memory → Postgres/Redis and commented-auth → enabled-auth graduation
+  path.
+
+### Testing
+- Template CI (`internal/scaffold/ci_test.go`) runs every shipped
+  template through `config.Load`, a mock-mode exec, the mock-to-real
+  migration swap, and `goleak.VerifyNone`. Assertions cover
+  `.gitignore` rules, `.env.example` placeholder shape, and
+  banner-delimited real-provider block presence.
+- Time-budget benchmark (`internal/scaffold/bench_test.go`) asserts
+  `overlord init hello` + demo completes under 10 seconds on CI
+  hardware.
+
 ## [0.4.0] — Security Hardening + Plugin System + Exec Command
 
 ### Security

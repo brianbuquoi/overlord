@@ -11,6 +11,7 @@ import (
 
 	"github.com/brianbuquoi/overlord/internal/broker"
 	"github.com/brianbuquoi/overlord/internal/config"
+	"github.com/brianbuquoi/overlord/internal/contract"
 )
 
 func TestNewFromConfig_Anthropic(t *testing.T) {
@@ -89,6 +90,154 @@ func TestNewFromConfig_Copilot(t *testing.T) {
 	}
 }
 
+// --- Mock provider: first-class via widened factory ---
+
+func TestNewFromConfigWithPlugins_Mock(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a trivial output schema.
+	schemaPath := filepath.Join(dir, "schemas", "out_v1.json")
+	if err := os.MkdirAll(filepath.Dir(schemaPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(schemaPath, []byte(`{"type":"object","required":["x"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := contract.NewRegistry([]config.SchemaEntry{{
+		Name: "out", Version: "v1", Path: "schemas/out_v1.json",
+	}}, dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	// Fixture that satisfies the schema.
+	fixDir := filepath.Join(dir, "fixtures")
+	if err := os.MkdirAll(fixDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixDir, "greet.json"), []byte(`{"x":"hi"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stages := []config.Stage{{
+		ID:           "greet",
+		Agent:        "mock-agent",
+		OutputSchema: config.StageSchemaRef{Name: "out", Version: "v1"},
+	}}
+
+	a, err := NewFromConfigWithPlugins(config.Agent{
+		ID:       "mock-agent",
+		Provider: "mock",
+		Fixtures: map[string]string{"greet": "fixtures/greet.json"},
+	}, nil, slog.Default(), reg, dir, stages)
+	if err != nil {
+		t.Fatalf("NewFromConfigWithPlugins(mock): %v", err)
+	}
+	if a.Provider() != "mock" {
+		t.Errorf("Provider: want mock, got %s", a.Provider())
+	}
+}
+
+func TestNewFromConfigWithPlugins_MockRejectsBadFixture(t *testing.T) {
+	dir := t.TempDir()
+
+	schemaPath := filepath.Join(dir, "schemas", "out_v1.json")
+	if err := os.MkdirAll(filepath.Dir(schemaPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(schemaPath, []byte(`{"type":"object","required":["x"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg, _ := contract.NewRegistry([]config.SchemaEntry{{
+		Name: "out", Version: "v1", Path: "schemas/out_v1.json",
+	}}, dir)
+
+	// Fixture missing required field.
+	if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte(`{"y":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stages := []config.Stage{{
+		ID:           "greet",
+		Agent:        "mock-agent",
+		OutputSchema: config.StageSchemaRef{Name: "out", Version: "v1"},
+	}}
+
+	_, err := NewFromConfigWithPlugins(config.Agent{
+		ID:       "mock-agent",
+		Provider: "mock",
+		Fixtures: map[string]string{"greet": "bad.json"},
+	}, nil, slog.Default(), reg, dir, stages)
+	if err == nil {
+		t.Fatal("expected schema-validation error from mock constructor")
+	}
+}
+
+// --- Widened factory still works for real providers ---
+
+func TestNewFromConfigWithPlugins_AnthropicStillBuilds(t *testing.T) {
+	// stages=nil / registry=nil / basePath="" must be accepted for
+	// non-mock providers; this mirrors what cmd/overlord/main.go does
+	// when calling NewFromConfig (which delegates with zero values).
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	a, err := NewFromConfigWithPlugins(config.Agent{
+		ID:       "a1",
+		Provider: "anthropic",
+		Model:    "claude-sonnet-4-5",
+	}, nil, slog.Default(), nil, "", nil)
+	if err != nil {
+		t.Fatalf("anthropic via widened factory: %v", err)
+	}
+	if a.Provider() != "anthropic" {
+		t.Errorf("Provider: got %s", a.Provider())
+	}
+}
+
+func TestNewFromConfigWithPlugins_CopilotStillBuilds(t *testing.T) {
+	a, err := NewFromConfigWithPlugins(config.Agent{
+		ID:       "cp1",
+		Provider: "copilot",
+		Model:    "copilot-chat",
+	}, nil, slog.Default(), nil, "", nil)
+	if err != nil {
+		t.Fatalf("copilot via widened factory: %v", err)
+	}
+	if a.Provider() != "copilot" {
+		t.Errorf("Provider: got %s", a.Provider())
+	}
+}
+
+// --- StagesForAgent helper ---
+
+func TestStagesForAgent_FiltersSingleAndFanOut(t *testing.T) {
+	pipelines := []config.Pipeline{{
+		Name: "p",
+		Stages: []config.Stage{
+			{ID: "s1", Agent: "a1"},
+			{ID: "s2", Agent: "a2"},
+			{ID: "s3", FanOut: &config.FanOutConfig{
+				Agents: []config.FanOutAgent{{ID: "a1"}, {ID: "a3"}},
+			}},
+		},
+	}}
+
+	got := StagesForAgent(pipelines, "a1")
+	if len(got) != 2 {
+		t.Fatalf("want 2 stages for a1, got %d", len(got))
+	}
+	ids := []string{got[0].ID, got[1].ID}
+	want := map[string]bool{"s1": true, "s3": true}
+	for _, id := range ids {
+		if !want[id] {
+			t.Errorf("unexpected stage id %q", id)
+		}
+	}
+
+	if got := StagesForAgent(pipelines, "nobody"); got != nil {
+		t.Errorf("want nil for unknown agent, got %+v", got)
+	}
+}
+
 // --- Item 9: Unknown provider with actionable error ---
 
 func TestNewFromConfig_UnknownProvider(t *testing.T) {
@@ -111,7 +260,7 @@ func TestNewFromConfig_UnknownProvider(t *testing.T) {
 	}
 
 	// The error MUST list all valid providers so the user can fix their config.
-	validProviders := []string{"anthropic", "openai", "google", "ollama", "copilot"}
+	validProviders := []string{"anthropic", "openai", "google", "ollama", "copilot", "mock"}
 	for _, p := range validProviders {
 		if !strings.Contains(errMsg, p) {
 			t.Errorf("error must list valid provider %q for user-actionability, got: %v", p, errMsg)

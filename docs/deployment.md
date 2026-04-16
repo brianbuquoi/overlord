@@ -312,6 +312,15 @@ volumes:
 
 ## Authentication
 
+> **Scaffolded projects:** `overlord init` generates projects with the
+> memory store and a commented `auth:` block so the first-run demo works
+> without credentials. `overlord run` emits a loud startup warning when
+> `auth.enabled=false` AND the HTTP bind address is not loopback
+> (`127.0.0.0/8`, `::1`, `localhost`). It does not refuse to start, but
+> the warning is unmistakable in logs. See [docs/init.md](init.md) for
+> the full graduation path (swap memory → Redis/Postgres, uncomment the
+> `auth:` block, add real keys).
+
 ### Enabling auth
 
 Add an `auth` block to your YAML config. Auth is disabled by default so

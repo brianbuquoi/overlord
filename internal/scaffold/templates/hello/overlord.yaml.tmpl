@@ -1,0 +1,77 @@
+version: "1"
+
+# Scaffolded by `overlord init hello`.
+#
+# This pipeline runs end-to-end against the first-party `mock` provider
+# (no credentials, no network). When you are ready to graduate to a real
+# LLM, follow the migration steps in the banner block below `agents:`.
+
+schema_registry:
+  - name: hello_input
+    version: "v1"
+    path: schemas/input_v1.json
+  - name: hello_output
+    version: "v1"
+    path: schemas/output_v1.json
+
+pipelines:
+  - name: hello
+    concurrency: 1
+    store: memory
+    stages:
+      - id: greet
+        # The stage binds to the mock agent by default so `overlord init`
+        # can auto-run the scaffolded demo with zero credentials. To swap
+        # in the real provider, uncomment the `greeter` block below AND
+        # change this agent reference from `greeter-mock` to `greeter`.
+        agent: greeter-mock
+        input_schema:
+          name: hello_input
+          version: "v1"
+        output_schema:
+          name: hello_output
+          version: "v1"
+        timeout: 10s
+        retry:
+          max_attempts: 1
+          backoff: fixed
+          base_delay: 500ms
+        on_success: done
+        on_failure: dead-letter
+
+agents:
+  - id: greeter-mock
+    provider: mock
+    fixtures:
+      greet: fixtures/greet.json
+
+  # === real provider: switch to this agent (uncomment + change stage reference from greeter-mock to greeter) ===
+  # - id: greeter
+  #   provider: anthropic
+  #   model: {{ .Model }}
+  #   auth:
+  #     api_key_env: ANTHROPIC_API_KEY
+  #   system_prompt: |
+  #     You are a friendly greeter. Respond with valid JSON and nothing else.
+  #     Format: {"greeting": "<your greeting>"}
+  #   temperature: 0.2
+  #   max_tokens: 256
+  #   timeout: 30s
+  # === end real provider ===
+
+# auth is DISABLED by default so `overlord run` works out of the box on
+# localhost. Enable it BEFORE exposing the API beyond loopback — the
+# runtime warns loudly when auth is off and the bind address is public.
+# See docs/deployment.md#authentication for the full threat model.
+# === auth (ENABLE BEFORE EXPOSING BEYOND LOCALHOST) ===
+# auth:
+#   enabled: true
+#   keys:
+#     - name: default
+#       key_env: OVERLORD_API_KEY
+#       scopes: [write]
+# === end auth ===
+
+stores:
+  memory:
+    max_tasks: 1024

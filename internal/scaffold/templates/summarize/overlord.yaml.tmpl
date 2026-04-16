@@ -1,0 +1,115 @@
+version: "1"
+
+# Scaffolded by `overlord init summarize`.
+#
+# A two-stage linear pipeline: summarize → validate. Both stages run
+# against the first-party `mock` provider by default so the scaffolded
+# demo produces output with zero credentials. To graduate to a real LLM,
+# uncomment the real-provider banner block for each stage AND change the
+# stage's agent reference from `<id>-mock` to `<id>`.
+
+schema_registry:
+  - name: summarize_input
+    version: "v1"
+    path: schemas/summarize_input_v1.json
+  - name: summarize_output
+    version: "v1"
+    path: schemas/summarize_output_v1.json
+  - name: validate_output
+    version: "v1"
+    path: schemas/validate_output_v1.json
+
+pipelines:
+  - name: summarize
+    concurrency: 1
+    store: memory
+    stages:
+      - id: summarize
+        # Swap to `summarize` (no -mock suffix) after uncommenting the
+        # real-provider block below `agents:`.
+        agent: summarize-mock
+        input_schema:
+          name: summarize_input
+          version: "v1"
+        output_schema:
+          name: summarize_output
+          version: "v1"
+        timeout: 30s
+        retry:
+          max_attempts: 1
+          backoff: fixed
+          base_delay: 500ms
+        on_success: validate
+        on_failure: dead-letter
+
+      - id: validate
+        # Swap to `validate` after uncommenting the real-provider block.
+        agent: validate-mock
+        input_schema:
+          name: summarize_output
+          version: "v1"
+        output_schema:
+          name: validate_output
+          version: "v1"
+        timeout: 15s
+        retry:
+          max_attempts: 1
+          backoff: fixed
+          base_delay: 500ms
+        on_success: done
+        on_failure: dead-letter
+
+agents:
+  - id: summarize-mock
+    provider: mock
+    fixtures:
+      summarize: fixtures/summarize.json
+
+  - id: validate-mock
+    provider: mock
+    fixtures:
+      validate: fixtures/validate.json
+
+  # === real provider: switch to this agent (uncomment + change stage reference from <id>-mock to <id>) ===
+  # - id: summarize
+  #   provider: anthropic
+  #   model: {{ .Model }}
+  #   auth:
+  #     api_key_env: ANTHROPIC_API_KEY
+  #   system_prompt: |
+  #     You are a summarization agent. Read the incoming text and respond
+  #     with valid JSON and nothing else.
+  #     Format: {"summary": "<one-paragraph summary>", "word_count": <int>}
+  #   temperature: 0.2
+  #   max_tokens: 1024
+  #   timeout: 30s
+  # - id: validate
+  #   provider: anthropic
+  #   model: {{ .Model }}
+  #   auth:
+  #     api_key_env: ANTHROPIC_API_KEY
+  #   system_prompt: |
+  #     You are a validation agent. Inspect the incoming summary payload
+  #     and respond with valid JSON and nothing else.
+  #     Format: {"summary": "<echoed summary>", "valid": <bool>, "issues": [<string>, ...]}
+  #   temperature: 0.0
+  #   max_tokens: 512
+  #   timeout: 15s
+  # === end real provider ===
+
+# auth is DISABLED by default so `overlord run` works out of the box on
+# localhost. Enable it BEFORE exposing the API beyond loopback — the
+# runtime warns loudly when auth is off and the bind address is public.
+# See docs/deployment.md#authentication for the full threat model.
+# === auth (ENABLE BEFORE EXPOSING BEYOND LOCALHOST) ===
+# auth:
+#   enabled: true
+#   keys:
+#     - name: default
+#       key_env: OVERLORD_API_KEY
+#       scopes: [write]
+# === end auth ===
+
+stores:
+  memory:
+    max_tasks: 1024

@@ -64,91 +64,35 @@ Install:
 go install github.com/brianbuquoi/overlord/cmd/overlord@latest
 ```
 
-Overlord splits configuration into two files: an **infra config** (store +
-agent credentials — stable across pipelines) and a **pipeline file** (topology
-and schemas — iterate freely). They are combined at runtime. If you prefer,
-both blocks can also live in a single file.
-
-Create `infra.yaml`:
-
-```yaml
-version: "1"
-
-agents:
-  - id: claude
-    provider: anthropic
-    model: claude-sonnet-4-20250514
-    auth: { api_key_env: ANTHROPIC_API_KEY }
-    system_prompt: "You are a helpful assistant."
-    timeout: 30s
-
-stores:
-  memory: { max_tasks: 10000 }
-```
-
-Create `pipeline.yaml`:
-
-```yaml
-version: "1"
-
-schema_registry:
-  - name: input
-    version: "v1"
-    path: input_schema.json
-  - name: output
-    version: "v1"
-    path: output_schema.json
-
-pipelines:
-  - name: hello
-    concurrency: 2
-    store: memory
-    stages:
-      - id: greet
-        agent: claude
-        input_schema:  { name: input,  version: "v1" }
-        output_schema: { name: output, version: "v1" }
-        timeout: 30s
-        retry: { max_attempts: 2, backoff: exponential, base_delay: 1s }
-        on_success: done
-        on_failure: dead-letter
-```
-
-Create minimal schemas (`input_schema.json` and `output_schema.json`):
-
-```json
-{ "type": "object" }
-```
-
-Run a single task:
+Scaffold a starter project and run it:
 
 ```bash
-export ANTHROPIC_API_KEY=your-key-here
-
-overlord exec \
-  --config ./infra.yaml \
-  --pipeline ./pipeline.yaml \
-  --id hello \
-  --payload '{"request": "Say hello"}'
+overlord init summarize
+cd summarize
+# init already ran the scaffolded demo against the mock provider;
+# re-run with your own input:
+overlord exec --config overlord.yaml --id summarize \
+  --payload '{"text": "..."}'
 ```
 
-`overlord exec` runs one task through the pipeline and exits — no HTTP
-server, no port binding. Progress is printed to stderr; the final result
-is written to stdout, so you can pipe it into other tools:
+Zero API key needed — the scaffolded project uses the built-in `mock`
+provider so you see a working pipeline on the first run. To switch to a
+real LLM, open `overlord.yaml`, uncomment the real-provider block, and
+change the stage's agent reference from `<id>-mock` to `<id>`.
 
-```
-infra.yaml + pipeline.yaml
-         ↓
-  overlord exec --config infra.yaml --pipeline pipeline.yaml --id hello --payload '{…}'
-         ↓
-  progress → stderr
-  result   → stdout   (e.g. | jq .response > out.txt)
-```
+See [docs/init.md](docs/init.md) for the full template catalog, flag
+reference, exit-code matrix, file tree, and migration guide.
 
-For long-running, multi-task deployments use `overlord run` instead — it
-starts the HTTP API, web dashboard, and broker workers. See
-[docs/exec.md](docs/exec.md) for the exec command reference and
-[docs/deployment.md](docs/deployment.md) for server-mode operations.
+For long-running, multi-task deployments use `overlord run` (HTTP API,
+web dashboard, broker workers). See [docs/exec.md](docs/exec.md) for
+the `exec` command reference and [docs/deployment.md](docs/deployment.md)
+for server-mode operations.
+
+If you prefer to hand-author your config — for split infra+pipeline
+files, custom templates, or non-scaffolded workflows — the
+[Configuration reference](#configuration-reference) below walks through
+the raw YAML shape. `overlord init` is a convenience bootstrap; every
+config it generates can be edited freely afterwards.
 
 ## Configuration reference
 
@@ -432,6 +376,7 @@ Note: Go's plugin package requires Linux or macOS with CGO enabled.
 | OpenAI | GPT-4o, Codex, o-series | `OPENAI_API_KEY` env var | Stable |
 | Google Gemini | Gemini Pro, Flash | `GEMINI_API_KEY` env var | Stable |
 | Ollama | Any model via Ollama REST API | None (local) | Stable |
+| Mock | Fixture-keyed stub (local demos, template CI — not for production) | None | Stable |
 | GitHub Copilot | — | — | Stub (waiting for public API) |
 
 > Custom providers can be added via the plugin system without forking

@@ -188,6 +188,12 @@ type Agent struct {
 	Timeout      Duration           `yaml:"timeout"`
 	RetryBudget  *RetryBudgetConfig `yaml:"retry_budget,omitempty"`
 	Extra        map[string]any     `yaml:"extra,omitempty"` // arbitrary provider-specific config (passed to plugins)
+	// Fixtures maps stage_id → fixture file path (relative to the config
+	// directory) for the first-class mock provider. Ignored by every other
+	// provider. Fixture files are loaded and validated against the stage's
+	// output schema at agent-construction time; see
+	// internal/agent/mock/mock.go for details.
+	Fixtures map[string]string `yaml:"fixtures,omitempty"`
 	// ManifestPath is the path to a subprocess-plugin manifest file. Only
 	// consulted when Provider == "plugin". Resolved relative to the process
 	// working directory.
