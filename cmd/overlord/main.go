@@ -58,6 +58,11 @@ func onSuccessDisplay(cfg config.OnSuccessConfig) string {
 	return "conditional: " + strings.Join(parts, " ")
 }
 
+// overlordVersion is the single source of truth for the binary version.
+// Surfaced via the root cobra command's --version flag and the `version`
+// subcommand.
+const overlordVersion = "0.6.0"
+
 func main() {
 	root := rootCmd()
 	registerCompletions(root)
@@ -118,7 +123,7 @@ Quick start:
 
   # Watch a task until it completes
   overlord status --config pipeline.yaml --task <task-id> --watch`,
-		Version:       "0.6.0",
+		Version:       overlordVersion,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -137,6 +142,7 @@ Quick start:
 	root.AddCommand(pipelinesCmd())
 	root.AddCommand(deadLetterCmd())
 	root.AddCommand(completionCmd())
+	root.AddCommand(versionCmd())
 
 	return root
 }
@@ -2112,6 +2118,21 @@ To load completions:
 		},
 	}
 	return cmd
+}
+
+// versionCmd prints the binary version. Complements the root command's
+// --version / -v flag with a conventional `overlord version` subcommand
+// so either invocation works.
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the overlord binary version",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fmt.Fprintf(cmd.OutOrStdout(), "overlord %s\n", overlordVersion)
+			return nil
+		},
+	}
 }
 
 // registerCompletions adds custom flag completions for --config and --pipeline.

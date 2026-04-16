@@ -148,6 +148,31 @@ type initArgs struct {
 	NonInteractive bool
 }
 
+// writeRollbackErrors prints any partial-rollback failures attached to
+// a scaffold.WriteError. No-op when errs is empty.
+func writeRollbackErrors(w io.Writer, errs []error) {
+	if len(errs) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "rollback reported %d partial failure(s):\n", len(errs))
+	for _, e := range errs {
+		fmt.Fprintf(w, "  %v\n", e)
+	}
+}
+
+// writeCleanupWarnings prints post-commit best-effort failures (tempdir
+// removal, etc.) collected on a scaffold.Result. No-op when warnings is
+// empty. The scaffold itself succeeded when this runs.
+func writeCleanupWarnings(w io.Writer, warnings []string) {
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "post-commit cleanup warnings (%d):\n", len(warnings))
+	for _, m := range warnings {
+		fmt.Fprintf(w, "  %s\n", m)
+	}
+}
+
 // runInit is the RunE body. Kept package-private so tests can drive it
 // directly with a fake *cobra.Command.
 func runInit(cmd *cobra.Command, args []string, a initArgs) error {
@@ -185,6 +210,10 @@ func runInit(cmd *cobra.Command, args []string, a initArgs) error {
 	if err != nil {
 		var werr *scaffold.WriteError
 		if errors.As(err, &werr) {
+			// Surface mid-merge rollback failures so the operator can see
+			// which backup or copied file could not be unwound. Primary
+			// error still classifies the exit code.
+			writeRollbackErrors(stderr, werr.RollbackErrors)
 			return &initExitError{Code: werr.Code, Msg: werr.Msg, Err: werr.Err}
 		}
 		return &initExitError{Code: initExitGeneralError, Msg: "scaffold write failed", Err: err}
@@ -197,6 +226,10 @@ func runInit(cmd *cobra.Command, args []string, a initArgs) error {
 			fmt.Fprintf(stderr, "  %s -> %s\n", b.Original, b.Backup)
 		}
 	}
+
+	// Post-commit best-effort failures (e.g. tempdir not fully removed)
+	// — the scaffold succeeded but something cosmetic is left behind.
+	writeCleanupWarnings(stderr, result.CleanupWarnings)
 
 	fmt.Fprintf(stderr, "Scaffolded %s into %s\n", template, result.Target)
 
