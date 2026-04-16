@@ -76,6 +76,10 @@ func TestCheckAuthGuardrail_NoWarning(t *testing.T) {
 	}
 }
 
+// TestCheckAuthGuardrail_Warning asserts the warn-emit behavior. Note
+// runCmd now only invokes this function when --allow-public-noauth is
+// set; the warn path is the opt-in case, not the default. See
+// TestRefusePublicNoauth for the default-refuse matrix.
 func TestCheckAuthGuardrail_Warning(t *testing.T) {
 	cases := []struct {
 		name     string
