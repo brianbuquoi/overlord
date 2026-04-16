@@ -76,6 +76,17 @@ func main() {
 			}
 			os.Exit(sw.ExitCode())
 		}
+		var ie *initExitError
+		if errors.As(err, &ie) {
+			// Code 0/130 and the demo-success path should not print
+			// "Error:" to stderr; the command has already surfaced the
+			// user-facing message. Other failure classes get the prefix
+			// so CI logs are consistent with exec/submit.
+			if ie.Msg != "" && ie.Code != initExitInterrupted && ie.Code != initExitSuccess {
+				fmt.Fprintln(os.Stderr, "Error:", ie.Error())
+			}
+			os.Exit(ie.Code)
+		}
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
@@ -116,6 +127,7 @@ Quick start:
 
 	root.AddCommand(runCmd())
 	root.AddCommand(execCmd())
+	root.AddCommand(initCmd())
 	root.AddCommand(submitCmd())
 	root.AddCommand(statusCmd())
 	root.AddCommand(validateCmd())
