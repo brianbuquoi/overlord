@@ -118,7 +118,7 @@ Quick start:
 
   # Watch a task until it completes
   overlord status --config pipeline.yaml --task <task-id> --watch`,
-		Version:       "0.5.0",
+		Version:       "0.6.0",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
