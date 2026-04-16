@@ -75,6 +75,16 @@ type Stopper interface {
 	Stop() error
 }
 
+// Drainer is implemented by agents that support graceful draining before
+// shutdown. Call Drain() to stop new work from being dispatched, wait for
+// in-flight work to complete (poll InFlightCount), then call Stop() to
+// terminate the subprocess.
+type Drainer interface {
+	Drain()
+	IsDraining() bool
+	InFlightCount() int32
+}
+
 // AgentError wraps an underlying error with provider context and retryability.
 type AgentError struct {
 	Err        error         `json:"-"`

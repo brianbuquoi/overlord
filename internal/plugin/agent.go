@@ -57,6 +57,9 @@ type Agent struct {
 	restartCount int
 	started      bool
 	unhealthy    bool // set when restart budget exhausted
+
+	draining bool  // set by Drain(); checked by Execute/HealthCheck
+	inFlight int32 // atomic count of in-flight RPCs
 }
 
 // scanLine carries a single stdout line (or error) from the reader goroutine.
@@ -332,9 +335,42 @@ func (a *Agent) doOneCall(ctx context.Context, method string, params any) (json.
 	}
 }
 
+// Drain signals the agent to stop accepting new RPCs. In-flight RPCs
+// are allowed to complete. After Drain() returns, no new Execute or
+// HealthCheck calls will be dispatched to this agent.
+// Call Stop() after Drain() to terminate the subprocess.
+func (a *Agent) Drain() {
+	a.mu.Lock()
+	a.draining = true
+	a.mu.Unlock()
+}
+
+// IsDraining returns true if Drain() has been called.
+func (a *Agent) IsDraining() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.draining
+}
+
+// InFlightCount returns the number of currently in-flight RPCs.
+func (a *Agent) InFlightCount() int32 {
+	return atomic.LoadInt32(&a.inFlight)
+}
+
 // Execute implements agent.Agent. It invokes the plugin's "execute" method
 // and maps the result back into a broker.TaskResult.
 func (a *Agent) Execute(ctx context.Context, task *broker.Task) (*broker.TaskResult, error) {
+	if a.IsDraining() {
+		return nil, &agent.AgentError{
+			Err:       fmt.Errorf("agent is draining; retry on new instance"),
+			AgentID:   a.id,
+			Prov:      "plugin",
+			Retryable: true,
+		}
+	}
+	atomic.AddInt32(&a.inFlight, 1)
+	defer atomic.AddInt32(&a.inFlight, -1)
+
 	params := ExecuteParams{
 		TaskID:       task.ID,
 		PipelineID:   task.PipelineID,
@@ -379,6 +415,17 @@ func (a *Agent) Execute(ctx context.Context, task *broker.Task) (*broker.TaskRes
 
 // HealthCheck implements agent.Agent.
 func (a *Agent) HealthCheck(ctx context.Context) error {
+	if a.IsDraining() {
+		return &agent.AgentError{
+			Err:       fmt.Errorf("agent is draining; retry on new instance"),
+			AgentID:   a.id,
+			Prov:      "plugin",
+			Retryable: true,
+		}
+	}
+	atomic.AddInt32(&a.inFlight, 1)
+	defer atomic.AddInt32(&a.inFlight, -1)
+
 	result, rpcErr, err := a.callRPC(ctx, MethodHealthCheck, nil)
 	if err != nil {
 		return a.mapCallError(err)

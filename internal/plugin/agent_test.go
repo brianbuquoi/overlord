@@ -326,3 +326,74 @@ func TestLoadAndCreate_EagerMissingManifest(t *testing.T) {
 		t.Fatal("expected eager validation error")
 	}
 }
+
+// TestPluginAgent_ReloadDuringRPC verifies that draining a plugin agent while
+// an RPC is in flight allows the in-flight RPC to complete, and that
+// subsequent Execute calls on the drained agent return a retryable error.
+func TestPluginAgent_ReloadDuringRPC(t *testing.T) {
+	// Use a slow plugin (200ms per RPC) so we can drain mid-flight.
+	a := buildAgent(t, map[string]string{"ECHO_PLUGIN_SLOW_MS": "200"}, nil)
+
+	// Warm up: trigger lazy subprocess start.
+	if _, err := a.Execute(context.Background(), newTask(`{"warmup":true}`)); err != nil {
+		t.Fatalf("warmup execute: %v", err)
+	}
+
+	// Launch a slow RPC in the background.
+	type execResult struct {
+		res *broker.TaskResult
+		err error
+	}
+	ch := make(chan execResult, 1)
+	go func() {
+		res, err := a.Execute(context.Background(), newTask(`{"inflight":true}`))
+		ch <- execResult{res, err}
+	}()
+
+	// Give the goroutine a moment to enter the RPC (acquire mutex + write
+	// stdin). The 200ms plugin sleep means the RPC won't return for a while.
+	time.Sleep(50 * time.Millisecond)
+
+	// Drain the agent while the RPC is in flight.
+	a.Drain()
+
+	if !a.IsDraining() {
+		t.Fatal("expected IsDraining() == true after Drain()")
+	}
+
+	// The in-flight RPC should complete successfully despite the drain.
+	result := <-ch
+	if result.err != nil {
+		t.Fatalf("in-flight RPC failed after Drain(): %v", result.err)
+	}
+	if string(result.res.Payload) != `{"inflight":true}` {
+		t.Errorf("in-flight RPC payload: got %s", string(result.res.Payload))
+	}
+
+	// After drain, in-flight count should be 0.
+	if c := a.InFlightCount(); c != 0 {
+		t.Errorf("expected InFlightCount==0 after drain completes, got %d", c)
+	}
+
+	// Subsequent Execute calls must return a retryable error.
+	_, err := a.Execute(context.Background(), newTask(`{"post-drain":true}`))
+	if err == nil {
+		t.Fatal("expected error on Execute after Drain()")
+	}
+	var ae *agent.AgentError
+	if !errors.As(err, &ae) {
+		t.Fatalf("expected AgentError, got %T: %v", err, err)
+	}
+	if !ae.Retryable {
+		t.Errorf("drain error should be retryable so broker requeues to new instance")
+	}
+
+	// HealthCheck should also be rejected.
+	err = a.HealthCheck(context.Background())
+	if err == nil {
+		t.Fatal("expected error on HealthCheck after Drain()")
+	}
+	if !errors.As(err, &ae) || !ae.Retryable {
+		t.Errorf("HealthCheck drain error should be retryable AgentError: %v", err)
+	}
+}

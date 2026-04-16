@@ -129,3 +129,19 @@ func Stoppers(agents map[string]broker.Agent) []agent.Stopper {
 	}
 	return stoppers
 }
+
+// Drainers returns all agents from the given registry map that implement
+// agent.Drainer. Used during hot-reload to drain in-flight RPCs before
+// stopping old plugin subprocesses.
+func Drainers(agents map[string]broker.Agent) []agent.Drainer {
+	if len(agents) == 0 {
+		return nil
+	}
+	drainers := make([]agent.Drainer, 0, len(agents))
+	for _, a := range agents {
+		if d, ok := a.(agent.Drainer); ok {
+			drainers = append(drainers, d)
+		}
+	}
+	return drainers
+}

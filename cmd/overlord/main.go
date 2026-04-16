@@ -399,12 +399,25 @@ func runCmd() *cobra.Command {
 					logger.Error("hot-reload: agents failed", "error", err)
 					return
 				}
-				// Stop subprocess-backed agents from the OLD registry before
-				// the swap: buildAgents always constructs fresh adapters, so
-				// every Stopper from the old map is orphaned by the reload
-				// and would otherwise leak its subprocess.
-				oldStoppers := registry.Stoppers(b.Agents())
+				// Drain in-flight RPCs on old agents before swapping.
+				// buildAgents always constructs fresh adapters, so every
+				// Stopper/Drainer from the old map is orphaned by the reload.
+				oldAgents := b.Agents()
+				oldDrainers := registry.Drainers(oldAgents)
+				oldStoppers := registry.Stoppers(oldAgents)
+				for _, d := range oldDrainers {
+					d.Drain()
+				}
+
+				// Wait for in-flight RPCs to complete before swapping.
+				drainCtx, drainCancel := context.WithTimeout(ctx, 10*time.Second)
+				waitForDrain(drainCtx, oldDrainers, logger)
+				drainCancel()
+
+				// Swap to the new agent map — new tasks route to new agents.
 				b.Reload(newCfg, newAgents, contract.NewValidator(newReg))
+
+				// Stop old plugin subprocesses now that they are drained.
 				for _, s := range oldStoppers {
 					if err := s.Stop(); err != nil {
 						logger.Warn("agent stop error during hot-reload", "error", err)
@@ -467,6 +480,35 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// waitForDrain polls until all drainers report zero in-flight RPCs or the
+// context times out. On timeout it logs a warning and returns so the caller
+// can proceed with Stop().
+func waitForDrain(ctx context.Context, drainers []agent.Drainer, logger *slog.Logger) {
+	if len(drainers) == 0 {
+		return
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		allIdle := true
+		for _, d := range drainers {
+			if d.InFlightCount() > 0 {
+				allIdle = false
+				break
+			}
+		}
+		if allIdle {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			logger.Warn("drain timeout: proceeding with stop while RPCs still in flight")
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // --- submit command ---

@@ -113,9 +113,23 @@ When Overlord shuts down gracefully (SIGTERM or Ctrl+C), it:
 5. Sends SIGKILL if the process has not exited.
 
 `overlord exec` follows the same sequence when its task finishes or the
-deferred cleanup runs. On hot-reload (SIGHUP), plugin agents from the old
-configuration are stopped before the new agent map takes effect — every
-reload starts fresh plugin subprocesses on first use.
+deferred cleanup runs.
+
+## Hot-Reload (SIGHUP)
+
+When Overlord receives SIGHUP, it reloads configuration without restarting:
+
+1. Plugin agents being removed or replaced are marked as draining — no new
+   tasks are dispatched to them.
+2. In-flight RPCs on draining agents are allowed to complete (up to a
+   configurable drain grace period, default 10s).
+3. The broker activates the new agent map — new tasks route to new agents.
+4. Drained plugin subprocesses receive SIGTERM, then SIGKILL after
+   `shutdown_timeout` if they have not exited.
+
+Unchanged agents (same ID, same config) are stopped and restarted during
+reload. This is a known limitation — future versions will reuse subprocesses
+for unchanged agents.
 
 ## Throughput and Capacity Planning
 
