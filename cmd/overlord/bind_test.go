@@ -21,6 +21,11 @@ func TestResolveBindAddr(t *testing.T) {
 		{"env OVERLORD_BIND supplies host", "", "8080", "10.0.0.5", "10.0.0.5:8080", false},
 		{"flag beats env", "127.0.0.1", "8080", "10.0.0.5", "127.0.0.1:8080", false},
 		{"IPv6 literal", "[::1]:8080", "9090", "", "[::1]:8080", false},
+		{"IPv6 bracketed without port", "[::1]", "8080", "", "[::1]:8080", false},
+		{"IPv6 unspecified bare", "::", "8080", "", "[::]:8080", false},
+		{"ephemeral port 0", "127.0.0.1", "0", "", "127.0.0.1:0", false},
+		{"env supplies host:port", "", "8080", "10.0.0.5:7777", "10.0.0.5:7777", false},
+		{"localhost name", "localhost", "8080", "", "localhost:8080", false},
 		{"empty port rejected", "127.0.0.1", "", "", "", true},
 		{"invalid bind host rejected", "not a host", "8080", "", "", true},
 	}

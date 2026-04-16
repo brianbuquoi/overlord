@@ -563,6 +563,11 @@ func resolveBindAddr(bindFlag, portFlag, envBind string) (string, error) {
 		}
 		return net.JoinHostPort(h, p), nil
 	}
+	// Strip IPv6 brackets on bare-host input (e.g. "[::1]") so ParseIP
+	// and JoinHostPort handle them uniformly.
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
 	// Validate bare host: either parseable IP or plausible hostname.
 	if ip := net.ParseIP(host); ip == nil {
 		if !isPlausibleHostname(host) {
