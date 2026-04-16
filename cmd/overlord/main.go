@@ -61,7 +61,7 @@ func onSuccessDisplay(cfg config.OnSuccessConfig) string {
 // overlordVersion is the single source of truth for the binary version.
 // Surfaced via the root cobra command's --version flag and the `version`
 // subcommand.
-const overlordVersion = "0.6.0"
+const overlordVersion = "0.6.1"
 
 func main() {
 	root := rootCmd()

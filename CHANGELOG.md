@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.1] — 2026-04-16 — Post-release polish
+
+### Added
+
+- `overlord version` subcommand. Complements the existing `--version` / `-v`
+  flag with the conventional subcommand form; both paths print the binary
+  version from a single `overlordVersion` constant in `cmd/overlord/main.go`.
+- `cmd/overlord/init.go` now surfaces `Result.CleanupWarnings` and
+  `WriteError.RollbackErrors` on stderr. The scaffolder already populated
+  both fields in v0.6.0, but the CLI swallowed them — a leaked tempdir or
+  partial rollback was invisible to operators. Formatting is extracted into
+  `writeCleanupWarnings` and `writeRollbackErrors` helpers with unit tests.
+
+### Changed
+
+- `.gitignore` now excludes `.context/` (internal scratch directory).
+- `docs/plans/2026-04-16-002-audit-bundle-plan.md` frontmatter updated to
+  `status: completed` with PR and release links.
+
 ## [0.6.0] — 2026-04-16 — Audit Bundle
 
 ### BREAKING
