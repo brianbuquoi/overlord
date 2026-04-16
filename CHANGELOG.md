@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — Audit Bundle
+
+### BREAKING
+
+- `overlord run` now defaults to `--bind 127.0.0.1` (loopback only).
+  Previous behavior was all-interfaces (`:$port`). Deployments that
+  relied on external reachability must add `--bind 0.0.0.0` (or a
+  specific host) and enable `auth:`. See
+  [docs/deployment.md#bind-address](docs/deployment.md#bind-address).
+
+### Security
+
+- **Refuse non-loopback + auth-off startup.** `overlord run` exits with
+  an error when the resolved bind is non-loopback and `auth.enabled=false`,
+  unless `--allow-public-noauth` is passed. Closes Codex audit finding #1.
+- **Reject `fixtures:` on non-mock providers.** `overlord validate` (and
+  every other path that calls `config.Load`) now fails with a clear error
+  if an agent has `fixtures:` set while `provider:` is not `mock`. Closes
+  Codex audit finding #3.
+
+### Fixed
+
+- `overlord init --force` no longer leaves a `.overlord-init-<hex>/` tempdir
+  under the parent directory after a successful merge. Closes Codex audit
+  finding #2 (first half).
+- `overlord init --force` now rolls back backups and removes partially-copied
+  files when a copy fails mid-merge. Rollback errors surface via
+  `WriteError.RollbackErrors`. Closes Codex audit finding #2 (second half).
+
+### Added
+
+- `overlord run --bind host[:port]` flag (default `127.0.0.1`). Accepts a
+  bare host + existing `--port`, or a full `host:port` string.
+- `overlord run --allow-public-noauth` flag. Required when binding to a
+  non-loopback address while `auth.enabled=false`.
+- `OVERLORD_BIND` environment variable (sets the `--bind` flag default).
+- `Result.CleanupWarnings []string` on the scaffolder's `Result` struct —
+  populated with post-commit best-effort failures (e.g. tempdir removal).
+- `WriteError.RollbackErrors []error` on the scaffolder's error type —
+  populated when a mid-merge copy failure triggered partial rollback.
+
 ## [0.5.0] — 2026-04-16 — One-Command Onboarding
 
 ### Added
