@@ -105,16 +105,25 @@ timeouts, retry policies, schema refs — lives in YAML. Hot-reload is
 supported on SIGHUP.
 
 ### Scaffolded projects and the runtime auth guardrail
+
 `overlord init` scaffolds projects with memory store + commented `auth:`
-block so the first-run demo is zero-friction. The runtime-level safety
-net is in `overlord run`: at startup, it emits a loud `slog.Warn` when
-`auth.enabled=false` AND the HTTP bind address is not loopback
-(`127.0.0.0/8`, `::1`, `localhost`). The warning names the bind address
-and links to `docs/deployment.md#authentication`. It does not refuse to
-start — local-dev users intentionally bind to LAN — but the log line is
-unmistakable. This guardrail is what makes the commented-auth pattern
-in scaffolded templates safe by default; see `docs/init.md` for the
-graduation path.
+block so the first-run demo is zero-friction. Two layers make the
+commented-auth pattern safe by default:
+
+1. **Loopback-default bind.** `overlord run` defaults to `127.0.0.1`,
+   so a freshly scaffolded project is never exposed outside the host
+   regardless of firewall state. Use `--bind host[:port]` to select a
+   different address.
+2. **Refuse non-loopback + no-auth.** When the resolved bind is
+   non-loopback AND `auth.enabled=false`, `overlord run` refuses to
+   start unless `--allow-public-noauth` is explicitly passed. The
+   existing `slog.Warn` guardrail (`checkAuthGuardrail`) is retained
+   for the opt-in case so operators who deliberately override still see
+   a log record.
+
+Together these remove the "commented auth + public bind" footgun at
+runtime. See `docs/deployment.md#authentication` and
+`docs/init.md` for the graduation path.
 
 ## Key Interfaces
 
@@ -332,6 +341,8 @@ the reverse proxy or firewall level in production.
 - Do not remove the `all:` prefix from the `//go:embed all:templates`
   directive in `internal/scaffold/templates.go` — without it, Go
   silently omits `.env.example` and `.gitignore` from the embedded tree
-- Do not silently weaken the runtime auth guardrail in
-  `overlord run` — it is the only thing catching the scaffolded
-  "commented auth + public bind" footgun at runtime
+- Do not silently weaken the runtime auth refusal in `overlord run` —
+  the hard error for non-loopback + auth-off bind is the only thing
+  catching the scaffolded "commented auth + public bind" footgun at
+  runtime. The slog.Warn guardrail only runs on the `--allow-public-noauth`
+  opt-in path.

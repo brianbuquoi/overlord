@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -87,6 +88,9 @@ func validate(cfg *Config) error {
 	}
 
 	if err := validateAuth(cfg.Auth); err != nil {
+		return err
+	}
+	if err := validateAgents(cfg.Agents); err != nil {
 		return err
 	}
 
@@ -350,6 +354,35 @@ var validScopes = map[string]bool{
 	"read":  true,
 	"write": true,
 	"admin": true,
+}
+
+// validateAgents enforces cross-field invariants on agent configs that
+// the per-field tag parsing cannot express. Currently:
+//
+//   - fixtures: is only meaningful for provider: mock. Any other
+//     provider with a non-empty fixtures map is rejected at config-load
+//     time so a half-finished migration cannot silently ship — the
+//     alternative (log at debug and ignore) hid fail-open behavior in
+//     both directions (Codex audit finding #3).
+func validateAgents(agents []Agent) error {
+	for _, a := range agents {
+		if len(a.Fixtures) == 0 {
+			continue
+		}
+		if a.Provider == "mock" {
+			continue
+		}
+		keys := make([]string, 0, len(a.Fixtures))
+		for k := range a.Fixtures {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys) // deterministic error output for logs and future tests
+		return fmt.Errorf(
+			"agent %q: fixtures: is only supported on provider: mock (got provider: %q); remove the fixtures map or switch the provider back to mock (stage keys: %v)",
+			a.ID, a.Provider, keys,
+		)
+	}
+	return nil
 }
 
 func validateAuth(auth APIAuthConfig) error {

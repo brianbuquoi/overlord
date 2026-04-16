@@ -76,6 +76,10 @@ func TestCheckAuthGuardrail_NoWarning(t *testing.T) {
 	}
 }
 
+// TestCheckAuthGuardrail_Warning asserts the warn-emit behavior. Note
+// runCmd now only invokes this function when --allow-public-noauth is
+// set; the warn path is the opt-in case, not the default. See
+// TestRefusePublicNoauth for the default-refuse matrix.
 func TestCheckAuthGuardrail_Warning(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -149,6 +153,38 @@ func TestCheckAuthGuardrail_NilConfig(t *testing.T) {
 
 	if got := warningRecords(t, buf); len(got) != 0 {
 		t.Fatalf("expected no warnings for nil config; got %d", len(got))
+	}
+}
+
+// TestRefusePublicNoauth asserts shouldRefusePublicNoauth returns true
+// exactly when the bind address is non-loopback AND auth is disabled
+// AND --allow-public-noauth was not set.
+func TestRefusePublicNoauth(t *testing.T) {
+	cases := []struct {
+		name        string
+		bindAddr    string
+		authEnabled bool
+		allow       bool
+		wantRefuse  bool
+	}{
+		{"loopback + auth off", "127.0.0.1:8080", false, false, false},
+		{"loopback + auth on", "127.0.0.1:8080", true, false, false},
+		{"public + auth on", "0.0.0.0:8080", true, false, false},
+		{"public + auth off (danger)", "0.0.0.0:8080", false, false, true},
+		{"public + auth off + allow", "0.0.0.0:8080", false, true, false},
+		{"LAN + auth off (danger)", "10.0.0.5:8080", false, false, true},
+		{"LAN + auth off + allow", "10.0.0.5:8080", false, true, false},
+		{"implicit all-interfaces + auth off (danger)", ":8080", false, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Auth: config.APIAuthConfig{Enabled: tc.authEnabled}}
+			got := shouldRefusePublicNoauth(cfg, tc.bindAddr, tc.allow)
+			if got != tc.wantRefuse {
+				t.Errorf("shouldRefusePublicNoauth(bind=%q, authOn=%v, allow=%v) = %v, want %v",
+					tc.bindAddr, tc.authEnabled, tc.allow, got, tc.wantRefuse)
+			}
+		})
 	}
 }
 

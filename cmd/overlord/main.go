@@ -282,6 +282,8 @@ func buildBroker(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, c
 func runCmd() *cobra.Command {
 	var configPath string
 	var port string
+	var bindFlag string
+	var allowPublicNoauth bool
 
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -350,6 +352,8 @@ func runCmd() *cobra.Command {
 				"schemas", len(cfg.SchemaRegistry),
 				"store", pipelineStoreType(cfg),
 				"port", port,
+				"bind", bindFlag,
+				"allow_public_noauth", allowPublicNoauth,
 				"tracing_enabled", cfg.Observability.Tracing.Enabled,
 			)
 
@@ -377,11 +381,24 @@ func runCmd() *cobra.Command {
 			// Start HTTP/WS API.
 			metricsPath := cfg.Observability.MetricsPath
 			srv := api.NewServerWithContext(ctx, b, logger, m, metricsPath, authKeys)
-			bindAddr := ":" + port
-			// Warn once at startup if auth is off on a non-loopback bind.
-			// Warn-only: local-dev users may intentionally bind to LAN.
-			// Not re-invoked on SIGHUP hot-reload (startup-only).
-			checkAuthGuardrail(logger, cfg, bindAddr)
+			bindAddr, err := resolveBindAddr(bindFlag, port, os.Getenv("OVERLORD_BIND"))
+			if err != nil {
+				cancel()
+				return fmt.Errorf("bind: %w", err)
+			}
+			if shouldRefusePublicNoauth(cfg, bindAddr, allowPublicNoauth) {
+				cancel()
+				return fmt.Errorf(
+					"refusing to start: bind=%s is non-loopback and auth.enabled=false — enable auth or pass --allow-public-noauth (see %s)",
+					bindAddr, authGuardrailDocURL,
+				)
+			}
+			// Warning path retained for --allow-public-noauth opt-in so operators
+			// who knowingly override still see a log record. Not re-invoked on
+			// SIGHUP hot-reload (startup-only).
+			if allowPublicNoauth {
+				checkAuthGuardrail(logger, cfg, bindAddr)
+			}
 			ln, err := net.Listen("tcp", bindAddr)
 			if err != nil {
 				cancel()
@@ -480,7 +497,9 @@ func runCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
-	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port")
+	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port (combined with --bind host when --bind has no port)")
+	cmd.Flags().StringVar(&bindFlag, "bind", envOrDefault("OVERLORD_BIND", ""), "HTTP bind address (host or host:port); defaults to 127.0.0.1")
+	cmd.Flags().BoolVar(&allowPublicNoauth, "allow-public-noauth", false, "explicitly allow non-loopback bind with auth disabled (requires operator opt-in)")
 	cmd.MarkFlagRequired("config")
 	return cmd
 }
@@ -522,6 +541,67 @@ func bindHost(addr string) string {
 	return host
 }
 
+// resolveBindAddr computes the listen address from the --bind flag, the
+// --port flag, and the OVERLORD_BIND env var snapshot. Default host is
+// loopback (127.0.0.1). A --bind value of "host:port" wins over --port;
+// a bare "host" is combined with the port flag. Empty port is rejected.
+func resolveBindAddr(bindFlag, portFlag, envBind string) (string, error) {
+	if portFlag == "" {
+		return "", fmt.Errorf("port must be non-empty")
+	}
+	host := bindFlag
+	if host == "" {
+		host = envBind
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	// If host already contains a port (including IPv6 literal form), accept verbatim.
+	if h, p, err := net.SplitHostPort(host); err == nil && p != "" {
+		if h == "" {
+			return "", fmt.Errorf("bind host cannot be empty when port is specified")
+		}
+		return net.JoinHostPort(h, p), nil
+	}
+	// Strip IPv6 brackets on bare-host input (e.g. "[::1]") so ParseIP
+	// and JoinHostPort handle them uniformly.
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	// Validate bare host: either parseable IP or plausible hostname.
+	if ip := net.ParseIP(host); ip == nil {
+		if !isPlausibleHostname(host) {
+			return "", fmt.Errorf("invalid bind host: %q", host)
+		}
+	}
+	return net.JoinHostPort(host, portFlag), nil
+}
+
+// isPlausibleHostname accepts labels a–z, 0–9, '-' (not leading/trailing),
+// separated by dots. Looser than RFC 1123 on length — we're rejecting
+// whitespace and obvious junk, not doing DNS validation.
+func isPlausibleHostname(h string) bool {
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z':
+			case r >= 'A' && r <= 'Z':
+			case r >= '0' && r <= '9':
+			case r == '-' && i != 0 && i != len(label)-1:
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // checkAuthGuardrail emits a one-shot slog.Warn when auth is disabled and
 // the HTTP bind address is not loopback. It is warn-only — never refuses
 // to start — because local-dev users may intentionally bind to LAN. The
@@ -544,6 +624,24 @@ func checkAuthGuardrail(logger *slog.Logger, cfg *config.Config, bindAddr string
 		"bind_address", bindAddr,
 		"doc", authGuardrailDocURL,
 	)
+}
+
+// shouldRefusePublicNoauth returns true when the bind address is
+// non-loopback AND auth is disabled AND the operator did not opt in
+// via --allow-public-noauth. Returning true causes runCmd to fail
+// startup with a clear error — this is the refusal half of the
+// guardrail. Warning-only behavior remains for the opt-in case.
+func shouldRefusePublicNoauth(cfg *config.Config, bindAddr string, allow bool) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.Auth.Enabled {
+		return false
+	}
+	if allow {
+		return false
+	}
+	return !isLoopbackHost(bindHost(bindAddr))
 }
 
 func pipelineStoreType(cfg *config.Config) string {

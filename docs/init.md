@@ -210,17 +210,33 @@ When you are ready to expose the API beyond your laptop:
   and adding real key entries. See
   [`docs/deployment.md#authentication`](deployment.md#authentication)
   for scopes, key generation, and CLI usage.
+- **Pick a bind address.** When you move off loopback (e.g. deploying
+  behind a reverse proxy or listening on a specific interface), enable
+  `auth:` first. `overlord run` refuses to start with a non-loopback
+  bind while `auth.enabled=false` unless you pass `--allow-public-noauth`
+  as an explicit opt-in.
 
-### Runtime auth guardrail
+### Runtime bind and auth guardrail
 
-`overlord run` inspects `auth.enabled` and the HTTP bind address at
-startup. If auth is disabled AND the bind address is not loopback
-(`127.0.0.0/8`, `::1`, `localhost`), the process emits a loud `WARN`
-log line naming the bind address and linking to the authentication
-docs. It does not refuse to start — local-dev users often bind to LAN
-addresses intentionally — but the warning is unmistakable in logs and
-aggregators. This is the runtime-level mitigation for the commented
-`auth:` block shipped by `init`.
+`overlord run` defaults to binding `127.0.0.1:8080` — a loopback-only
+listener that nothing outside the host can reach. This is the reason
+the scaffolded `auth:` block can safely ship commented-out. You choose
+a different address with `--bind host[:port]` or by setting
+`OVERLORD_BIND`.
+
+Two layers make this safe:
+
+1. **Loopback default.** Until you pass `--bind`, nothing off-host
+   can hit the API — even if your firewall is open.
+2. **Refusal on non-loopback + auth-off.** When `--bind` points at a
+   non-loopback address and `auth.enabled=false`, `overlord run`
+   refuses to start. Pass `--allow-public-noauth` if you deliberately
+   want that combination (the warning still logs).
+
+Both layers are removed automatically once you uncomment the `auth:`
+block and add real keys. See
+[docs/deployment.md#bind-address](deployment.md#bind-address) and
+[docs/deployment.md#authentication](deployment.md#authentication).
 
 ## Adding a template
 

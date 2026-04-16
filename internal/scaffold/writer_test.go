@@ -1,6 +1,7 @@
 package scaffold
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -177,21 +178,50 @@ func TestWrite_NonTmplFilesByteIdentical(t *testing.T) {
 
 // TestWrite_NoStrayTempdir asserts no .overlord-init-<hex> directory
 // remains in the parent after a successful commit — tempdir must be
-// renamed-in-place, not left as a sibling.
+// renamed-in-place (fresh target) or fully cleaned up (--force merge).
 func TestWrite_NoStrayTempdir(t *testing.T) {
-	parent := t.TempDir()
-	target := filepath.Join(parent, "hello")
-	if _, err := Write(context.Background(), "hello", target, Options{}); err != nil {
-		t.Fatalf("Write: %v", err)
+	cases := []struct {
+		name    string
+		prefill func(t *testing.T, target string)
+		opts    Options
+	}{
+		{
+			name:    "fresh target",
+			prefill: func(*testing.T, string) {},
+			opts:    Options{},
+		},
+		{
+			name: "--force merge into pre-existing empty dir",
+			prefill: func(t *testing.T, target string) {
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					t.Fatalf("prefill mkdir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(target, "unrelated.txt"), []byte("x"), 0o644); err != nil {
+					t.Fatalf("prefill write: %v", err)
+				}
+			},
+			opts: Options{Force: true},
+		},
 	}
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		t.Fatalf("read parent: %v", err)
-	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), tempdirPrefix) {
-			t.Errorf("stray tempdir in parent: %s", e.Name())
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			target := filepath.Join(parent, "hello")
+			tc.prefill(t, target)
+
+			if _, err := Write(context.Background(), "hello", target, tc.opts); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			entries, err := os.ReadDir(parent)
+			if err != nil {
+				t.Fatalf("read parent: %v", err)
+			}
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), tempdirPrefix) {
+					t.Errorf("stray tempdir in parent: %s", e.Name())
+				}
+			}
+		})
 	}
 }
 
@@ -874,5 +904,105 @@ func TestWrite_RelativeTargetPath(t *testing.T) {
 	}
 	if !strings.HasSuffix(res.Target, "proj") {
 		t.Errorf("Result.Target = %q, expected to end with 'proj'", res.Target)
+	}
+}
+
+// TestWrite_ForceRollback_CopyFails asserts that when a copy fails
+// after backups have been performed, backups are restored to their
+// original names and any files already copied are removed.
+//
+// Poison mechanism: pre-create target/schemas/ with mode 0o500 (no
+// write bit). The template also produces schemas/input_v1.json and
+// schemas/output_v1.json. commitIntoExistingTarget calls MkdirAll on
+// schemas/ (no-op, already exists) then iterates the sorted rendered
+// list. Files before schemas/* (.env.example, .gitignore,
+// fixtures/greet.json, sample_payload.json) copy fine; the first
+// schemas/input_v1.json copy fails with EACCES, triggering rollback.
+func TestWrite_ForceRollback_CopyFails(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root — permission bits are advisory")
+	}
+	parent := t.TempDir()
+	target := filepath.Join(parent, "hello")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+
+	// Pre-populate target with a file whose name collides with a
+	// template output so --overwrite triggers a backup.
+	originalContent := []byte("ORIGINAL\n")
+	yamlPath := filepath.Join(target, "overlord.yaml")
+	if err := os.WriteFile(yamlPath, originalContent, 0o644); err != nil {
+		t.Fatalf("prefill yaml: %v", err)
+	}
+
+	// Inject a failure: pre-create target/schemas/ with no write bit so
+	// copyFileExclusive cannot create schemas/input_v1.json inside it.
+	// Template produces schemas/input_v1.json (confirmed from embedded tree).
+	schemasDir := filepath.Join(target, "schemas")
+	if err := os.MkdirAll(schemasDir, 0o500); err != nil {
+		t.Fatalf("mkdir schemas ro: %v", err)
+	}
+	t.Cleanup(func() {
+		// Restore write so TempDir teardown can remove it even if
+		// rollback did not (schemas/ itself is never removed by rollback).
+		_ = os.Chmod(schemasDir, 0o700)
+	})
+
+	_, err := Write(context.Background(), "hello", target, Options{Force: true, Overwrite: true})
+	if err == nil {
+		t.Fatalf("expected copy failure; got nil")
+	}
+
+	// Restore write permission before reading — rollback may have left
+	// schemas/ intact (it only removes files it copied, not dirs).
+	_ = os.Chmod(schemasDir, 0o700)
+
+	got, readErr := os.ReadFile(yamlPath)
+	if readErr != nil {
+		t.Fatalf("read target yaml after rollback: %v", readErr)
+	}
+	if !bytes.Equal(got, originalContent) {
+		t.Errorf("rollback did not restore original overlord.yaml\nwant: %q\n got: %q", originalContent, got)
+	}
+
+	bakMatches, globErr := filepath.Glob(filepath.Join(target, "*.overlord-init-bak.*"))
+	if globErr != nil {
+		t.Fatalf("glob backups: %v", globErr)
+	}
+	if len(bakMatches) != 0 {
+		t.Errorf("rollback left backup files behind: %v", bakMatches)
+	}
+}
+
+// TestRollbackMerge_BackupMissing asserts that when a backup file is
+// unexpectedly gone at rollback time, rollbackMerge does NOT remove
+// the live file at origPath. Tests the data-safety invariant added
+// after code-quality review of Unit 3.
+func TestRollbackMerge_BackupMissing(t *testing.T) {
+	target := t.TempDir()
+	// Set up: a live file at origPath, no backup file.
+	origContent := []byte("LIVE\n")
+	if err := os.WriteFile(filepath.Join(target, "overlord.yaml"), origContent, 0o644); err != nil {
+		t.Fatalf("write orig: %v", err)
+	}
+	// Call rollbackMerge with a backup entry whose bakPath does not exist.
+	backups := []Backup{
+		{Original: "overlord.yaml", Backup: "overlord.yaml.overlord-init-bak.MISSING"},
+	}
+	errs := rollbackMerge(target, backups, nil)
+	// Expect: an error about the missing backup, AND the live file is untouched.
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 rollback error; got %d: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), "backup missing") {
+		t.Errorf("expected 'backup missing' in error; got %q", errs[0].Error())
+	}
+	got, readErr := os.ReadFile(filepath.Join(target, "overlord.yaml"))
+	if readErr != nil {
+		t.Fatalf("read live file after rollback: %v", readErr)
+	}
+	if !bytes.Equal(got, origContent) {
+		t.Errorf("rollback destroyed live file when backup was missing\nwant: %q\n got: %q", origContent, got)
 	}
 }

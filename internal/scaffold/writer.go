@@ -88,8 +88,9 @@ type Backup struct {
 // path to the scaffolded directory. Backups is non-empty only when
 // Write ran with Force+Overwrite and at least one file was replaced.
 type Result struct {
-	Target  string
-	Backups []Backup
+	Target          string
+	Backups         []Backup
+	CleanupWarnings []string // post-commit best-effort failures (e.g. tempdir removal)
 }
 
 // WriteError is the typed error returned by Write. Code matches the
@@ -97,9 +98,10 @@ type Result struct {
 // the init cobra command's RunE to set the process exit code. Err wraps
 // the underlying cause and is surfaced via errors.Unwrap for telemetry.
 type WriteError struct {
-	Code int
-	Msg  string
-	Err  error
+	Code           int
+	Msg            string
+	Err            error
+	RollbackErrors []error // populated when commit failed and rollback was attempted
 }
 
 // Error implements the error interface.
@@ -256,9 +258,13 @@ func Write(ctx context.Context, tmplName, target string, opts Options) (*Result,
 			return nil, err
 		}
 		result.Backups = backups
-		// Tempdir is drained by commitIntoExistingTarget; remove the
-		// now-empty husk. Best-effort — a leftover empty dir is harmless.
-		_ = os.Remove(tempdir)
+		// commitIntoExistingTarget copies files (not renames) so the
+		// tempdir still contains the full rendered tree after a
+		// successful merge. Use RemoveAll; Remove silently failed on
+		// non-empty dirs and leaked the tempdir (Codex audit finding #2).
+		if err := os.RemoveAll(tempdir); err != nil {
+			result.CleanupWarnings = append(result.CleanupWarnings, fmt.Sprintf("remove tempdir %s: %v", tempdir, err))
+		}
 		committed = true
 	}
 
@@ -591,27 +597,80 @@ func commitIntoExistingTarget(tempdir, target string, rendered []string, overwri
 		backups = append(backups, Backup{Original: rel, Backup: bakRel})
 	}
 
-	// Move rendered files into target. Use copyFileExclusive for
-	// portability — os.Rename across dirs on the same fs works fine,
-	// but Windows can hit EXDEV within a single volume for subtler
-	// reasons, and copy-then-delete is uniform.
+	// Move rendered files into target, with rollback on any copy
+	// failure: restore the backups we just created and delete any
+	// files we already copied. Rollback is best-effort and reported
+	// via RollbackErrors on the returned WriteError.
+	copied, copyErr := copyRenderedFiles(tempdir, target, rendered)
+	if copyErr != nil {
+		rbErrs := rollbackMerge(target, backups, copied)
+		var we *WriteError
+		if errors.As(copyErr, &we) {
+			we.RollbackErrors = rbErrs
+		}
+		return nil, copyErr
+	}
+
+	return backups, nil
+}
+
+// copyRenderedFiles copies every non-directory entry in rendered from
+// tempdir into target. Returns the ordered list of destination files
+// it successfully created so the caller can roll back on error.
+func copyRenderedFiles(tempdir, target string, rendered []string) ([]string, error) {
+	copied := make([]string, 0, len(rendered))
 	for _, rel := range rendered {
 		src := filepath.Join(tempdir, rel)
 		dst := filepath.Join(target, rel)
 		srcFi, err := os.Lstat(src)
 		if err != nil {
-			return nil, newWriteFailure(fmt.Sprintf("lstat tempdir entry %s", src), err)
+			return copied, newWriteFailure(fmt.Sprintf("lstat tempdir entry %s", src), err)
 		}
 		if srcFi.IsDir() {
-			// Already ensured via MkdirAll above; nothing to do.
 			continue
 		}
 		if err := copyFileExclusive(src, dst); err != nil {
-			return nil, err
+			return copied, err
+		}
+		copied = append(copied, dst)
+	}
+	return copied, nil
+}
+
+// rollbackMerge reverses the backups-then-copy sequence on failure.
+// Files already copied into target are removed; every backup is
+// renamed back to its original name. All errors are accumulated and
+// returned; rollback continues past individual failures so partial
+// success is possible.
+func rollbackMerge(target string, backups []Backup, copied []string) []error {
+	var errs []error
+	for _, dst := range copied {
+		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove copied file %s: %w", dst, err))
 		}
 	}
-
-	return backups, nil
+	for _, b := range backups {
+		origPath := filepath.Join(target, b.Original)
+		bakPath := filepath.Join(target, b.Backup)
+		// Confirm the backup still exists before touching the live file. If
+		// the backup is gone (concurrent process, disk error, test harness
+		// pre-cleanup), restoring is impossible — record the error and
+		// leave origPath alone so we don't destroy the user's live file.
+		if _, err := os.Lstat(bakPath); err != nil {
+			errs = append(errs, fmt.Errorf("backup missing, cannot restore %s: %w", bakPath, err))
+			continue
+		}
+		if _, err := os.Lstat(origPath); err == nil {
+			if err := os.Remove(origPath); err != nil {
+				errs = append(errs, fmt.Errorf("clear path for backup restore %s: %w", origPath, err))
+				continue
+			}
+		}
+		if err := os.Rename(bakPath, origPath); err != nil {
+			errs = append(errs, fmt.Errorf("restore backup %s -> %s: %w", bakPath, origPath, err))
+		}
+	}
+	return errs
 }
 
 // backupSuffixCollides reports whether any of the prospective backup

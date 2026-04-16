@@ -314,12 +314,40 @@ volumes:
 
 > **Scaffolded projects:** `overlord init` generates projects with the
 > memory store and a commented `auth:` block so the first-run demo works
-> without credentials. `overlord run` emits a loud startup warning when
-> `auth.enabled=false` AND the HTTP bind address is not loopback
-> (`127.0.0.0/8`, `::1`, `localhost`). It does not refuse to start, but
-> the warning is unmistakable in logs. See [docs/init.md](init.md) for
-> the full graduation path (swap memory → Redis/Postgres, uncomment the
-> `auth:` block, add real keys).
+> without credentials. The `overlord run` default bind is `127.0.0.1`
+> (loopback-only), so a scaffolded project is not exposed outside the
+> host. If you pass `--bind` to select a non-loopback address while
+> `auth.enabled=false`, `overlord run` **refuses to start** unless you
+> also pass `--allow-public-noauth`. This makes the "commented auth +
+> public bind" footgun unreachable by default. See
+> [docs/init.md](init.md) for the full graduation path (swap memory →
+> Redis/Postgres, uncomment the `auth:` block, add real keys, then drop
+> the override flag).
+
+### Bind address
+
+Use `--bind` to control which address `overlord run` listens on.
+Accepts either a bare host (`--bind 0.0.0.0`) combined with `--port`,
+or a full `host:port` string (`--bind 10.0.0.5:8080`). Defaults to
+`127.0.0.1`. The `OVERLORD_BIND` environment variable sets the flag
+default.
+
+```bash
+# Loopback-only (default) — safest; external clients cannot reach the API.
+overlord run --config overlord.yaml
+
+# Listen on all interfaces. Requires auth.enabled=true OR --allow-public-noauth.
+overlord run --config overlord.yaml --bind 0.0.0.0
+
+# Opt-in to the dangerous combo (bind public + auth off). Logs a warning.
+overlord run --config overlord.yaml --bind 0.0.0.0 --allow-public-noauth
+```
+
+When `--bind` resolves to a non-loopback address and `auth.enabled=false`,
+startup fails with:
+
+> refusing to start: bind=<addr> is non-loopback and auth.enabled=false —
+> enable auth or pass --allow-public-noauth
 
 ### Enabling auth
 
