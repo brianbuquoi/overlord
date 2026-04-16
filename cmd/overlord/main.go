@@ -282,6 +282,8 @@ func buildBroker(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, c
 func runCmd() *cobra.Command {
 	var configPath string
 	var port string
+	var bindFlag string
+	var allowPublicNoauth bool
 
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -350,6 +352,8 @@ func runCmd() *cobra.Command {
 				"schemas", len(cfg.SchemaRegistry),
 				"store", pipelineStoreType(cfg),
 				"port", port,
+				"bind", bindFlag,
+				"allow_public_noauth", allowPublicNoauth,
 				"tracing_enabled", cfg.Observability.Tracing.Enabled,
 			)
 
@@ -377,11 +381,24 @@ func runCmd() *cobra.Command {
 			// Start HTTP/WS API.
 			metricsPath := cfg.Observability.MetricsPath
 			srv := api.NewServerWithContext(ctx, b, logger, m, metricsPath, authKeys)
-			bindAddr := ":" + port
-			// Warn once at startup if auth is off on a non-loopback bind.
-			// Warn-only: local-dev users may intentionally bind to LAN.
-			// Not re-invoked on SIGHUP hot-reload (startup-only).
-			checkAuthGuardrail(logger, cfg, bindAddr)
+			bindAddr, err := resolveBindAddr(bindFlag, port, os.Getenv("OVERLORD_BIND"))
+			if err != nil {
+				cancel()
+				return fmt.Errorf("bind: %w", err)
+			}
+			if shouldRefusePublicNoauth(cfg, bindAddr, allowPublicNoauth) {
+				cancel()
+				return fmt.Errorf(
+					"refusing to start: bind=%s is non-loopback and auth.enabled=false — enable auth or pass --allow-public-noauth (see %s)",
+					bindAddr, authGuardrailDocURL,
+				)
+			}
+			// Warning path retained for --allow-public-noauth opt-in so operators
+			// who knowingly override still see a log record. Not re-invoked on
+			// SIGHUP hot-reload (startup-only).
+			if allowPublicNoauth {
+				checkAuthGuardrail(logger, cfg, bindAddr)
+			}
 			ln, err := net.Listen("tcp", bindAddr)
 			if err != nil {
 				cancel()
@@ -480,7 +497,9 @@ func runCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
-	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port")
+	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port (combined with --bind host when --bind has no port)")
+	cmd.Flags().StringVar(&bindFlag, "bind", envOrDefault("OVERLORD_BIND", ""), "HTTP bind address (host or host:port); defaults to 127.0.0.1")
+	cmd.Flags().BoolVar(&allowPublicNoauth, "allow-public-noauth", false, "explicitly allow non-loopback bind with auth disabled (requires operator opt-in)")
 	cmd.MarkFlagRequired("config")
 	return cmd
 }
