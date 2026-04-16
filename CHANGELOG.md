@@ -4,6 +4,101 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] — Security Hardening + Plugin System + Exec Command
+
+### Security
+- Removed prompt and payload preview logging from all provider adapters (prevented credential leakage via debug logs)
+- Replaced raw `err.Error()` HTTP responses with stable opaque error messages; full errors logged server-side with request ID
+- `/v1/health` no longer leaks provider or environment failure details
+- WebSocket auth: API key removed from query string; replaced with short-lived single-use session tokens via `POST /v1/ws-token`
+- IPv6 brute-force tracking normalized to /64 prefix; evicts at 90% capacity rather than failing open
+- `--payload @file` rejects symlinks and non-regular files on both `exec` and `submit`
+- Plugin environment isolation: plugins receive only explicitly listed env vars
+- Sanitizer extended to 6 of 8 prompt injection vector classes with active detection
+- Output validation layer: model responses checked for instruction-like patterns as defense-in-depth
+
+### Store
+- Redis `UpdateTask` made atomic via Lua script; eliminates lost-update races
+- Per-state secondary index (`tasks:state:{STATE}`) for O(log N) state-filtered listings
+- Two-dimensional state×pipeline index (`tasks:state:{STATE}:pipeline:{PIPELINE_ID}`) for O(log N) pipeline-scoped queries
+- Postgres `ClaimForReplay` and `RollbackReplayClaim` collapsed into single-CTE statements eliminating TOCTOU window
+- Postgres store brought to full contract parity: `RoutedToDeadLetter`, `CrossStageTransitions`, `IncludeDiscarded` correctly applied
+- Store conformance suite covers `ClaimForReplay`, `RollbackReplayClaim`, concurrent contention across all backends
+- `internal/store/mock` moved to `internal/testutil/storemock` with test-only package doc
+
+### Replay State Machine
+- `REPLAY_PENDING` (transitional) and `REPLAYED` (terminal audit state) introduced
+- `ClaimForReplay` atomically transitions task to `REPLAY_PENDING`, preventing duplicate replay under concurrent requests
+- `RollbackReplayClaim` atomically restores `FAILED+RoutedToDeadLetter=true` if Submit fails after claim
+- Handler rolls back claim on Submit failure; logs Error with task_id and recovery command if rollback also fails
+- `POST /v1/tasks/{id}/recover` endpoint for operator recovery of tasks stranded in `REPLAY_PENDING`
+- `overlord dead-letter recover` CLI command added
+
+### Dead-Letter Operations
+- `replay-all` and `discard-all` paginate through full dead-letter set (was capped at 1000 tasks)
+- `failedIDs` deduplication prevents rolled-back tasks from inflating failure counts across pages
+- `failed` count in bulk responses reflects distinct failing task IDs; field always present (no `omitempty`)
+- `processed` field standardized on bulk responses (renamed from `count`)
+- Per-task failure logging with task_id, pipeline_id, error
+
+### External Plugin System
+- New provider `plugin`: runs external binaries as persistent subprocesses via stdin/stdout JSON-RPC 2.0
+- YAML manifest: `name`, `version`, `binary`, `on_failure`, `rpc_timeout`, `shutdown_timeout`, `max_restarts`, `env`
+- Environment isolation: plugins receive only explicitly listed env vars
+- Automatic restart with configurable `max_restarts`; agent marked unhealthy at limit
+- Hot-reload: in-flight RPCs complete before subprocess stopped; `Drainer` interface, 10s drain grace period
+- `Agent.Stop()` sends SIGTERM before closing stdin; SIGKILL after `shutdown_timeout`
+- Plugin binary validated at startup; missing/non-executable binary produces exit 3 (config error)
+- `docs/plugin-security.md` documents isolation model, env isolation, shutdown sequence, capacity planning
+
+### OpenAI Responses API Adapter
+- New provider `openai-responses` targeting `POST /v1/responses` (enables `codex-mini-latest`)
+- Coexists with existing `openai` Chat Completions provider
+- Parse-then-fallback: non-JSON output wrapped as `{"text": "<raw>"}` rather than failing
+
+### `overlord exec` Command
+- Runs a single task to completion and exits — no HTTP server, no port binding
+- Progress to stderr, result to stdout; `--output json` for machine-readable piping
+- Exit codes: 0=done, 1=failed/dead-lettered, 2=timeout, 3=config error
+- `--payload @filepath` reads payload from file
+- Graceful broker drain and plugin subprocess cleanup on exit and SIGINT
+
+### Infra/Pipeline Config Separation
+- `--pipeline` flag accepts standalone pipeline definition YAML on both `exec` and `submit`
+- `--id` flag for pipeline ID (standardized across both commands)
+- Relative schema paths in pipeline files resolve from the pipeline file's own directory
+- Example configs in `config/examples/`
+
+### API
+- `POST /v1/ws-token`: short-lived single-use WebSocket session token (64-char hex)
+- `POST /v1/tasks/{id}/recover`: transitions `REPLAY_PENDING` back to `FAILED+RoutedToDeadLetter=true`
+- New task states in `GET /v1/tasks/{id}`: `REPLAY_PENDING`, `REPLAYED`
+
+### Observability
+- ws-token logs include `client_ip` and `request_id`; token values never logged
+- Plugin restart events logged at Warn with agent_id, restart_count, max_restarts
+- Double-failure Error log for stranded `REPLAY_PENDING` includes task_id and recovery command
+
+### Testing
+- `go test -race -count=3` passes across all packages
+- Fault-injection tests for replay-all/discard-all via store mock
+- Plugin tests: crash/restart, env isolation, RPC timeout, SIGTERM sentinel
+- Comprehensive sweep: Redis index consistency, broker retry policy, schema validation, API error isolation, dead-letter full lifecycle
+
+### Documentation
+- README rewritten to lead with `overlord exec` as primary entry point
+- `docs/exec.md`: exec command, config split pattern, exit codes, @filepath syntax
+- `docs/plugin-security.md`: full isolation model, capacity planning, shutdown sequence
+- `docs/api.md`: all new endpoints documented
+
+### Known Limitations
+- Redis 2D index not backfilled for pre-v0.4.0 tasks (KG-005); backfill needed for live upgrades
+- Plugin seccomp deferred; bwrap/landlock-exec recommended for full Linux syscall isolation
+- Prompt injection classes 7 and 8 rely on model alignment
+- Unchanged plugin agents restarted on hot-reload (subprocess reuse optimization deferred)
+- Hot-reload drain grace period hardcoded at 10s
+- Multi-tenant authorization boundaries not yet implemented
+
 ## [0.3.0] - 2026-04-11
 
 ### Changed
