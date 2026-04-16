@@ -602,6 +602,28 @@ func checkAuthGuardrail(logger *slog.Logger, cfg *config.Config, bindAddr string
 	)
 }
 
+// shouldRefusePublicNoauth returns true when the bind address is
+// non-loopback AND auth is disabled AND the operator did not opt in
+// via --allow-public-noauth. Returning true causes runCmd to fail
+// startup with a clear error — this is the refusal half of the
+// guardrail. Warning-only behavior remains for the opt-in case.
+func shouldRefusePublicNoauth(cfg *config.Config, bindAddr string, allow bool) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.Auth.Enabled {
+		return false
+	}
+	if allow {
+		return false
+	}
+	host := bindHost(bindAddr)
+	if isLoopbackHost(host) {
+		return false
+	}
+	return true
+}
+
 func pipelineStoreType(cfg *config.Config) string {
 	for _, p := range cfg.Pipelines {
 		if p.Store != "" {
