@@ -522,6 +522,62 @@ func bindHost(addr string) string {
 	return host
 }
 
+// resolveBindAddr computes the listen address from the --bind flag, the
+// --port flag, and the OVERLORD_BIND env var snapshot. Default host is
+// loopback (127.0.0.1). A --bind value of "host:port" wins over --port;
+// a bare "host" is combined with the port flag. Empty port is rejected.
+func resolveBindAddr(bindFlag, portFlag, envBind string) (string, error) {
+	if portFlag == "" {
+		return "", fmt.Errorf("port must be non-empty")
+	}
+	host := bindFlag
+	if host == "" {
+		host = envBind
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	// If host already contains a port (including IPv6 literal form), accept verbatim.
+	if h, p, err := net.SplitHostPort(host); err == nil && p != "" {
+		if h == "" {
+			return "", fmt.Errorf("bind host cannot be empty when port is specified")
+		}
+		return net.JoinHostPort(h, p), nil
+	}
+	// Validate bare host: either parseable IP or plausible hostname.
+	if ip := net.ParseIP(host); ip == nil {
+		if !isPlausibleHostname(host) {
+			return "", fmt.Errorf("invalid bind host: %q", host)
+		}
+	}
+	return net.JoinHostPort(host, portFlag), nil
+}
+
+// isPlausibleHostname accepts labels a–z, 0–9, '-' (not leading/trailing),
+// separated by dots. Looser than RFC 1123 on length — we're rejecting
+// whitespace and obvious junk, not doing DNS validation.
+func isPlausibleHostname(h string) bool {
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z':
+			case r >= 'A' && r <= 'Z':
+			case r >= '0' && r <= '9':
+			case r == '-' && i != 0 && i != len(label)-1:
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // checkAuthGuardrail emits a one-shot slog.Warn when auth is disabled and
 // the HTTP bind address is not loopback. It is warn-only — never refuses
 // to start — because local-dev users may intentionally bind to LAN. The
