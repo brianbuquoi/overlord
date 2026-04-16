@@ -1,9 +1,12 @@
 ---
 title: "fix: audit bundle — loopback-default bind, fixtures hard-reject, --force cleanup/rollback"
 type: fix
-status: draft
+status: completed
 date: 2026-04-16
+completed: 2026-04-16
 origin: codex audit (v0.5.0) — findings #1 (bind default), #3 (fixtures fail-open), #2 (--force cleanup/rollback)
+pr: https://github.com/brianbuquoi/overlord/pull/2
+release: https://github.com/brianbuquoi/overlord/releases/tag/v0.6.0
 ---
 
 # fix: audit bundle — loopback-default bind, fixtures hard-reject, `--force` cleanup/rollback
