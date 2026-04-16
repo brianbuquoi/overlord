@@ -88,8 +88,9 @@ type Backup struct {
 // path to the scaffolded directory. Backups is non-empty only when
 // Write ran with Force+Overwrite and at least one file was replaced.
 type Result struct {
-	Target  string
-	Backups []Backup
+	Target          string
+	Backups         []Backup
+	CleanupWarnings []string // post-commit best-effort failures (e.g. tempdir removal)
 }
 
 // WriteError is the typed error returned by Write. Code matches the
@@ -256,9 +257,13 @@ func Write(ctx context.Context, tmplName, target string, opts Options) (*Result,
 			return nil, err
 		}
 		result.Backups = backups
-		// Tempdir is drained by commitIntoExistingTarget; remove the
-		// now-empty husk. Best-effort — a leftover empty dir is harmless.
-		_ = os.Remove(tempdir)
+		// commitIntoExistingTarget copies files (not renames) so the
+		// tempdir still contains the full rendered tree after a
+		// successful merge. Use RemoveAll; Remove silently failed on
+		// non-empty dirs and leaked the tempdir (Codex audit finding #2).
+		if err := os.RemoveAll(tempdir); err != nil {
+			result.CleanupWarnings = append(result.CleanupWarnings, fmt.Sprintf("remove tempdir %s: %v", tempdir, err))
+		}
 		committed = true
 	}
 

@@ -177,21 +177,50 @@ func TestWrite_NonTmplFilesByteIdentical(t *testing.T) {
 
 // TestWrite_NoStrayTempdir asserts no .overlord-init-<hex> directory
 // remains in the parent after a successful commit — tempdir must be
-// renamed-in-place, not left as a sibling.
+// renamed-in-place (fresh target) or fully cleaned up (--force merge).
 func TestWrite_NoStrayTempdir(t *testing.T) {
-	parent := t.TempDir()
-	target := filepath.Join(parent, "hello")
-	if _, err := Write(context.Background(), "hello", target, Options{}); err != nil {
-		t.Fatalf("Write: %v", err)
+	cases := []struct {
+		name    string
+		prefill func(t *testing.T, target string)
+		opts    Options
+	}{
+		{
+			name:    "fresh target",
+			prefill: func(*testing.T, string) {},
+			opts:    Options{},
+		},
+		{
+			name: "--force merge into pre-existing empty dir",
+			prefill: func(t *testing.T, target string) {
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					t.Fatalf("prefill mkdir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(target, "unrelated.txt"), []byte("x"), 0o644); err != nil {
+					t.Fatalf("prefill write: %v", err)
+				}
+			},
+			opts: Options{Force: true},
+		},
 	}
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		t.Fatalf("read parent: %v", err)
-	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), tempdirPrefix) {
-			t.Errorf("stray tempdir in parent: %s", e.Name())
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			target := filepath.Join(parent, "hello")
+			tc.prefill(t, target)
+
+			if _, err := Write(context.Background(), "hello", target, tc.opts); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			entries, err := os.ReadDir(parent)
+			if err != nil {
+				t.Fatalf("read parent: %v", err)
+			}
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), tempdirPrefix) {
+					t.Errorf("stray tempdir in parent: %s", e.Name())
+				}
+			}
+		})
 	}
 }
 
