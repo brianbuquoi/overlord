@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -375,6 +376,7 @@ func validateAgents(agents []Agent) error {
 		for k := range a.Fixtures {
 			keys = append(keys, k)
 		}
+		sort.Strings(keys) // deterministic error output for logs and future tests
 		return fmt.Errorf(
 			"agent %q: fixtures: is only supported on provider: mock (got provider: %q); remove the fixtures map or switch the provider back to mock (stage keys: %v)",
 			a.ID, a.Provider, keys,
