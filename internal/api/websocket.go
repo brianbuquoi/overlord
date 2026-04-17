@@ -18,6 +18,38 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     checkOrigin,
 }
 
+// wsLimits controls the resource envelope every WebSocket connection
+// operates within. The audit flagged the prior shape — unbounded
+// client count, no read deadline, no ping/pong — as a denial-of-
+// service path available to any authenticated tenant. Tuning these
+// values is a trade-off between monitoring-tool friendliness and
+// attacker cost; the defaults below chose values generous enough for
+// typical dashboards (~hundreds of clients) and aggressive enough to
+// close dead connections inside a minute.
+const (
+	// maxWSClients caps the total number of concurrent WebSocket
+	// clients the hub registers. Connections arriving past this
+	// point are refused at registration with a 503-style close
+	// frame so legitimate clients see a clear signal rather than a
+	// hung socket.
+	maxWSClients = 512
+
+	// wsPongWait is the maximum time the server waits between
+	// client pong frames before considering the connection dead
+	// and closing it. Paired with wsPingPeriod.
+	wsPongWait = 60 * time.Second
+
+	// wsPingPeriod is how often the server sends a ping frame. Must
+	// be strictly less than wsPongWait so a single missed pong has a
+	// chance to refresh the read deadline before the deadline
+	// expires.
+	wsPingPeriod = (wsPongWait * 9) / 10
+
+	// wsWriteWait bounds every write (data, ping, close) so a slow
+	// or wedged client cannot stall the writePump goroutine.
+	wsWriteWait = 10 * time.Second
+)
+
 // checkOrigin validates the Origin header against the request Host to prevent
 // cross-site WebSocket hijacking (CSWSH). Only same-origin connections are
 // allowed. If no Origin header is present (non-browser clients), the request
@@ -105,14 +137,22 @@ func (h *wsHub) stopped() bool {
 	}
 }
 
-// register adds a new client. It is a no-op if the hub is shut down.
-func (h *wsHub) register(c *wsClient) {
+// register adds a new client. Returns false when the hub is shut
+// down or at the max-clients cap; callers MUST check the return
+// value and reject the connection rather than leak the socket.
+// A successful registration counts against maxWSClients until the
+// caller's writePump / readPump closes and unregister runs.
+func (h *wsHub) register(c *wsClient) bool {
 	if h.stopped() {
-		return
+		return false
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.clients) >= maxWSClients {
+		return false
+	}
 	h.clients[c] = struct{}{}
-	h.mu.Unlock()
+	return true
 }
 
 // unregister removes a client. Safe to call after shutdown.
@@ -167,20 +207,61 @@ func (c *wsClient) close() {
 	})
 }
 
-// writePump pumps messages from the send channel to the WebSocket connection.
+// writePump pumps messages from the send channel to the WebSocket
+// connection. Every write (data and ping) is bounded by wsWriteWait
+// so a wedged client cannot stall this goroutine indefinitely. A
+// periodic ping keeps the connection warm and tickles the peer's
+// stack so stale TCP connections are detected within wsPongWait.
 func (c *wsClient) writePump() {
-	defer c.close()
-	for msg := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			return
+	ticker := time.NewTicker(wsPingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.close()
+	}()
+	for {
+		select {
+		case msg, ok := <-c.send:
+			if !ok {
+				// Hub closed the channel — send a graceful close
+				// frame and bail. WriteControl handles the deadline
+				// itself so SetWriteDeadline is unnecessary here.
+				_ = c.conn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "stream closed"),
+					time.Now().Add(wsWriteWait),
+				)
+				return
+			}
+			if err := c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait)); err != nil {
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait)); err != nil {
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
 
-// readPump reads from the WebSocket to detect client disconnect.
+// readPump reads from the WebSocket to detect client disconnect and
+// refresh the read deadline on every pong. A client that stops
+// responding to pings has its read deadline expire within wsPongWait
+// and this goroutine returns, triggering close().
 func (c *wsClient) readPump() {
 	defer c.close()
 	c.conn.SetReadLimit(512)
+	// Prime the read deadline so a stalled first-message client is
+	// still cleaned up within the pong window.
+	_ = c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
 	for {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
@@ -190,6 +271,13 @@ func (c *wsClient) readPump() {
 }
 
 // handleStream upgrades to WebSocket and registers a client.
+//
+// Refuses the connection when the hub is at the maxWSClients cap —
+// sending a CloseTryAgainLater frame so well-behaved clients back
+// off and retry rather than reconnecting in a tight loop. Every
+// accepted connection operates under the ping/pong deadline regime
+// in writePump / readPump so stale TCP sessions are detected and
+// cleaned up within wsPongWait.
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -206,7 +294,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		hub:        s.hub,
 	}
 
-	s.hub.register(c)
+	if !s.hub.register(c) {
+		s.logger.Warn("refusing websocket connection: at max clients or hub stopped",
+			"max_clients", maxWSClients,
+		)
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "too many clients"),
+			time.Now().Add(wsWriteWait),
+		)
+		_ = conn.Close()
+		return
+	}
 	go c.writePump()
 	go c.readPump()
 }

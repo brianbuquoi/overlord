@@ -106,7 +106,9 @@ func TestWSHubRegisterAfterShutdown(t *testing.T) {
 	hub.shutdown()
 
 	c := &wsClient{hub: hub, send: make(chan []byte, 1)}
-	hub.register(c)
+	if ok := hub.register(c); ok {
+		t.Fatal("register must return false after hub shutdown")
+	}
 
 	hub.mu.RLock()
 	_, found := hub.clients[c]
@@ -115,4 +117,43 @@ func TestWSHubRegisterAfterShutdown(t *testing.T) {
 	if found {
 		t.Fatal("client should not be registered on a stopped hub")
 	}
+}
+
+// TestWSHubRegisterRefusesAtMaxClients verifies the global
+// connection cap. Once maxWSClients clients are registered, the
+// next register call must return false so the caller can send a
+// TryAgainLater close frame and avoid leaking an unbounded number
+// of goroutines per tenant — the audit flagged the prior shape as
+// a denial-of-service path for any authenticated caller.
+func TestWSHubRegisterRefusesAtMaxClients(t *testing.T) {
+	bus := broker.NewEventBus()
+	hub := newWSHub(bus, slog.Default())
+	defer hub.shutdown()
+
+	accepted := 0
+	clients := make([]*wsClient, 0, maxWSClients+5)
+	for i := 0; i < maxWSClients+5; i++ {
+		c := &wsClient{hub: hub, send: make(chan []byte, 1)}
+		if hub.register(c) {
+			accepted++
+			clients = append(clients, c)
+		}
+	}
+
+	if accepted != maxWSClients {
+		t.Fatalf("expected exactly %d accepted registrations, got %d", maxWSClients, accepted)
+	}
+
+	// Drain accepted clients so the hub's state is clean for the
+	// next test; this also exercises the unregister path.
+	for _, c := range clients {
+		hub.unregister(c)
+	}
+
+	// After unregistering, the cap slot is available again.
+	c := &wsClient{hub: hub, send: make(chan []byte, 1)}
+	if !hub.register(c) {
+		t.Fatal("register must succeed after slots are freed")
+	}
+	hub.unregister(c)
 }
