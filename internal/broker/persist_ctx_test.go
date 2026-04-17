@@ -66,7 +66,11 @@ func TestBroker_PersistCtxSurvivesWorkerCancel(t *testing.T) {
 
 	// Force agent1 to return a non-retryable error on every call so
 	// failTask runs promptly (no sleep, no retry ladder in the way).
+	// Record the invocation so we can wait for pickup before cancelling
+	// the run ctx — a fixed sleep races under slow CI runners.
+	var agentCalls atomic.Int32
 	agents["agent1"].(*mockAgent).setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
+		agentCalls.Add(1)
 		return nil, errors.New("boom")
 	})
 	agents["agent2"].(*mockAgent).setHandler(func(_ context.Context, _ *broker.Task) (*broker.TaskResult, error) {
@@ -89,10 +93,20 @@ func TestBroker_PersistCtxSurvivesWorkerCancel(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 
-	// Give the worker a moment to pick up and call agent once so
+	// Wait for the worker to pick up and call the agent once so
 	// failTask is the next thing in line, then cancel so the ctx it
-	// receives is already Done.
-	time.Sleep(50 * time.Millisecond)
+	// receives is already Done. A fixed sleep here races on slow
+	// runners where the worker has not yet dequeued.
+	pickupDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(pickupDeadline) {
+		if agentCalls.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if agentCalls.Load() < 1 {
+		t.Fatal("agent was never invoked — worker did not pick up submitted task")
+	}
 	cancel()
 
 	// Wait long enough for failTask's persistCtx write to land.
