@@ -1432,13 +1432,26 @@ func migrateRunCmd() *cobra.Command {
 		toVer      string
 		dryRun     bool
 		batchSize  int
+		allowLive  bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Migrate task payloads from one schema version to another",
+		Long: `Migrate rewrites the payload and schema version of every task in a
+pipeline that matches the given --schema and --from version, using the
+registered migration chain to reach --to.
+
+SAFETY (SEC2-005): by default `+"`migrate run`"+` only touches tasks in terminal
+states (DONE, FAILED, DISCARDED, REPLAYED) because a migration of a task
+the broker is actively dequeuing / executing is a TOCTOU race — the
+broker may have already read the pre-migration payload into memory and
+the store write simply loses. If you need to migrate non-terminal tasks,
+first stop every broker instance reading from this store, then re-run
+with --allow-live. The command prints a loud banner when --allow-live is
+set so operators cannot miss it.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMigration(cmd.OutOrStdout(), configPath, pipelineID, schemaName, fromVer, toVer, dryRun, batchSize)
+			return runMigration(cmd.OutOrStdout(), cmd.ErrOrStderr(), configPath, pipelineID, schemaName, fromVer, toVer, dryRun, batchSize, allowLive)
 		},
 	}
 
@@ -1449,6 +1462,7 @@ func migrateRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&toVer, "to", "", "target schema version")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print what would be migrated without writing")
 	cmd.Flags().IntVar(&batchSize, "batch-size", 100, "number of tasks to process at a time")
+	cmd.Flags().BoolVar(&allowLive, "allow-live", false, "also migrate non-terminal tasks (requires the broker to be stopped — see SEC2-005)")
 	cmd.MarkFlagRequired("config")
 	cmd.MarkFlagRequired("pipeline")
 	cmd.MarkFlagRequired("schema")
@@ -1470,7 +1484,10 @@ func migrateValidateCmd() *cobra.Command {
 		Use:   "validate",
 		Short: "Validate that all tasks can be migrated without errors",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMigration(cmd.OutOrStdout(), configPath, pipelineID, schemaName, fromVer, toVer, true, 100)
+			// validate is always a dry run so allow-live is safe to pass
+			// true — no writes happen, only the filter shape changes so
+			// operators see the full set of tasks that would be touched.
+			return runMigration(cmd.OutOrStdout(), cmd.ErrOrStderr(), configPath, pipelineID, schemaName, fromVer, toVer, true, 100, true)
 		},
 	}
 
@@ -1487,7 +1504,15 @@ func migrateValidateCmd() *cobra.Command {
 	return cmd
 }
 
-func runMigration(out io.Writer, configPath, pipelineID, schemaName, fromVer, toVer string, dryRun bool, batchSize int) error {
+// runMigration walks every task in a pipeline that matches
+// (schemaName, fromVer) on input or output schema, applies the registered
+// migration chain to reach toVer, and writes the result back. SEC2-005:
+// non-terminal tasks are refused by default because a live broker can
+// have already dequeued the pre-migration payload; operators must pass
+// allowLive=true after stopping every broker instance reading this store.
+// Stdout and stderr flow through the caller-provided writers so CLI
+// tests can capture output via cmd.OutOrStdout / cmd.ErrOrStderr.
+func runMigration(out, errOut io.Writer, configPath, pipelineID, schemaName, fromVer, toVer string, dryRun bool, batchSize int, allowLive bool) error {
 	logger := newLogger()
 
 	cfg, err := loadConfig(configPath)
@@ -1529,11 +1554,23 @@ func runMigration(out io.Writer, configPath, pipelineID, schemaName, fromVer, to
 	if dryRun {
 		fmt.Fprintln(out, "DRY RUN — no changes will be written.")
 	}
+	if allowLive && !dryRun {
+		// SEC2-005: loud banner on the risky path so operators who pass
+		// --allow-live at the wrong moment notice before it finishes.
+		fmt.Fprintln(errOut, "")
+		fmt.Fprintln(errOut, "!!! --allow-live is set. This migration will rewrite the payload of")
+		fmt.Fprintln(errOut, "!!! non-terminal tasks in this pipeline. Every broker instance")
+		fmt.Fprintln(errOut, "!!! reading from this store MUST be stopped for the duration of the")
+		fmt.Fprintln(errOut, "!!! run — otherwise a task the broker has already read into memory")
+		fmt.Fprintln(errOut, "!!! will execute with its pre-migration payload (SEC2-005).")
+		fmt.Fprintln(errOut, "")
+	}
 
 	ctx := context.Background()
 
 	// Process matching tasks in batches.
 	var migrated, failed, total int
+	skippedLive := 0
 	offset := 0
 
 	for {
@@ -1554,6 +1591,16 @@ func runMigration(out io.Writer, configPath, pipelineID, schemaName, fromVer, to
 		for _, task := range result.Tasks {
 			// Match tasks that use the old schema version on either input or output.
 			if !taskMatchesSchema(task, schemaName, fromVer) {
+				continue
+			}
+			// SEC2-005: refuse to mutate non-terminal tasks unless the
+			// operator has explicitly opted in to a live migration.
+			// A broker dequeuing a non-terminal task between our list
+			// and our write loses the migration (broker reads the old
+			// payload, writes a terminal result; our update fails or
+			// overwrites the terminal).
+			if !allowLive && !task.State.IsTerminal() {
+				skippedLive++
 				continue
 			}
 			total++
@@ -1614,7 +1661,11 @@ func runMigration(out io.Writer, configPath, pipelineID, schemaName, fromVer, to
 	}
 
 	if total == 0 {
-		fmt.Fprintln(out, "No tasks found matching the specified schema and version.")
+		if skippedLive > 0 {
+			fmt.Fprintf(out, "No terminal tasks matched the filter (skipped %d non-terminal tasks — re-run with --allow-live after stopping the broker to include them).\n", skippedLive)
+		} else {
+			fmt.Fprintln(out, "No tasks found matching the specified schema and version.")
+		}
 		return nil
 	}
 
@@ -1625,6 +1676,9 @@ func runMigration(out io.Writer, configPath, pipelineID, schemaName, fromVer, to
 	fmt.Fprintf(out, "%s %d/%d tasks", verb, migrated, total)
 	if failed > 0 {
 		fmt.Fprintf(out, " (%d failed)", failed)
+	}
+	if skippedLive > 0 {
+		fmt.Fprintf(out, " (skipped %d non-terminal — SEC2-005)", skippedLive)
 	}
 	fmt.Fprintln(out)
 

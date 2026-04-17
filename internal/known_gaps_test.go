@@ -103,14 +103,10 @@ func TestKnownGap_SEC014_TokenBucketCleanupLeak(t *testing.T) {
 // (TestMemoryStoreConformance/CancelTask_*) plus concurrent-winner
 // coverage in internal/store/memory/memory_test.go.
 
-// =============================================================================
-// SEC2-005: Migration lacks concurrency protection against live broker
-// =============================================================================
-
-func TestKnownGap_SEC2005_MigrationLiveBroker(t *testing.T) {
-	t.Skip("SEC2-005 OPEN: migrate run against a live pipeline can cause tasks " +
-		"to be processed with wrong schema version.")
-}
+// SEC2-005 RESOLVED: `migrate run` now refuses non-terminal tasks by
+// default; operators must pass --allow-live after stopping every broker
+// instance reading from the store. The regression guard is
+// TestCLI_MigrateRun_HasAllowLiveFlag in cmd/overlord/coverage_gap_test.go.
 
 // SEC4-007 RESOLVED: Plugin load paths are now manifest-validated (the plugin
 // name may not contain path separators) and the subprocess provider runs with

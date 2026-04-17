@@ -191,15 +191,23 @@ Regression coverage:
 - `TestCancelTask_AlreadyTerminalRejected` confirms the stored state is
   not overwritten when the CAS rejects.
 
-### SEC2-005: Migration lacks concurrency protection against live broker
-**Location:** `cmd/overlord/main.go` — `runMigration()`
+### SEC2-005: Migration lacks concurrency protection against live broker — RESOLVED
+**Location:** `cmd/overlord/main.go` — `runMigration`, `migrateRunCmd`
 **Severity:** Medium
-**Description:** `migrate run` against a live pipeline with in-flight tasks can cause a
-task to be processed with a pre-migration payload while migration writes the post-migration
-payload. No data corruption (Postgres FOR UPDATE prevents that), but the task may be
-processed with the wrong schema version.
-**Recommendation:** Document that `migrate run` should target quiesced pipelines, or add
-`--require-state DONE,FAILED` filter to only migrate terminal tasks.
+**Status:** Resolved
+**Description:** `migrate run` against a live pipeline with in-flight tasks
+could cause a task to be processed with a pre-migration payload while
+migration wrote the post-migration payload. No data corruption (Postgres
+`FOR UPDATE` prevented that), but the task could be processed with the
+wrong schema version.
+**Resolution:** `migrate run` defaults to terminal-only — only tasks in
+`DONE` / `FAILED` / `DISCARDED` / `REPLAYED` are migrated; non-terminal
+tasks are skipped with an observable count. Operators who need to touch
+non-terminal tasks must pass `--allow-live`, which prints a loud banner
+warning that every broker instance reading the store must be stopped for
+the duration of the run. The summary output reports the skipped count so
+a partial run is obvious. Regression guard lives in
+`cmd/overlord/coverage_gap_test.go` (`TestCLI_MigrateRun_HasAllowLiveFlag`).
 
 ### SEC4-003: WebSocket connections lack ping/pong keepalive — RESOLVED
 **Location:** `internal/api/websocket.go` — `wsClient.readPump`, `wsClient.writePump`
@@ -469,7 +477,7 @@ without a total count.
 | SEC-015 | No DisallowUnknownFields | Informational | Accepted |
 | SEC-016 | Path param validation adequate | Informational | Confirmed |
 | SEC2-003 | cancel command TOCTOU race | Medium | Resolved |
-| SEC2-005 | Migration lacks live broker guard | Medium | Open |
+| SEC2-005 | Migration lacks live broker guard | Medium | Resolved |
 | SEC2-NEW-002 | Metrics endpoint on shared port | Informational | Informational |
 | SEC3-001 | RecordSuccess resets brute force window | Medium | Resolved |
 | SEC4-003 | WebSocket lacks ping/pong keepalive | Medium | Resolved |
