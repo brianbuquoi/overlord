@@ -29,6 +29,21 @@ var (
 type Store interface {
 	EnqueueTask(ctx context.Context, stageID string, task *broker.Task) error
 	DequeueTask(ctx context.Context, stageID string) (*broker.Task, error)
+	// RequeueTask atomically applies update to an existing task and
+	// places it onto stageID's queue. Unlike EnqueueTask (which
+	// inserts a net-new task), this is the contract the broker uses
+	// for routing, retry, and failure-path requeues where the same
+	// task ID is being moved to a (possibly different) stage.
+	//
+	// The update fields and the queue placement are applied as one
+	// operation per backend: callers either see the task persisted
+	// onto stageID with the new update applied AND dequeueable, or
+	// see an error and no state change. This is the fail-closed
+	// contract the broker relies on to stop emitting terminal events
+	// when persistence has not actually happened.
+	//
+	// Returns ErrTaskNotFound if the task does not exist.
+	RequeueTask(ctx context.Context, taskID, stageID string, update broker.TaskUpdate) error
 	UpdateTask(ctx context.Context, taskID string, update broker.TaskUpdate) error
 	GetTask(ctx context.Context, taskID string) (*broker.Task, error)
 	ListTasks(ctx context.Context, filter broker.TaskFilter) (*broker.ListTasksResult, error)

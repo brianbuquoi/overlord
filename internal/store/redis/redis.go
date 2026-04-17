@@ -252,6 +252,66 @@ return tostring(newState)
 
 var updateTask = redis.NewScript(updateTaskScript)
 
+// requeueTaskScript is updateTaskScript + an LPUSH on the new
+// stage queue, all inside one server-side execution so the broker
+// sees either "task updated AND on queue" or "nothing changed".
+// Keeping the script next to updateTaskScript (and keeping the
+// body verbatim except for the trailing LPUSH) so changes to the
+// update semantics flow to both paths.
+//
+// KEYS[1] = task key
+// KEYS[2] = destination queue list key
+// ARGV[1] = JSON object of update fields
+// ARGV[2] = updated_at timestamp
+// ARGV[3] = state index key prefix
+// ARGV[4] = score for state index ZADD
+// ARGV[5] = task ID (LPUSH member)
+//
+// Replies with the task's new state as a string, or TASK_NOT_FOUND.
+const requeueTaskScript = `
+local data = redis.call('GET', KEYS[1])
+if not data then
+  return redis.error_reply('TASK_NOT_FOUND')
+end
+local task = cjson.decode(data)
+local update = cjson.decode(ARGV[1])
+local oldState = task.state
+for k, v in pairs(update) do
+  if k == 'metadata' and type(v) == 'table' then
+    if type(task.metadata) ~= 'table' then
+      task.metadata = {}
+    end
+    for mk, mv in pairs(v) do
+      task.metadata[mk] = mv
+    end
+  else
+    task[k] = v
+  end
+end
+task.updated_at = ARGV[2]
+local newData = cjson.encode(task)
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl and tonumber(pttl) and tonumber(pttl) > 0 then
+  redis.call('SET', KEYS[1], newData, 'PX', tonumber(pttl))
+else
+  redis.call('SET', KEYS[1], newData)
+end
+local newState = task.state
+if oldState ~= nil and newState ~= nil and oldState ~= newState then
+  redis.call('ZREM', ARGV[3] .. oldState, task.id)
+  redis.call('ZADD', ARGV[3] .. newState, tonumber(ARGV[4]), task.id)
+  local pipeline_id = task.pipeline_id
+  if pipeline_id and pipeline_id ~= '' then
+    redis.call('ZREM', ARGV[3] .. oldState .. ':pipeline:' .. pipeline_id, task.id)
+    redis.call('ZADD', ARGV[3] .. newState .. ':pipeline:' .. pipeline_id, tonumber(ARGV[4]), task.id)
+  end
+end
+redis.call('LPUSH', KEYS[2], ARGV[5])
+return tostring(newState)
+`
+
+var requeueTask = redis.NewScript(requeueTaskScript)
+
 // buildUpdateJSON serializes only the fields that the TaskUpdate actually sets
 // so the Lua script performs a partial merge rather than overwriting the whole
 // task. This matches the per-field dispatch the previous GET→modify→SET code
@@ -299,6 +359,51 @@ func buildUpdateJSON(update broker.TaskUpdate) ([]byte, error) {
 		m["cross_stage_transitions"] = *update.CrossStageTransitions
 	}
 	return json.Marshal(m)
+}
+
+// RequeueTask atomically applies update to the task and LPUSHes it
+// onto stageID's queue list via a single Lua script. This is the
+// Redis counterpart of the broker's old `UpdateTask + EnqueueTask`
+// pair — now all-or-nothing.
+//
+// Returns ErrTaskNotFound if the task key does not exist.
+func (r *RedisStore) RequeueTask(ctx context.Context, taskID, stageID string, update broker.TaskUpdate) error {
+	// Make sure the requeued row lands on stageID with state
+	// PENDING so it is immediately dequeueable from the new stage's
+	// queue (the LPUSH below puts the ID on the queue; the task row
+	// state must match for dequeue to accept it).
+	if update.StageID == nil {
+		update.StageID = &stageID
+	}
+	if update.State == nil {
+		pending := broker.TaskStatePending
+		update.State = &pending
+	}
+	updateJSON, err := buildUpdateJSON(update)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	score := float64(now.UnixNano()) / 1e9
+	scoreStr := fmt.Sprintf("%f", score)
+
+	_, err = requeueTask.Run(ctx, r.client,
+		[]string{r.taskKey(taskID), r.queueKey(stageID)},
+		string(updateJSON),
+		nowStr,
+		r.stateIndexPrefix(),
+		scoreStr,
+		taskID,
+	).Result()
+	if err != nil {
+		if strings.Contains(err.Error(), "TASK_NOT_FOUND") {
+			return store.ErrTaskNotFound
+		}
+		return fmt.Errorf("redis: requeue task: %w", err)
+	}
+	return nil
 }
 
 func (r *RedisStore) UpdateTask(ctx context.Context, taskID string, update broker.TaskUpdate) error {

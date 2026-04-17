@@ -262,6 +262,12 @@ func (f *failingStore) EnqueueTask(_ context.Context, _ string, _ *broker.Task) 
 	}
 	return nil
 }
+func (f *failingStore) RequeueTask(_ context.Context, _ string, _ string, _ broker.TaskUpdate) error {
+	if f.failEnqueue {
+		return errors.New(internalLeakMarker + " requeue exploded")
+	}
+	return nil
+}
 func (f *failingStore) DequeueTask(_ context.Context, _ string) (*broker.Task, error) {
 	return nil, broker.ErrQueueEmpty
 }

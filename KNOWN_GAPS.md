@@ -24,6 +24,32 @@ broker's outer envelope applies. Raw step output is still stored on task
 metadata for operator inspection. Adversarial regression tests live in
 `internal/chain/adapter_test.go`.
 
+### SEC-016: (Resolved) Broker swallowed store persistence errors + Postgres requeue duplicate-key
+**Location:** `internal/broker/broker.go`, `internal/store/postgres/postgres.go`
+**Severity:** High (resolved)
+**Description:** Broker state-transition helpers (`retryTask`,
+`routeSuccess`, `failTask`, `transition`, `mergeMetadata`) ignored
+store-write errors with `_ = b.store.*`, then emitted terminal
+events, incremented success metrics, and mutated in-memory task
+state regardless. A task could be reported `DONE` or re-routed while
+the durable record lagged or was never updated at all.
+
+Compounding this: the Postgres `EnqueueTask` was a plain `INSERT`,
+but the broker called `EnqueueTask` for stage-to-stage routing and
+retry of *existing* task IDs — deterministically producing
+duplicate-key violations that the above error-swallowing then hid.
+
+**Resolution:** Split the store contract: `EnqueueTask` keeps
+insert-only semantics for net-new tasks; new `RequeueTask(ctx,
+taskID, stageID, update)` atomically applies the field update and
+places the task back onto the destination stage's queue (Memory:
+single-mutex update + append; Redis: one Lua script; Postgres:
+single `UPDATE`). Broker state-transition helpers now return on
+store errors, log at error level, and increment the new
+`overlord_broker_store_errors_total{operation, pipeline_id,
+stage_id}` counter rather than silently continuing. Terminal
+events and success metrics only fire after persistence succeeds.
+
 ### SEC-010: Envelope delimiters are predictable
 **Location:** `internal/sanitize/envelope.go`
 **Severity:** Medium
@@ -356,6 +382,7 @@ without a total count.
 |---|-------|----------|--------|
 | SEC-010 | Predictable envelope delimiters | Medium | Open |
 | SEC-015 | Chain-adapter envelope bypass via placeholder substitution | High | Resolved |
+| SEC-016 | Broker swallowed store errors + Postgres requeue duplicate-key | High | Resolved |
 | SEC-012 | Redis UpdateTask not atomic | Medium | Resolved |
 | SEC-013 | Unbounded WebSocket client count | Low | Open |
 | SEC-014 | Token bucket cleanup goroutine leak | Low | Open |

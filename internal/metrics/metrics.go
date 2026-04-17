@@ -20,6 +20,14 @@ type Metrics struct {
 	SanitizerRedactions  *prometheus.CounterVec
 	QueueDepth           *prometheus.GaugeVec
 
+	// Broker-side persistence failures. Incremented when the
+	// broker's fail-closed state-transition helpers see a store
+	// error that would otherwise have been silently swallowed.
+	// operation carries the store method name ("update_task",
+	// "requeue_task", "merge_metadata") so operators can
+	// distinguish routing failures from metadata-only failures.
+	BrokerStoreErrorsTotal *prometheus.CounterVec
+
 	// Retry budget metrics.
 	RetryBudgetExhaustionsTotal *prometheus.CounterVec
 
@@ -91,6 +99,11 @@ func New() *Metrics {
 			Name: "overlord_fanout_require_policy_failures_total",
 			Help: "Fan-out executions where require policy was not met.",
 		}, []string{"pipeline_id", "stage_id", "require_policy"}),
+
+		BrokerStoreErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "overlord_broker_store_errors_total",
+			Help: "Store operations that failed inside broker state-transition helpers.",
+		}, []string{"pipeline_id", "stage_id", "operation"}),
 	}
 
 	reg.MustRegister(
@@ -105,6 +118,7 @@ func New() *Metrics {
 		m.RetryBudgetExhaustionsTotal,
 		m.FanOutAgentResults,
 		m.FanOutRequirePolicyFailures,
+		m.BrokerStoreErrorsTotal,
 	)
 
 	return m

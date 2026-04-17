@@ -259,6 +259,13 @@ type Agent interface {
 // All stores implement this
 type Store interface {
     EnqueueTask(ctx context.Context, stageID string, task *Task) error
+    // RequeueTask is the atomic "advance existing task to new stage"
+    // op used by broker routing/retry paths. Do not substitute
+    // UpdateTask + EnqueueTask — the split was introduced to make
+    // persistence failures fail-closed (see SEC-016 in
+    // KNOWN_GAPS.md). Every backend guarantees the update and queue
+    // placement happen as one operation.
+    RequeueTask(ctx context.Context, taskID, stageID string, update TaskUpdate) error
     DequeueTask(ctx context.Context, stageID string) (*Task, error)
     UpdateTask(ctx context.Context, taskID string, update TaskUpdate) error
     GetTask(ctx context.Context, taskID string) (*Task, error)

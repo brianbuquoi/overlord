@@ -32,6 +32,7 @@ type Store struct {
 	mem *memory.MemoryStore
 
 	OnEnqueueTask         func(ctx context.Context, stageID string, task *broker.Task) error
+	OnRequeueTask         func(ctx context.Context, taskID, stageID string, update broker.TaskUpdate) error
 	OnDequeueTask         func(ctx context.Context, stageID string) (*broker.Task, error)
 	OnUpdateTask          func(ctx context.Context, taskID string, update broker.TaskUpdate) error
 	OnGetTask             func(ctx context.Context, taskID string) (*broker.Task, error)
@@ -104,6 +105,16 @@ func (s *Store) EnqueueTask(ctx context.Context, stageID string, task *broker.Ta
 		return h(ctx, stageID, task)
 	}
 	return s.mem.EnqueueTask(ctx, stageID, task)
+}
+
+func (s *Store) RequeueTask(ctx context.Context, taskID, stageID string, update broker.TaskUpdate) error {
+	s.mu.RLock()
+	h := s.OnRequeueTask
+	s.mu.RUnlock()
+	if h != nil {
+		return h(ctx, taskID, stageID, update)
+	}
+	return s.mem.RequeueTask(ctx, taskID, stageID, update)
 }
 
 func (s *Store) DequeueTask(ctx context.Context, stageID string) (*broker.Task, error) {

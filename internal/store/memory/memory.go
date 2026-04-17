@@ -59,37 +59,15 @@ func (m *MemoryStore) EnqueueTask(_ context.Context, stageID string, task *broke
 	return nil
 }
 
-func (m *MemoryStore) DequeueTask(_ context.Context, stageID string) (*broker.Task, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := time.Now()
-	q := m.queues[stageID]
-
-	for len(q) > 0 {
-		id := q[0]
-		q = q[1:]
-
-		task, ok := m.tasks[id]
-		if !ok {
-			continue
-		}
-
-		// Skip expired tasks.
-		if !task.ExpiresAt.IsZero() && now.After(task.ExpiresAt) {
-			delete(m.tasks, id)
-			continue
-		}
-
-		m.queues[stageID] = q
-		return copyTask(task), nil
-	}
-
-	m.queues[stageID] = q
-	return nil, store.ErrQueueEmpty
-}
-
-func (m *MemoryStore) UpdateTask(_ context.Context, taskID string, update broker.TaskUpdate) error {
+// RequeueTask applies update to an existing task and appends its
+// ID to stageID's queue. The update and queue placement happen
+// under a single mutex acquisition, so concurrent dequeues see
+// either the pre-update state (task still on its old queue/stage)
+// or the post-requeue state (task on the new stage queue with the
+// update applied) — never a torn view.
+//
+// Returns ErrTaskNotFound if the task row does not exist.
+func (m *MemoryStore) RequeueTask(_ context.Context, taskID, stageID string, update broker.TaskUpdate) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -98,6 +76,16 @@ func (m *MemoryStore) UpdateTask(_ context.Context, taskID string, update broker
 		return store.ErrTaskNotFound
 	}
 
+	applyTaskUpdate(task, update)
+	task.UpdatedAt = time.Now()
+	m.queues[stageID] = append(m.queues[stageID], taskID)
+	return nil
+}
+
+// applyTaskUpdate merges the non-nil fields of a TaskUpdate into an
+// existing task. Shared between UpdateTask and RequeueTask so field
+// merge semantics stay in one place.
+func applyTaskUpdate(task *broker.Task, update broker.TaskUpdate) {
 	if update.State != nil {
 		task.State = *update.State
 	}
@@ -139,6 +127,47 @@ func (m *MemoryStore) UpdateTask(_ context.Context, taskID string, update broker
 	if update.CrossStageTransitions != nil {
 		task.CrossStageTransitions = *update.CrossStageTransitions
 	}
+}
+
+func (m *MemoryStore) DequeueTask(_ context.Context, stageID string) (*broker.Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	q := m.queues[stageID]
+
+	for len(q) > 0 {
+		id := q[0]
+		q = q[1:]
+
+		task, ok := m.tasks[id]
+		if !ok {
+			continue
+		}
+
+		// Skip expired tasks.
+		if !task.ExpiresAt.IsZero() && now.After(task.ExpiresAt) {
+			delete(m.tasks, id)
+			continue
+		}
+
+		m.queues[stageID] = q
+		return copyTask(task), nil
+	}
+
+	m.queues[stageID] = q
+	return nil, store.ErrQueueEmpty
+}
+
+func (m *MemoryStore) UpdateTask(_ context.Context, taskID string, update broker.TaskUpdate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	task, ok := m.tasks[taskID]
+	if !ok {
+		return store.ErrTaskNotFound
+	}
+	applyTaskUpdate(task, update)
 	task.UpdatedAt = time.Now()
 	return nil
 }

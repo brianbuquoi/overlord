@@ -650,7 +650,12 @@ func newBrokerWithStore(cfg *config.Config, st broker.Store, agents map[string]b
 	return broker.New(cfg, st, agents, reg, logger, nil, nil)
 }
 
-// failingStore wraps a MemoryStore and can fail EnqueueTask calls for a specific stage.
+// failingStore wraps a MemoryStore and can fail EnqueueTask /
+// RequeueTask calls for a specific stage. Since the broker uses
+// RequeueTask for stage-to-stage routing (and EnqueueTask only for
+// net-new submissions), "fail during routing" tests drive the
+// requeue path; the EnqueueTask knob is retained so tests of the
+// initial Submit path still work.
 type failingStore struct {
 	*memory.MemoryStore
 	mu               sync.Mutex
@@ -663,14 +668,24 @@ func (f *failingStore) setFailEnqueueStage(stage string) {
 	f.mu.Unlock()
 }
 
-func (f *failingStore) EnqueueTask(ctx context.Context, stageID string, task *broker.Task) error {
+func (f *failingStore) shouldFail(stage string) bool {
 	f.mu.Lock()
-	fail := f.failEnqueueStage != "" && f.failEnqueueStage == stageID
-	f.mu.Unlock()
-	if fail {
+	defer f.mu.Unlock()
+	return f.failEnqueueStage != "" && f.failEnqueueStage == stage
+}
+
+func (f *failingStore) EnqueueTask(ctx context.Context, stageID string, task *broker.Task) error {
+	if f.shouldFail(stageID) {
 		return errors.New("simulated store failure on enqueue")
 	}
 	return f.MemoryStore.EnqueueTask(ctx, stageID, task)
+}
+
+func (f *failingStore) RequeueTask(ctx context.Context, taskID, stageID string, update broker.TaskUpdate) error {
+	if f.shouldFail(stageID) {
+		return errors.New("simulated store failure on requeue")
+	}
+	return f.MemoryStore.RequeueTask(ctx, taskID, stageID, update)
 }
 
 func buildLoopbackEnv(t *testing.T) (

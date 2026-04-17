@@ -48,6 +48,13 @@ type RetryableError interface {
 type Store interface {
 	EnqueueTask(ctx context.Context, stageID string, task *Task) error
 	DequeueTask(ctx context.Context, stageID string) (*Task, error)
+	// RequeueTask atomically applies update to an existing task and
+	// places it back onto stageID's queue. Used by the broker for
+	// routing / retry / failure-path requeues where the task row
+	// already exists. See internal/store/store.go for the full
+	// contract (persistence and queue placement are one operation —
+	// success or error; never partial).
+	RequeueTask(ctx context.Context, taskID, stageID string, update TaskUpdate) error
 	UpdateTask(ctx context.Context, taskID string, update TaskUpdate) error
 	GetTask(ctx context.Context, taskID string) (*Task, error)
 	ListTasks(ctx context.Context, filter TaskFilter) (*ListTasksResult, error)
@@ -918,6 +925,10 @@ func (b *Broker) waitForBudget(ctx context.Context, pipelineID string, stage *co
 }
 
 // retryTask applies backoff with jitter and re-enqueues the task.
+// Persistence is fail-closed: a store error during the RETRYING
+// transition or the final requeue leaves the task visible in the
+// store for redelivery and increments broker_store_errors_total
+// instead of emitting a success event.
 func (b *Broker) retryTask(ctx context.Context, stage *config.Stage, task *Task) {
 	if b.metrics != nil {
 		b.metrics.TaskRetriesTotal.WithLabelValues(task.PipelineID, stage.ID).Inc()
@@ -925,12 +936,15 @@ func (b *Broker) retryTask(ctx context.Context, stage *config.Stage, task *Task)
 
 	delay := b.calculateBackoff(stage.Retry, task.Attempts-1)
 
-	state := TaskStateRetrying
+	retrying := TaskStateRetrying
 	attempts := task.Attempts
-	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
-		State:    &state,
+	if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{
+		State:    &retrying,
 		Attempts: &attempts,
-	})
+	}); err != nil {
+		b.recordStoreError("update_task", task.PipelineID, stage.ID, err)
+		return
+	}
 
 	b.logger.Info("backoff before retry",
 		"task_id", task.ID, "stage", stage.ID, "delay", delay,
@@ -938,9 +952,14 @@ func (b *Broker) retryTask(ctx context.Context, stage *config.Stage, task *Task)
 
 	b.sleepFn(ctx, delay)
 
-	state = TaskStatePending
-	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state})
-	_ = b.store.EnqueueTask(ctx, stage.ID, task)
+	pending := TaskStatePending
+	if err := b.store.RequeueTask(ctx, task.ID, stage.ID, TaskUpdate{
+		State:    &pending,
+		Attempts: &attempts,
+	}); err != nil {
+		b.recordStoreError("requeue_task", task.PipelineID, stage.ID, err)
+		return
+	}
 	if b.metrics != nil {
 		b.metrics.QueueDepth.WithLabelValues(task.PipelineID, stage.ID).Inc()
 	}
@@ -992,6 +1011,12 @@ func (b *Broker) maxStageTransitions(pipelineID string) int {
 
 // checkTransitionLimit increments CrossStageTransitions and dead-letters the
 // task if the limit is exceeded. Returns true if the task was dead-lettered.
+// Terminal event + dead-letter metric are only emitted after the store
+// UpdateTask succeeds — a persistence failure returns true (treat as
+// dead-lettered from the caller's perspective — the caller's own routing
+// path must not proceed) but does not publish the event, so downstream
+// WebSocket / metric consumers only see terminal state when the durable
+// record matches.
 func (b *Broker) checkTransitionLimit(ctx context.Context, pipelineID string, stage *config.Stage, task *Task) bool {
 	task.CrossStageTransitions++
 	limit := b.maxStageTransitions(pipelineID)
@@ -1004,11 +1029,14 @@ func (b *Broker) checkTransitionLimit(ctx context.Context, pipelineID string, st
 		state := TaskStateFailed
 		deadLetter := true
 		transitions := task.CrossStageTransitions
-		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
+		if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{
 			State:                 &state,
 			RoutedToDeadLetter:    &deadLetter,
 			CrossStageTransitions: &transitions,
-		})
+		}); err != nil {
+			b.recordStoreError("update_task", pipelineID, stage.ID, err)
+			return true
+		}
 		b.logger.Warn("task exceeded max stage transitions",
 			"task_id", task.ID, "pipeline", pipelineID,
 			"transitions", task.CrossStageTransitions-1, "limit", limit,
@@ -1032,6 +1060,11 @@ func (b *Broker) checkTransitionLimit(ctx context.Context, pipelineID string, st
 }
 
 // routeSuccess sends the task to the next stage or marks it done.
+// Persistence is fail-closed throughout: the broker does not publish
+// terminal events or record success metrics until the store write
+// succeeds. On store error the broker increments
+// broker_store_errors_total, logs, and returns — the task stays
+// visible for redelivery.
 func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *config.Stage, task *Task, outputPayload json.RawMessage) {
 	next, err := routing.Resolve(stage.OnSuccess.RouteConfig, outputPayload)
 	if err != nil {
@@ -1044,10 +1077,13 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 	if next == "done" || next == "" {
 		from := task.State
 		state := TaskStateDone
-		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
+		if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{
 			State:   &state,
 			Payload: &outputPayload,
-		})
+		}); err != nil {
+			b.recordStoreError("update_task", pipelineID, stage.ID, err)
+			return
+		}
 		b.logger.Info("task completed",
 			"task_id", task.ID, "pipeline", pipelineID, "stage", stage.ID,
 		)
@@ -1075,7 +1111,9 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 	if !ok {
 		b.logger.Error("next stage not found", "task_id", task.ID, "next_stage", next)
 		state := TaskStateFailed
-		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state})
+		if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state}); err != nil {
+			b.recordStoreError("update_task", pipelineID, stage.ID, err)
+		}
 		return
 	}
 
@@ -1114,12 +1152,16 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 		return
 	}
 
-	// Update task for the next stage.
+	// Atomically advance the task onto the next stage: the update +
+	// queue placement is one store operation per backend. On
+	// persistence failure the in-memory task struct is NOT mutated so
+	// redelivery picks up the pre-routing state and the downstream
+	// stage never sees a partially-transitioned task.
 	state := TaskStatePending
 	attempts := 0
 	maxAttempts := nextStage.Retry.MaxAttempts
 	transitions := task.CrossStageTransitions
-	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
+	if err := b.store.RequeueTask(ctx, task.ID, next, TaskUpdate{
 		State:                 &state,
 		StageID:               &next,
 		Payload:               &outputPayload,
@@ -1130,7 +1172,10 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 		OutputSchemaVersion:   &nextStage.OutputSchema.Version,
 		MaxAttempts:           &maxAttempts,
 		CrossStageTransitions: &transitions,
-	})
+	}); err != nil {
+		b.recordStoreError("requeue_task", pipelineID, next, err)
+		return
+	}
 
 	task.StageID = next
 	task.Payload = outputPayload
@@ -1142,7 +1187,6 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 	task.OutputSchemaVersion = nextStage.OutputSchema.Version
 	task.MaxAttempts = nextStage.Retry.MaxAttempts
 
-	_ = b.store.EnqueueTask(ctx, next, task)
 	if b.metrics != nil {
 		b.metrics.QueueDepth.WithLabelValues(pipelineID, next).Inc()
 	}
@@ -1153,6 +1197,11 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 }
 
 // failTask routes a task to the failure path or marks it failed.
+// Persistence is fail-closed: dead-letter metrics and terminal
+// events fire only after the durable state change succeeds. On
+// store error the task stays in its pre-failure state in the store;
+// broker_store_errors_total is incremented so operators see the
+// divergence without the dead-letter counter silently ticking up.
 func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.Stage, task *Task, reason string) {
 	b.mergeMetadata(ctx, task, map[string]any{"failure_reason": reason})
 
@@ -1161,7 +1210,10 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 		from := task.State
 		state := TaskStateFailed
 		deadLetter := true
-		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state, RoutedToDeadLetter: &deadLetter})
+		if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state, RoutedToDeadLetter: &deadLetter}); err != nil {
+			b.recordStoreError("update_task", pipelineID, stage.ID, err)
+			return
+		}
 		b.logger.Warn("task failed",
 			"task_id", task.ID, "stage", stage.ID, "reason", reason,
 		)
@@ -1192,7 +1244,10 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 	b.mu.RUnlock()
 	if !ok {
 		state := TaskStateFailed
-		_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state})
+		if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state}); err != nil {
+			b.recordStoreError("update_task", pipelineID, stage.ID, err)
+			return
+		}
 		b.logger.Error("failure stage not found",
 			"task_id", task.ID, "stage", stage.ID, "target", next,
 		)
@@ -1204,7 +1259,7 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 	attempts := 0
 	maxAttempts := nextStage.Retry.MaxAttempts
 	transitions := task.CrossStageTransitions
-	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{
+	if err := b.store.RequeueTask(ctx, task.ID, next, TaskUpdate{
 		State:                 &state,
 		StageID:               &next,
 		Attempts:              &attempts,
@@ -1214,7 +1269,10 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 		OutputSchemaVersion:   &nextStage.OutputSchema.Version,
 		MaxAttempts:           &maxAttempts,
 		CrossStageTransitions: &transitions,
-	})
+	}); err != nil {
+		b.recordStoreError("requeue_task", pipelineID, next, err)
+		return
+	}
 
 	task.StageID = next
 	task.State = TaskStatePending
@@ -1225,7 +1283,6 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 	task.OutputSchemaVersion = nextStage.OutputSchema.Version
 	task.MaxAttempts = nextStage.Retry.MaxAttempts
 
-	_ = b.store.EnqueueTask(ctx, next, task)
 	if b.metrics != nil {
 		b.metrics.QueueDepth.WithLabelValues(pipelineID, next).Inc()
 	}
@@ -1236,10 +1293,17 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 }
 
 // transition atomically updates the task state in the store and emits an event.
+// The in-memory task.State mutation is kept on store success; on
+// store error the transition is rolled back in memory and the event
+// is not published, so downstream consumers never see a state the
+// durable record disagrees with.
 func (b *Broker) transition(ctx context.Context, task *Task, state TaskState) {
 	from := task.State
+	if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state}); err != nil {
+		b.recordStoreError("update_task", task.PipelineID, task.StageID, err)
+		return
+	}
 	task.State = state
-	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state})
 	b.logger.Debug("state transition",
 		"task_id", task.ID, "state", state,
 	)
@@ -1252,6 +1316,25 @@ func (b *Broker) transition(ctx context.Context, task *Task, state TaskState) {
 		To:         state,
 		Timestamp:  time.Now(),
 	})
+}
+
+// recordStoreError is the single place broker state-transition
+// helpers route a store-write failure. Logs at error level with
+// enough context to identify the stage and operation; increments
+// broker_store_errors_total so failures are observable even when
+// tests or operators don't tail logs. Callers should return
+// immediately after recording so they do not emit success events or
+// mutate in-memory task state.
+func (b *Broker) recordStoreError(operation, pipelineID, stageID string, err error) {
+	b.logger.Error("broker store operation failed",
+		"operation", operation,
+		"pipeline_id", pipelineID,
+		"stage_id", stageID,
+		"error", err,
+	)
+	if b.metrics != nil {
+		b.metrics.BrokerStoreErrorsTotal.WithLabelValues(pipelineID, stageID, operation).Inc()
+	}
 }
 
 // reservedMetadataKeys are metadata keys set by the broker that agents must
@@ -1309,7 +1392,13 @@ func (b *Broker) recordTerminalMetrics(task *Task, pipelineID, stageID, finalSta
 	b.mu.Unlock()
 }
 
-// mergeMetadata updates task metadata both in-memory and in the store.
+// mergeMetadata updates task metadata both in-memory and in the
+// store. Metadata writes are not routing-critical — callers still
+// make progress on the task if the store drops the update — but a
+// failure is surfaced via broker_store_errors_total so operators can
+// tell when observability metadata (failure_reason, sanitizer
+// warnings, stage history) silently stops flowing to the durable
+// record.
 func (b *Broker) mergeMetadata(ctx context.Context, task *Task, meta map[string]any) {
 	if task.Metadata == nil {
 		task.Metadata = make(map[string]any)
@@ -1317,5 +1406,7 @@ func (b *Broker) mergeMetadata(ctx context.Context, task *Task, meta map[string]
 	for k, v := range meta {
 		task.Metadata[k] = v
 	}
-	_ = b.store.UpdateTask(ctx, task.ID, TaskUpdate{Metadata: meta})
+	if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{Metadata: meta}); err != nil {
+		b.recordStoreError("merge_metadata", task.PipelineID, task.StageID, err)
+	}
 }

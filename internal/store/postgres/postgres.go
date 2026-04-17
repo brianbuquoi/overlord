@@ -129,6 +129,31 @@ func (p *PostgresStore) DequeueTask(ctx context.Context, stageID string) (*broke
 	}
 }
 
+// RequeueTask atomically applies update to an existing task and
+// makes it dequeueable on stageID's queue. Postgres's "queue" is
+// the set of rows where stage_id = X AND state = PENDING, so the
+// queue placement is the same UPDATE as the field merge — there is
+// no separate LPUSH. The caller's update is augmented with stage_id
+// = stageID and state = PENDING (when not already set) so the
+// post-update row is guaranteed to be visible to the dequeue
+// selector.
+//
+// Returns ErrTaskNotFound if the task row does not exist.
+func (p *PostgresStore) RequeueTask(ctx context.Context, taskID, stageID string, update broker.TaskUpdate) error {
+	// Make sure the resulting row lands in the dequeue set for
+	// stageID. Callers (the broker) normally pass both fields
+	// explicitly; falling through here is belt-and-suspenders so a
+	// mistyped call site does not silently corrupt routing.
+	if update.StageID == nil {
+		update.StageID = &stageID
+	}
+	if update.State == nil {
+		pending := broker.TaskStatePending
+		update.State = &pending
+	}
+	return p.UpdateTask(ctx, taskID, update)
+}
+
 func (p *PostgresStore) UpdateTask(ctx context.Context, taskID string, update broker.TaskUpdate) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
