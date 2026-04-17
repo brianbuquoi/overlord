@@ -12,6 +12,63 @@ import (
 	"github.com/brianbuquoi/overlord/internal/store"
 )
 
+// jsonEqual compares two JSON payloads semantically. Postgres JSONB
+// reorders keys and normalizes whitespace on round-trip, so byte-for-
+// byte equality against the originally-submitted bytes produces
+// false negatives. All store conformance tests that compare payload
+// identity after a round trip must use this helper instead of
+// string() equality — the audit flagged raw JSON comparison as a
+// source of flaky integration failures that looked like store bugs
+// but were really JSON normalization.
+func jsonEqual(a, b []byte) bool {
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false
+	}
+	// reflect.DeepEqual handles nested maps and slices uniformly
+	// after unmarshal into any.
+	return deepEqualJSON(av, bv)
+}
+
+// deepEqualJSON walks parallel structures unmarshalled from JSON and
+// returns true when they are semantically equal. It does not use
+// reflect.DeepEqual directly because json.Number handling and
+// interface nil-ness would need special casing that a small hand
+// walk makes easier to read. Scalars are compared with ==, maps are
+// compared key-by-key, and slices are compared in order.
+func deepEqualJSON(a, b any) bool {
+	switch av := a.(type) {
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for k, v := range av {
+			w, ok := bv[k]
+			if !ok || !deepEqualJSON(v, w) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !deepEqualJSON(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return a == b
+	}
+}
+
 func newTask(pipelineID, stageID string) *broker.Task {
 	return &broker.Task{
 		ID:                  uuid.New().String(),
@@ -213,7 +270,7 @@ func RunConformanceTests(t *testing.T, factory func() store.Store) {
 			if err != nil {
 				t.Fatalf("get after overwrite: %v", err)
 			}
-			if string(got.Payload) != `{"key":"updated"}` {
+			if !jsonEqual(got.Payload, []byte(`{"key":"updated"}`)) {
 				t.Errorf("payload not updated: %s", string(got.Payload))
 			}
 		}
@@ -620,8 +677,8 @@ func RunConformanceTests(t *testing.T, factory func() store.Store) {
 		if got.StageID != newStage {
 			t.Errorf("StageID: got %s, want %s", got.StageID, newStage)
 		}
-		if string(got.Payload) != string(newPayload) {
-			t.Errorf("Payload: got %s, want %s", got.Payload, newPayload)
+		if !jsonEqual(got.Payload, newPayload) {
+			t.Errorf("Payload: got %s, want %s (semantic JSON comparison)", got.Payload, newPayload)
 		}
 		if got.Attempts != newAttempts {
 			t.Errorf("Attempts: got %d, want %d", got.Attempts, newAttempts)
@@ -696,8 +753,8 @@ func RunConformanceTests(t *testing.T, factory func() store.Store) {
 		if got.OutputSchemaVersion != orig.OutputSchemaVersion {
 			t.Errorf("OutputSchemaVersion: got %s, want %s", got.OutputSchemaVersion, orig.OutputSchemaVersion)
 		}
-		if string(got.Payload) != string(orig.Payload) {
-			t.Errorf("Payload: got %s, want %s", got.Payload, orig.Payload)
+		if !jsonEqual(got.Payload, orig.Payload) {
+			t.Errorf("Payload: got %s, want %s (semantic JSON comparison)", got.Payload, orig.Payload)
 		}
 		if got.MaxAttempts != orig.MaxAttempts {
 			t.Errorf("MaxAttempts: got %d, want %d", got.MaxAttempts, orig.MaxAttempts)
