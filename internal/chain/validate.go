@@ -221,8 +221,9 @@ func splitModel(s string) (provider, model string, bare bool, err error) {
 // validateInlineOutputSchema ensures a user-authored output.schema
 // round-trips to valid JSON and compiles as a JSONSchema. The chain
 // compiler will compile the same schema bytes into the runtime
-// registry, so failing fast here surfaces authoring errors at
-// `chain validate` / `chain run` time rather than mid-broker.
+// registry, so failing fast here surfaces authoring errors at load
+// time — any caller that goes through chain.Load (chain run, chain
+// inspect, chain export) sees the error before the broker starts.
 func validateInlineOutputSchema(schema map[string]any) error {
 	if len(schema) == 0 {
 		return nil

@@ -168,8 +168,9 @@ Rules:
   with `type: text` (or no type) is a validation error.
 - The schema is any valid JSONSchema fragment — whatever you write is
   serialized to JSON and compiled by the same JSONSchema compiler
-  pipeline mode uses. Invalid schemas are rejected at `chain run`
-  (and `chain validate`) time, not mid-broker.
+  pipeline mode uses. Invalid schemas are rejected at load time —
+  `chain run`, `chain inspect`, and `chain export` all surface the
+  error before the broker starts, never mid-run.
 - The schema is synthesized under the reserved name `chain_json@v1`.
   `chain export` writes it to `schemas/chain_json_v1.json`, so
   graduation preserves the validation rules.
