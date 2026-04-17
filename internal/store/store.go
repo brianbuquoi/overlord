@@ -34,6 +34,11 @@ var (
 	// HTTP API can preserve its ALREADY_DISCARDED response code and a
 	// genuine retry can be distinguished from a lost-race state mismatch.
 	ErrTaskAlreadyDiscarded = errors.New("task is already discarded")
+	// ErrTaskAlreadyTerminal is returned by CancelTask when the task exists
+	// but is already in a terminal state (DONE / FAILED / DISCARDED /
+	// REPLAYED). This protects the SEC2-003 race: the prior read-check-write
+	// cancel shape could clobber a concurrent completion.
+	ErrTaskAlreadyTerminal = errors.New("task is already in a terminal state")
 )
 
 // Store is the interface for task persistence and queuing.
@@ -96,4 +101,18 @@ type Store interface {
 	// (including REPLAY_PENDING, REPLAYED, DONE, or a non-dead-lettered
 	// FAILED).
 	DiscardDeadLetter(ctx context.Context, taskID string) error
+
+	// CancelTask atomically transitions a non-terminal task to FAILED with a
+	// "cancelled by operator" failure_reason. The state check and the write
+	// are one operation so a concurrent completion cannot be overwritten by
+	// a late cancel (SEC2-003).
+	//
+	// Returns the task's pre-cancel snapshot so callers can surface context
+	// (for example, warning that a task caught in EXECUTING may still finish
+	// the current stage even though further routing is stopped).
+	//
+	// Returns ErrTaskNotFound if the task does not exist.
+	// Returns ErrTaskAlreadyTerminal if the task is already terminal
+	// (DONE / FAILED / DISCARDED / REPLAYED).
+	CancelTask(ctx context.Context, taskID string) (*broker.Task, error)
 }

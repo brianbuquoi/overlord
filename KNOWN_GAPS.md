@@ -154,13 +154,25 @@ clients see a clear signal rather than a hung socket.
 in production but leaks in tests.
 **Recommendation:** Accept a context parameter and stop on cancellation.
 
-### SEC2-003: cancel command TOCTOU race
-**Location:** `cmd/overlord/main.go` — `cancelTask()`
+### SEC2-003: cancel command TOCTOU race — RESOLVED
+**Location:** `internal/store/{memory,postgres,redis}` — `CancelTask`; `cmd/overlord/main.go` — `cancelTask`
 **Severity:** Medium
-**Description:** `cancelTask()` performs a read-then-write. Between GetTask and
-UpdateTask, the broker can complete the task, and cancel will overwrite the DONE state.
-**Recommendation:** Add `CancelTask` to the Store interface with atomic
-`UPDATE WHERE state NOT IN ('DONE', 'FAILED')`.
+**Status:** Resolved
+**Description:** `cancelTask` previously performed a read-then-write. Between
+`GetTask` and `UpdateTask`, the broker could complete the task and the cancel
+would overwrite the terminal state.
+**Resolution:** Added `Store.CancelTask(ctx, taskID) (*Task, error)` as an
+atomic CAS across memory (single-mutex), Postgres (CTE-backed conditional
+UPDATE refusing terminal states), and Redis (Lua script). The pre-cancel
+task snapshot is returned so the CLI can preserve its "Note: task was
+EXECUTING" warning. `ErrTaskAlreadyTerminal` sentinel surfaces when the
+task has already reached DONE / FAILED / DISCARDED / REPLAYED.
+Regression coverage:
+- `TestMemoryStoreConformance/CancelTask_*` runs against every backend
+- `TestCancelTask_ConcurrentExactlyOneWins` pins exactly-one-winner
+  semantics under concurrent callers
+- `TestCancelTask_AlreadyTerminalRejected` confirms the stored state is
+  not overwritten when the CAS rejects.
 
 ### SEC2-005: Migration lacks concurrency protection against live broker
 **Location:** `cmd/overlord/main.go` — `runMigration()`
@@ -435,7 +447,7 @@ without a total count.
 | SEC-014 | Token bucket cleanup goroutine leak | Low | Open |
 | SEC-015 | No DisallowUnknownFields | Informational | Accepted |
 | SEC-016 | Path param validation adequate | Informational | Confirmed |
-| SEC2-003 | cancel command TOCTOU race | Medium | Open |
+| SEC2-003 | cancel command TOCTOU race | Medium | Resolved |
 | SEC2-005 | Migration lacks live broker guard | Medium | Open |
 | SEC2-NEW-002 | Metrics endpoint on shared port | Informational | Informational |
 | SEC3-001 | RecordSuccess resets brute force window | Medium | Resolved |

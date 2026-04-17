@@ -570,6 +570,57 @@ return 'OK'
 
 var discardDeadLetter = redis.NewScript(discardDeadLetterScript)
 
+// cancelTaskScript atomically transitions a non-terminal task to FAILED
+// with a "cancelled by operator" failure_reason, updating the per-state
+// index server-side. The state check and the write are one Lua call so
+// a concurrent completer cannot be clobbered by a late cancel (SEC2-003).
+//
+//	KEYS[1] = task key
+//	ARGV[1] = updated_at timestamp (RFC3339Nano string)
+//	ARGV[2] = state index key prefix
+//	ARGV[3] = score for state index ZADD
+//
+// Returns: the JSON of the task as it stood BEFORE the cancel on success
+// so the caller can surface pre-cancel context, or
+// "TASK_NOT_FOUND" / "ALREADY_TERMINAL" on the failure paths.
+const cancelTaskScript = `
+local data = redis.call('GET', KEYS[1])
+if not data then
+  return 'TASK_NOT_FOUND'
+end
+local task = cjson.decode(data)
+local st = task.state
+if st == 'DONE' or st == 'FAILED' or st == 'DISCARDED' or st == 'REPLAYED' then
+  return 'ALREADY_TERMINAL'
+end
+-- snapshot the pre-cancel task so the caller can return it verbatim.
+local snapshot = data
+local prev_state = task.state
+task.state = 'FAILED'
+if type(task.metadata) ~= 'table' then
+  task.metadata = {}
+end
+task.metadata['failure_reason'] = 'cancelled by operator'
+task.updated_at = ARGV[1]
+local newData = cjson.encode(task)
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl and tonumber(pttl) and tonumber(pttl) > 0 then
+  redis.call('SET', KEYS[1], newData, 'PX', tonumber(pttl))
+else
+  redis.call('SET', KEYS[1], newData)
+end
+redis.call('ZREM', ARGV[2] .. prev_state, task.id)
+redis.call('ZADD', ARGV[2] .. 'FAILED', tonumber(ARGV[3]), task.id)
+local pipeline_id = task.pipeline_id
+if pipeline_id and pipeline_id ~= '' then
+  redis.call('ZREM', ARGV[2] .. prev_state .. ':pipeline:' .. pipeline_id, task.id)
+  redis.call('ZADD', ARGV[2] .. 'FAILED:pipeline:' .. pipeline_id, tonumber(ARGV[3]), task.id)
+end
+return snapshot
+`
+
+var cancelTask = redis.NewScript(cancelTaskScript)
+
 // ClaimForReplay atomically transitions a FAILED+dead-lettered task to
 // REPLAY_PENDING and clears RoutedToDeadLetter. The state transition is the
 // claim token so concurrent callers each get ErrTaskNotReplayable after the
@@ -606,6 +657,42 @@ func (r *RedisStore) ClaimForReplay(ctx context.Context, taskID string) (*broker
 		return nil, fmt.Errorf("redis: claim for replay: unmarshal: %w", err)
 	}
 	return &task, nil
+}
+
+// CancelTask atomically transitions a non-terminal task to FAILED with
+// a "cancelled by operator" failure_reason via the Lua script above, so
+// a concurrent completer cannot be clobbered by a late cancel (SEC2-003).
+// Returns the pre-cancel task snapshot on success.
+func (r *RedisStore) CancelTask(ctx context.Context, taskID string) (*broker.Task, error) {
+	now := time.Now()
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	score := float64(now.UnixNano()) / 1e9
+	scoreStr := fmt.Sprintf("%f", score)
+
+	res, err := cancelTask.Run(ctx, r.client,
+		[]string{r.taskKey(taskID)},
+		nowStr,
+		r.stateIndexPrefix(),
+		scoreStr,
+	).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis: cancel task: %w", err)
+	}
+	s, ok := res.(string)
+	if !ok {
+		return nil, fmt.Errorf("redis: cancel task: unexpected reply type %T", res)
+	}
+	switch s {
+	case "TASK_NOT_FOUND":
+		return nil, store.ErrTaskNotFound
+	case "ALREADY_TERMINAL":
+		return nil, store.ErrTaskAlreadyTerminal
+	}
+	var snapshot broker.Task
+	if err := json.Unmarshal([]byte(s), &snapshot); err != nil {
+		return nil, fmt.Errorf("redis: cancel task: unmarshal snapshot: %w", err)
+	}
+	return &snapshot, nil
 }
 
 // DiscardDeadLetter atomically transitions a FAILED+dead-lettered task to

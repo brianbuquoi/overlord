@@ -698,6 +698,83 @@ func RunConformanceTests(t *testing.T, factory func() store.Store) {
 		}
 	})
 
+	// SEC2-003: CancelTask is an atomic CAS that refuses to act on a
+	// task already in a terminal state so a concurrent completer cannot
+	// be clobbered.
+
+	t.Run("CancelTask_HappyPath", func(t *testing.T) {
+		t.Parallel()
+		s := factory()
+		ctx := context.Background()
+		task := newTask("p", "stage-cancel-happy-"+uuid.New().String())
+		if err := s.EnqueueTask(ctx, task.StageID, task); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		snapshot, err := s.CancelTask(ctx, task.ID)
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+		if snapshot.State != broker.TaskStatePending {
+			t.Errorf("snapshot state: got %s want PENDING", snapshot.State)
+		}
+		got, err := s.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != broker.TaskStateFailed {
+			t.Errorf("state: got %s want FAILED", got.State)
+		}
+		if got.Metadata["failure_reason"] != "cancelled by operator" {
+			t.Errorf("metadata: got %v want 'cancelled by operator'", got.Metadata["failure_reason"])
+		}
+	})
+
+	t.Run("CancelTask_NotFound", func(t *testing.T) {
+		t.Parallel()
+		s := factory()
+		_, err := s.CancelTask(context.Background(), "nonexistent-"+uuid.New().String())
+		if err != store.ErrTaskNotFound {
+			t.Errorf("got %v, want ErrTaskNotFound", err)
+		}
+	})
+
+	t.Run("CancelTask_AlreadyTerminalRejected", func(t *testing.T) {
+		t.Parallel()
+		terminalStates := []broker.TaskState{
+			broker.TaskStateDone,
+			broker.TaskStateFailed,
+			broker.TaskStateDiscarded,
+			broker.TaskStateReplayed,
+		}
+		for _, st := range terminalStates {
+			final := st
+			t.Run(string(final), func(t *testing.T) {
+				t.Parallel()
+				s := factory()
+				ctx := context.Background()
+				task := newTask("p", "stage-cancel-term-"+string(final)+"-"+uuid.New().String())
+				if err := s.EnqueueTask(ctx, task.StageID, task); err != nil {
+					t.Fatalf("enqueue: %v", err)
+				}
+				if err := s.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &final}); err != nil {
+					t.Fatalf("set %s: %v", final, err)
+				}
+				_, err := s.CancelTask(ctx, task.ID)
+				if err != store.ErrTaskAlreadyTerminal {
+					t.Fatalf("terminal=%s: got %v, want ErrTaskAlreadyTerminal", final, err)
+				}
+				got, err := s.GetTask(ctx, task.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.State != final {
+					t.Errorf("state after rejected cancel: got %s want %s (SEC2-003 invariant)",
+						got.State, final)
+				}
+			})
+		}
+	})
+
 	t.Run("DiscardDeadLetter_NotDiscardableWhenNotDeadLettered", func(t *testing.T) {
 		t.Parallel()
 		s := factory()

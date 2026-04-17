@@ -40,6 +40,7 @@ type Store struct {
 	OnClaimForReplay      func(ctx context.Context, taskID string) (*broker.Task, error)
 	OnRollbackReplayClaim func(ctx context.Context, taskID string) error
 	OnDiscardDeadLetter   func(ctx context.Context, taskID string) error
+	OnCancelTask          func(ctx context.Context, taskID string) (*broker.Task, error)
 }
 
 // Compile-time assertion that *Store satisfies store.Store.
@@ -186,6 +187,16 @@ func (s *Store) DiscardDeadLetter(ctx context.Context, taskID string) error {
 		return h(ctx, taskID)
 	}
 	return s.mem.DiscardDeadLetter(ctx, taskID)
+}
+
+func (s *Store) CancelTask(ctx context.Context, taskID string) (*broker.Task, error) {
+	s.mu.RLock()
+	h := s.OnCancelTask
+	s.mu.RUnlock()
+	if h != nil {
+		return h(ctx, taskID)
+	}
+	return s.mem.CancelTask(ctx, taskID)
 }
 
 func toSet(ids []string) map[string]struct{} {

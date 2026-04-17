@@ -117,14 +117,11 @@ func TestKnownGap_SEC014_TokenBucketCleanupLeak(t *testing.T) {
 		"Fix: accept context parameter and stop on cancellation.")
 }
 
-// =============================================================================
-// SEC2-003: cancel command TOCTOU race
-// =============================================================================
-
-func TestKnownGap_SEC2003_CancelTOCTOU(t *testing.T) {
-	t.Skip("SEC2-003 OPEN: cancelTask performs read-then-write. " +
-		"Between GetTask and UpdateTask, the broker can complete the task.")
-}
+// SEC2-003 RESOLVED: CancelTask is now an atomic CAS across memory /
+// Redis / Postgres that refuses to act on a task already in a terminal
+// state. Regression coverage lives in the store conformance suite
+// (TestMemoryStoreConformance/CancelTask_*) plus concurrent-winner
+// coverage in internal/store/memory/memory_test.go.
 
 // =============================================================================
 // SEC2-005: Migration lacks concurrency protection against live broker

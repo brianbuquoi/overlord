@@ -197,6 +197,37 @@ func (m *MemoryStore) ClaimForReplay(_ context.Context, taskID string) (*broker.
 	return copyTask(task), nil
 }
 
+// CancelTask atomically transitions a non-terminal task to FAILED with
+// a "cancelled by operator" failure_reason. SEC2-003: the prior
+// read-check-write cancel shape could clobber a concurrent completion.
+func (m *MemoryStore) CancelTask(_ context.Context, taskID string) (*broker.Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	task, ok := m.tasks[taskID]
+	if !ok {
+		return nil, store.ErrTaskNotFound
+	}
+	if !task.ExpiresAt.IsZero() && time.Now().After(task.ExpiresAt) {
+		return nil, store.ErrTaskNotFound
+	}
+	if task.State.IsTerminal() {
+		return nil, store.ErrTaskAlreadyTerminal
+	}
+
+	// Capture the pre-cancel snapshot so the caller can surface context
+	// (e.g. warn that an EXECUTING task may still complete its stage).
+	snapshot := copyTask(task)
+
+	task.State = broker.TaskStateFailed
+	if task.Metadata == nil {
+		task.Metadata = map[string]any{}
+	}
+	task.Metadata["failure_reason"] = "cancelled by operator"
+	task.UpdatedAt = time.Now()
+	return snapshot, nil
+}
+
 // DiscardDeadLetter atomically transitions a FAILED+dead-lettered task to
 // DISCARDED. Concurrent replay claims transition via a different predicate
 // (FAILED+DL=true → REPLAY_PENDING), so exactly one of {replay-claim,
