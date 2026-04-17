@@ -50,13 +50,24 @@ store errors, log at error level, and increment the new
 stage_id}` counter rather than silently continuing. Terminal
 events and success metrics only fire after persistence succeeds.
 
-### SEC-010: Envelope delimiters are predictable
-**Location:** `internal/sanitize/envelope.go`
+### SEC-010: Envelope delimiters are predictable — RESOLVED
+**Location:** `internal/sanitize/envelope.go` — `Wrap`, `WrapInline`
 **Severity:** Medium
-**Description:** Envelope delimiters (`[SYSTEM CONTEXT ...]`, `[END SYSTEM CONTEXT]`)
-are static, human-readable strings. While the sanitizer detects these in agent output,
-a per-task random nonce in the delimiter would provide stronger defense-in-depth.
-**Recommendation:** Use a cryptographically random nonce in delimiters per-task.
+**Status:** Resolved
+**Description:** Envelope delimiters (`[SYSTEM CONTEXT ...]`, `[END SYSTEM
+CONTEXT]`) were static, human-readable strings. The sanitizer's active
+detection redacted literal occurrences in agent output, but an
+adversarial delimiter variant that escaped detection would have been
+indistinguishable from our real boundary.
+**Resolution:** Every `Wrap` / `WrapInline` call now appends a
+crypto/rand-seeded `#nonce=<hex>` token to both delimiter lines (64 bits
+of entropy per call). Two successive envelopes carry different nonces so
+an adversary observing one task cannot predict the next, and the
+receiving model sees the real boundary marked with a token the attacker
+cannot forge. Regression guard:
+`TestEnvelope_ExactFormatMatchesCLAUDEMD` in
+`internal/sanitize/bypass_test.go` asserts the nonce pairs within a
+single call and differs between calls.
 
 ## Sanitizer Coverage Gaps
 
@@ -427,7 +438,7 @@ without a total count.
 
 | # | Title | Severity | Status |
 |---|-------|----------|--------|
-| SEC-010 | Predictable envelope delimiters | Medium | Open |
+| SEC-010 | Predictable envelope delimiters | Medium | Resolved |
 | SEC-015 | Chain-adapter envelope bypass via placeholder substitution | High | Resolved |
 | SEC-016 | Broker swallowed store errors + Postgres requeue duplicate-key | High | Resolved |
 | SEC-012 | Redis UpdateTask not atomic | Medium | Resolved |

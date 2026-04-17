@@ -8,28 +8,15 @@ import (
 	"time"
 
 	"github.com/brianbuquoi/overlord/internal/auth"
-	"github.com/brianbuquoi/overlord/internal/sanitize"
 )
 
-// =============================================================================
-// SEC-010: Predictable envelope delimiters
-// The envelope delimiters are static strings. A per-task random nonce would
-// provide stronger defense-in-depth.
-// =============================================================================
-
-func TestKnownGap_SEC010_PredictableEnvelopeDelimiters(t *testing.T) {
-	t.Skip("SEC-010 OPEN: Envelope delimiters are static. Fix: use per-task random nonce.")
-
-	// When fixed, this test should verify that two Wrap() calls produce
-	// different delimiter strings (nonce-based).
-	out1 := sanitize.Wrap("task1", "data1")
-	out2 := sanitize.Wrap("task2", "data2")
-
-	// Currently these use the same delimiter strings.
-	// After fix: delimiters should differ between calls.
-	_ = out1
-	_ = out2
-}
+// SEC-010 RESOLVED: sanitize.Wrap and sanitize.WrapInline now append a
+// crypto/rand-seeded `#nonce=<hex>` token to every envelope delimiter
+// line. Two successive Wrap calls produce different nonces so an
+// adversarial agent cannot pre-craft a `[END SYSTEM CONTEXT]` fragment
+// that matches our real boundary. Regression coverage:
+// TestEnvelope_ExactFormatMatchesCLAUDEMD in internal/sanitize/bypass_test.go
+// asserts the nonce pairs per call and differs between calls.
 
 // =============================================================================
 // SEC3-001: RecordSuccess resets brute force window indefinitely
