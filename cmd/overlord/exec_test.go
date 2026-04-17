@@ -381,7 +381,14 @@ func TestExec_PluginBinaryNotFound(t *testing.T) {
 	manifestPath := filepath.Join(dir, "plugin-manifest.yaml")
 	os.WriteFile(manifestPath, []byte("name: fake\nbinary: ./does_not_exist\n"), 0o600)
 
+	// plugins.enabled: true is required to reach the binary-existence
+	// check at all; without the opt-in, validate() would refuse the
+	// config itself. The test covers the "binary not found" path, not
+	// the gate — see TestExec_PluginGateRefusesWhenDisabled below.
 	yaml := `version: "1"
+
+plugins:
+  enabled: true
 
 schema_registry:
   - name: task_in
@@ -428,5 +435,79 @@ stores:
 	}
 	if !strings.Contains(stderr, "not found") {
 		t.Errorf("expected 'not found' in error, got: %s", stderr)
+	}
+}
+
+// TestExec_PluginGateRefusesWhenDisabled verifies the fail-closed opt-in:
+// a config that references provider: plugin without plugins.enabled: true
+// must be refused at config load (exit 3 = config error), not silently
+// accepted and exec'd. This is the CLI-level half of the defense that
+// complements the validator-level test in internal/config.
+func TestExec_PluginGateRefusesWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	schemasDir := filepath.Join(dir, "schemas")
+	if err := os.MkdirAll(schemasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inSchema := `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"request":{"type":"string"}},"required":["request"]}`
+	outSchema := `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"response":{"type":"string"}},"required":["response"]}`
+	os.WriteFile(filepath.Join(schemasDir, "in_v1.json"), []byte(inSchema), 0o644)
+	os.WriteFile(filepath.Join(schemasDir, "out_v1.json"), []byte(outSchema), 0o644)
+
+	manifestPath := filepath.Join(dir, "plugin-manifest.yaml")
+	os.WriteFile(manifestPath, []byte("name: fake\nbinary: ./some_binary\n"), 0o600)
+
+	// No plugins block at all — the operator has not opted in, so this
+	// config must be rejected even though every other field is valid.
+	yaml := `version: "1"
+
+schema_registry:
+  - name: task_in
+    version: "v1"
+    path: schemas/in_v1.json
+  - name: task_out
+    version: "v1"
+    path: schemas/out_v1.json
+
+pipelines:
+  - name: gated
+    concurrency: 1
+    store: memory
+    stages:
+      - id: only
+        agent: plug
+        input_schema: { name: task_in, version: "v1" }
+        output_schema: { name: task_out, version: "v1" }
+        timeout: 5s
+        retry: { max_attempts: 1, backoff: fixed, base_delay: 50ms }
+        on_success: done
+        on_failure: dead-letter
+
+agents:
+  - id: plug
+    provider: plugin
+    manifest: ` + manifestPath + `
+
+stores:
+  memory:
+    max_tasks: 1000
+`
+	configPath := filepath.Join(dir, "config.yaml")
+	os.WriteFile(configPath, []byte(yaml), 0o644)
+
+	code, _, stderr := runExecCmd(t,
+		"--config", configPath,
+		"--id", "gated",
+		"--payload", `{"request":"hi"}`,
+		"--timeout", "5s",
+	)
+	if code != execExitConfig {
+		t.Fatalf("expected exit %d (config error) for disabled-plugin config, got %d\nstderr: %s", execExitConfig, code, stderr)
+	}
+	if !strings.Contains(stderr, "plugins are disabled") {
+		t.Errorf("expected 'plugins are disabled' in error, got: %s", stderr)
+	}
+	if !strings.Contains(stderr, "plugins.enabled: true") {
+		t.Errorf("expected error to tell operator how to opt in, got: %s", stderr)
 	}
 }

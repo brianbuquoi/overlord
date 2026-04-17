@@ -6,6 +6,15 @@
 
 version: "1"
 
+# Plugins are disabled by default because a plugin loads arbitrary code
+# with the full privilege of the Overlord process. Setting enabled: true
+# is an explicit operator opt-in. The optional allow list, when set,
+# restricts loading to the listed absolute binary paths.
+plugins:
+  enabled: true
+  # allow:
+  #   - /opt/overlord/plugins/bin/my-code-reviewer
+
 schema_registry:
   - name: review_input
     version: "v1"

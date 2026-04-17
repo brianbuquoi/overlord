@@ -385,11 +385,13 @@ func TestAgent_IDAndProvider(t *testing.T) {
 func TestLoadAndCreate_EagerMissingManifest(t *testing.T) {
 	// Manifest validation is now eager — missing manifest fails at
 	// construction time rather than on first HealthCheck/Execute.
+	// Enable plugins so this test exercises manifest validation, not
+	// the opt-in gate (TestLoadAndCreate_GateDisabledRefuses covers that).
 	_, err := LoadAndCreate(config.Agent{
 		ID:           "missing",
 		Provider:     "plugin",
 		ManifestPath: "/nonexistent/manifest.yaml",
-	}, slog.Default())
+	}, config.PluginConfig{Enabled: true}, slog.Default())
 	if err == nil {
 		t.Fatal("expected eager validation error")
 	}

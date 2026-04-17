@@ -261,7 +261,7 @@ func buildAgents(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, l
 	agents := make(map[string]broker.Agent, len(cfg.Agents))
 	for _, ac := range cfg.Agents {
 		stages := registry.StagesForAgent(cfg.Pipelines, ac.ID)
-		a, err := registry.NewFromConfigWithPlugins(ac, plugins, logger, reg, basePath, stages, m)
+		a, err := registry.NewFromConfigWithPlugins(ac, plugins, cfg.Plugins, logger, reg, basePath, stages, m)
 		if err != nil {
 			return nil, fmt.Errorf("agent %q: %w", ac.ID, err)
 		}
@@ -1240,7 +1240,7 @@ func healthCmd() *cobra.Command {
 			agents := make(map[string]agent.Agent, len(cfg.Agents))
 			for _, ac := range cfg.Agents {
 				stages := registry.StagesForAgent(cfg.Pipelines, ac.ID)
-				a, err := registry.NewFromConfigWithPlugins(ac, nil, logger, reg, basePath, stages)
+				a, err := registry.NewFromConfigWithPlugins(ac, nil, cfg.Plugins, logger, reg, basePath, stages)
 				if err != nil {
 					return fmt.Errorf("agent %q: %w", ac.ID, err)
 				}

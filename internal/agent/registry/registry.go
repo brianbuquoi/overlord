@@ -30,8 +30,12 @@ import (
 // first-class mock provider is rejected here because it requires a
 // compiled registry + the filtered stages to validate fixtures — callers
 // that may encounter provider: "mock" must use NewFromConfigWithPlugins.
+//
+// NewFromConfig passes a zero-valued plugin policy (plugins disabled).
+// Callers that need to load plugin agents must use
+// NewFromConfigWithPlugins with an explicit policy.
 func NewFromConfig(cfg config.Agent, logger *slog.Logger, m ...*metrics.Metrics) (agent.Agent, error) {
-	return NewFromConfigWithPlugins(cfg, nil, logger, nil, "", nil, m...)
+	return NewFromConfigWithPlugins(cfg, nil, config.PluginConfig{}, logger, nil, "", nil, m...)
 }
 
 // NewFromConfigWithPlugins creates an Agent adapter, checking built-in
@@ -43,9 +47,16 @@ func NewFromConfig(cfg config.Agent, logger *slog.Logger, m ...*metrics.Metrics)
 // that reference cfg.ID (that filtering is the caller's responsibility).
 // basePath is the directory that relative fixture paths resolve against
 // and should be the same value passed to contract.NewRegistry.
+//
+// The policy argument carries the operator's plugins.enabled opt-in and
+// optional allowlist. It is consulted on every plugin provider path
+// (provider: plugin subprocess agents and dynamically-loaded .so
+// plugins passed via the plugins map). A zero-valued policy means
+// "plugins disabled", which is the fail-closed default.
 func NewFromConfigWithPlugins(
 	cfg config.Agent,
 	plugins map[string]pluginapi.AgentPlugin,
+	policy config.PluginConfig,
 	logger *slog.Logger,
 	registry *contract.Registry,
 	basePath string,
@@ -121,12 +132,23 @@ func NewFromConfigWithPlugins(
 		}, logger, registry, stages, m...)
 
 	case "plugin":
-		return internalplugin.LoadAndCreate(cfg, logger)
+		return internalplugin.LoadAndCreate(cfg, policy, logger)
 	}
 
-	// Check plugins.
+	// Check plugins. The .so loader has already enforced the opt-in
+	// gate at load time (see internal/plugin/loader.go), so any provider
+	// present in the plugins map is already approved for use. We still
+	// refuse here if the caller somehow built a plugin map with the
+	// gate disabled — belt-and-suspenders so the one-call-site invariant
+	// cannot drift.
 	if plugins != nil {
 		if ap, ok := plugins[cfg.Provider]; ok {
+			if !policy.Enabled {
+				return nil, fmt.Errorf(
+					"agent %q: provider %q is a .so plugin but plugins are disabled; set plugins.enabled: true in the config",
+					cfg.ID, cfg.Provider,
+				)
+			}
 			brokerAgent, err := internalplugin.CreatePluginAgent(ap, cfg)
 			if err != nil {
 				return nil, err

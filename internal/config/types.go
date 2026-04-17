@@ -21,9 +21,66 @@ type Config struct {
 }
 
 // PluginConfig controls plugin discovery and loading.
+//
+// Plugins (both in-process .so shared libraries and subprocess plugins
+// declared by provider: plugin + manifest: on an agent) load arbitrary
+// code with the full privilege of the Overlord process. Untrusted YAML
+// that references a plugin is therefore a remote-code-execution vector
+// unless the operator has explicitly opted in.
+//
+// The gate is fail-closed:
+//
+//   - Enabled defaults to false; config validation refuses any agent with
+//     provider: plugin and any non-empty plugins.dir / plugins.files
+//     unless Enabled is explicitly set to true.
+//   - Allow is an optional absolute-path allowlist enforced at load time.
+//     When non-empty, every resolved subprocess binary and every .so file
+//     path must appear in the list or the plugin is rejected. When empty,
+//     any binary is permitted (the operator has opted in globally but
+//     chosen not to restrict paths further).
+//
+// Operators running uncurated third-party YAML should leave Enabled=false.
+// See docs/plugin-security.md.
 type PluginConfig struct {
+	// Enabled is the master switch. When false (the default), both .so
+	// plugins and subprocess plugins are refused — config validation
+	// returns an actionable error and the registry never instantiates
+	// a plugin agent. Must be set explicitly to true to load plugins.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Allow is an optional allowlist of absolute binary paths (for
+	// subprocess plugins) and absolute .so file paths (for in-process
+	// plugins). When non-empty, load-time enforcement rejects any path
+	// not in the list. When empty and Enabled=true, no path restriction
+	// is applied.
+	Allow []string `yaml:"allow,omitempty"`
+
 	Dir   string   `yaml:"dir,omitempty"`   // directory to scan for .so files
 	Files []string `yaml:"files,omitempty"` // explicit list of .so file paths
+}
+
+// HasPluginInputs reports whether the config references any plugin
+// discovery inputs — an explicit .so file list, a .so directory, or
+// any plugin subprocess agent. Used by config validation to decide
+// whether the plugins.enabled gate must be verified.
+func (p PluginConfig) HasPluginInputs() bool {
+	return p.Dir != "" || len(p.Files) > 0
+}
+
+// PathAllowed reports whether the given absolute path is permitted by
+// the allowlist. An empty allowlist means "no path restriction" (the
+// operator has globally opted in via Enabled but has not narrowed
+// further), so every path is allowed in that case.
+func (p PluginConfig) PathAllowed(absPath string) bool {
+	if len(p.Allow) == 0 {
+		return true
+	}
+	for _, allowed := range p.Allow {
+		if allowed == absPath {
+			return true
+		}
+	}
+	return false
 }
 
 // DashboardConfig controls the embedded web dashboard.

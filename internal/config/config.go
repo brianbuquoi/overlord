@@ -107,6 +107,9 @@ func validate(cfg *Config) error {
 	if err := validateAgents(cfg.Agents); err != nil {
 		return err
 	}
+	if err := validatePluginGate(cfg.Plugins, cfg.Agents); err != nil {
+		return err
+	}
 
 	pipelineNames := make(map[string]bool)
 	for _, p := range cfg.Pipelines {
@@ -394,6 +397,49 @@ func validateAgents(agents []Agent) error {
 		return fmt.Errorf(
 			"agent %q: fixtures: is only supported on provider: mock (got provider: %q); remove the fixtures map or switch the provider back to mock (stage keys: %v)",
 			a.ID, a.Provider, keys,
+		)
+	}
+	return nil
+}
+
+// validatePluginGate enforces the plugins.enabled opt-in. Any agent with
+// provider: plugin and any non-empty plugins.dir / plugins.files
+// reference is rejected unless the operator has explicitly set
+// plugins.enabled: true in the config.
+//
+// This is the config-time half of the fail-closed plugin gate. The
+// agent registry enforces the companion allowlist at load time.
+//
+// Rationale: untrusted YAML that references a plugin is remote code
+// execution — the subprocess loader exec.Commands the manifest's
+// binary with full process privileges, and .so loading is literally
+// dlopen. The default of Enabled=false means a random third-party
+// YAML cannot silently obtain RCE by adding provider: plugin; the
+// operator must explicitly opt in.
+func validatePluginGate(pcfg PluginConfig, agents []Agent) error {
+	var pluginAgents []string
+	for _, a := range agents {
+		if a.Provider == "plugin" {
+			pluginAgents = append(pluginAgents, a.ID)
+		}
+	}
+	hasAgents := len(pluginAgents) > 0
+	hasSOInputs := pcfg.HasPluginInputs()
+
+	if pcfg.Enabled {
+		return nil
+	}
+
+	if hasAgents {
+		sort.Strings(pluginAgents)
+		return fmt.Errorf(
+			"plugins are disabled but agents use provider: plugin (%v); set plugins.enabled: true in the config to load plugins, and consider adding plugins.allow with the absolute binary path(s) — plugins load arbitrary code with the full privilege of the Overlord process and must be explicitly trusted",
+			pluginAgents,
+		)
+	}
+	if hasSOInputs {
+		return fmt.Errorf(
+			"plugins are disabled but plugins.dir or plugins.files is set; set plugins.enabled: true in the config to load .so plugins, and consider adding plugins.allow with the absolute .so path(s) — plugins load arbitrary code with the full privilege of the Overlord process and must be explicitly trusted",
 		)
 	}
 	return nil

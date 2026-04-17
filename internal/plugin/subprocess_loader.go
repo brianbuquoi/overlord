@@ -39,10 +39,22 @@ func (e *PluginValidationError) Unwrap() error { return e.Err }
 // A validation failure is returned as *PluginValidationError so callers can
 // distinguish a config-time error from a runtime task failure.
 //
+// The policy argument carries the operator's plugins.enabled opt-in and
+// optional allowlist. LoadAndCreate refuses to build a plugin agent when
+// policy.Enabled is false (fail-closed double-check over config-time
+// validation), and refuses when the resolved binary path is not in the
+// allowlist (when the allowlist is non-empty).
+//
 // This is the entry point used by the agent registry when Provider == "plugin".
 // It is distinct from the older .so loader (CreatePluginAgent) which loads
 // in-process shared-library plugins.
-func LoadAndCreate(cfg config.Agent, logger *slog.Logger) (agent.Agent, error) {
+func LoadAndCreate(cfg config.Agent, policy config.PluginConfig, logger *slog.Logger) (agent.Agent, error) {
+	if !policy.Enabled {
+		return nil, &PluginValidationError{
+			AgentID: cfg.ID,
+			Err:     fmt.Errorf("plugins are disabled; set plugins.enabled: true in the config to load this agent"),
+		}
+	}
 	if cfg.ManifestPath == "" {
 		return nil, &PluginValidationError{
 			AgentID: cfg.ID,
@@ -60,6 +72,15 @@ func LoadAndCreate(cfg config.Agent, logger *slog.Logger) (agent.Agent, error) {
 	resolved := manifest.ResolveBinary()
 	if err := manifest.ValidateBinary(resolved); err != nil {
 		return nil, &PluginValidationError{AgentID: cfg.ID, Err: err}
+	}
+	if !policy.PathAllowed(resolved) {
+		return nil, &PluginValidationError{
+			AgentID: cfg.ID,
+			Err: fmt.Errorf(
+				"plugin binary %q is not in plugins.allow; add it to the allowlist to permit this plugin",
+				resolved,
+			),
+		}
 	}
 
 	return &lazyAgent{

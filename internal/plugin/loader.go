@@ -50,6 +50,8 @@ func DefaultOpener(path string) (PluginLookup, error) {
 
 // LoadPlugins discovers and loads plugin .so files from the given config.
 // Returns a map of provider name → AgentPlugin. Errors are returned for:
+//   - plugins.enabled is false but .so inputs are present (fail-closed)
+//   - a resolved .so path is not in plugins.allow (when non-empty)
 //   - .so file not found or not loadable
 //   - "Plugin" symbol not found in the .so
 //   - Symbol does not implement AgentPlugin
@@ -63,6 +65,32 @@ func loadPlugins(cfg config.PluginConfig, logger *slog.Logger, opener PluginOpen
 	paths, err := resolvePaths(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if len(paths) == 0 {
+		return map[string]pluginapi.AgentPlugin{}, nil
+	}
+	// Fail-closed: even if config.Validate was bypassed, LoadPlugins
+	// refuses to dlopen anything unless the operator explicitly opted in.
+	if !cfg.Enabled {
+		return nil, fmt.Errorf(
+			"plugins are disabled but %d .so input(s) resolved; set plugins.enabled: true in the config to load plugins",
+			len(paths),
+		)
+	}
+	// Enforce the optional allowlist against resolved absolute paths so
+	// symlinks and relative paths cannot sneak past an operator's list.
+	for i, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return nil, fmt.Errorf("plugin %q: resolve absolute path: %w", p, err)
+		}
+		paths[i] = abs
+		if !cfg.PathAllowed(abs) {
+			return nil, fmt.Errorf(
+				"plugin %q is not in plugins.allow; add it to the allowlist to permit this plugin",
+				abs,
+			)
+		}
 	}
 	return loadFromPaths(paths, logger, opener)
 }

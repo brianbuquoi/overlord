@@ -129,7 +129,7 @@ func TestNewFromConfigWithPlugins_Mock(t *testing.T) {
 		ID:       "mock-agent",
 		Provider: "mock",
 		Fixtures: map[string]string{"greet": "fixtures/greet.json"},
-	}, nil, slog.Default(), reg, dir, stages)
+	}, nil, config.PluginConfig{}, slog.Default(), reg, dir, stages)
 	if err != nil {
 		t.Fatalf("NewFromConfigWithPlugins(mock): %v", err)
 	}
@@ -167,7 +167,7 @@ func TestNewFromConfigWithPlugins_MockRejectsBadFixture(t *testing.T) {
 		ID:       "mock-agent",
 		Provider: "mock",
 		Fixtures: map[string]string{"greet": "bad.json"},
-	}, nil, slog.Default(), reg, dir, stages)
+	}, nil, config.PluginConfig{}, slog.Default(), reg, dir, stages)
 	if err == nil {
 		t.Fatal("expected schema-validation error from mock constructor")
 	}
@@ -184,7 +184,7 @@ func TestNewFromConfigWithPlugins_AnthropicStillBuilds(t *testing.T) {
 		ID:       "a1",
 		Provider: "anthropic",
 		Model:    "claude-sonnet-4-5",
-	}, nil, slog.Default(), nil, "", nil)
+	}, nil, config.PluginConfig{}, slog.Default(), nil, "", nil)
 	if err != nil {
 		t.Fatalf("anthropic via widened factory: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestNewFromConfigWithPlugins_CopilotStillBuilds(t *testing.T) {
 		ID:       "cp1",
 		Provider: "copilot",
 		Model:    "copilot-chat",
-	}, nil, slog.Default(), nil, "", nil)
+	}, nil, config.PluginConfig{}, slog.Default(), nil, "", nil)
 	if err != nil {
 		t.Fatalf("copilot via widened factory: %v", err)
 	}

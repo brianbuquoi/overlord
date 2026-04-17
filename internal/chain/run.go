@@ -170,7 +170,7 @@ func buildBaseAgents(compiled *Compiled, logger *slog.Logger, m *metrics.Metrics
 	base := make(map[string]agent.Agent, len(compiled.Config.Agents))
 	for _, ac := range compiled.Config.Agents {
 		stages := registry.StagesForAgent(compiled.Config.Pipelines, ac.ID)
-		a, err := registry.NewFromConfigWithPlugins(ac, nil, logger, compiled.Registry, compiled.BasePath, stages, m)
+		a, err := registry.NewFromConfigWithPlugins(ac, nil, compiled.Config.Plugins, logger, compiled.Registry, compiled.BasePath, stages, m)
 		if err != nil {
 			return nil, fmt.Errorf("build agent %q: %w", ac.ID, err)
 		}
