@@ -2,10 +2,73 @@
 
 ## Project Overview
 
-Overlord is a Go-based orchestration engine for AI agent pipelines.
-Pipelines are defined entirely in YAML. Agents are LLM adapters (API-only).
-The broker routes tasks between agents through typed, versioned stages.
-Schema versioning is a first-class concept in the YAML config.
+Overlord is a Go-based, local-first orchestration tool for AI agent
+workflows. It exposes **two user-facing authoring layers** on top of a
+single runtime:
+
+1. **Chain mode** (`overlord chain …`) — a lightweight authoring
+   layer for linear prompt workflows. Authors write a minimal YAML
+   (`chain.id`, `chain.steps`, `chain.vars`, `chain.output`) and the
+   chain compiler lowers it into a normal `config.Config`. This is the
+   recommended first stop for local multi-model prompt chains.
+2. **Full pipeline mode** (`overlord run`, `overlord exec`) — the
+   strict, production-oriented orchestration layer. Multi-stage DAGs
+   with fan-out, conditional routing, versioned schemas, retry
+   budgets, dead-letter replay, auth, metrics, tracing, and the
+   embedded web dashboard. This is where workflows graduate when they
+   outgrow chain mode.
+
+Both layers share the **same runtime core**: broker, store backends,
+retries, dead-letter/replay, auth, metrics, tracing, dashboard, `exec`
+and `run`. The chain compiler is an authoring-layer translation, not a
+second engine. Running a chain and running its exported pipeline YAML
+produce identical broker behavior.
+
+**Product philosophy: start simple, scale without a rewrite.** A chain
+that grows into a production workflow graduates via `overlord chain
+export`, which emits the equivalent full-pipeline config; the chain
+YAML remains the source of truth for the simple version, and the
+exported pipeline becomes the artifact that hand-editing evolves. No
+workflow is ever stuck at the authoring-layer boundary.
+
+Agents are LLM adapters (API-only). The broker routes tasks between
+agents through typed, versioned stages. Schema versioning is a
+first-class concept in the full pipeline YAML; in chain mode, schemas
+are synthesized by the compiler and the internal wire format is
+`{"text": "..."}` between steps (see `docs/chain.md`).
+
+### When to use chain vs full pipeline
+
+Use **chain mode** when:
+
+- The workflow is a linear sequence of LLM calls (`draft → review`,
+  `summarize → critique`, `plan → execute`).
+- You want to demo a multi-model idea locally with zero credentials
+  (the built-in `mock` provider drives scaffolded chains).
+- You have not yet decided whether you need fan-out, conditional
+  routing, explicit schemas, or a long-lived server.
+- You are prototyping something that *may* graduate later. Graduating
+  is an explicit `chain export` + edit, not a rewrite.
+
+Use **full pipeline mode** when:
+
+- The workflow needs fan-out (parallel agents collated by a require
+  policy — all/any/majority), conditional routing, or loopback.
+- You want typed, versioned schemas per stage with major-version
+  enforcement at routing time.
+- You need retry budgets, dead-letter replay, per-pipeline authz
+  scopes, Prometheus metrics with stable labels, or OpenTelemetry
+  trace export.
+- You want to run `overlord run` as a long-lived service with the
+  HTTP API and the embedded dashboard.
+
+**Architectural guidance for agents working in this repo:** chain
+mode *always* compiles into the strict runtime. New chain features
+must land by extending `internal/chain/compile.go` (and the adapter
+wrapper where runtime behavior is needed). Do not shortcut the broker,
+do not bypass the contract validator, and do not introduce a
+separate execution engine for chain mode — the shared runtime is the
+product's backbone.
 
 ## Architecture
 
@@ -32,9 +95,12 @@ internal/api/           → HTTP REST + WebSocket for pipeline observation
 internal/metrics/       → Prometheus instrumentation
 internal/tracing/       → OpenTelemetry tracing (Tracer type with ForceFlush)
 internal/migration/     → Schema migration framework for task payloads
+internal/chain/         → Chain mode: authoring layer, compile to config.Config,
+                         runtime wrapper adapter, embedded write-review template
 config/examples/        → Reference pipeline YAML files
 schemas/                → JSONSchema files referenced by schema_registry
-docs/                   → Deployment and operations documentation
+docs/                   → Deployment and operations documentation (docs/chain.md
+                         for chain authoring, docs/init.md for pipeline scaffolds)
 ```
 
 **See also:** [docs/deployment.md](docs/deployment.md) for single-instance
@@ -45,9 +111,11 @@ limitations.
 
 Top-level subcommands wired in `cmd/overlord/main.go`:
 
+Pipeline-mode commands (strict full-pipeline authoring):
+
 - `run` — long-running server (HTTP API, WebSocket, broker workers, dashboard)
 - `exec` — single-task in-process execution; no HTTP bind (see [docs/exec.md](docs/exec.md))
-- `init` — scaffold a runnable project from an embedded template + auto-run a mock demo (see [docs/init.md](docs/init.md))
+- `init` — scaffold a runnable full-pipeline project + auto-run a mock demo (see [docs/init.md](docs/init.md))
 - `submit` — submit a task via HTTP; optional `--wait`
 - `status`, `cancel` — task introspection and cancellation
 - `validate` — YAML parse + schema registry compile + contract compatibility
@@ -56,6 +124,13 @@ Top-level subcommands wired in `cmd/overlord/main.go`:
 - `dead-letter` — list/replay/discard/recover dead-lettered tasks
 - `migrate` — schema migration framework (list/run/validate)
 - `completion` — shell completion scripts
+
+Chain-mode commands (lightweight authoring layer — see [docs/chain.md](docs/chain.md)):
+
+- `chain run` — compile a chain, build an in-process broker with a memory store, submit one task, print the final output
+- `chain init` — scaffold a chain project from the embedded `write-review` template (mock provider, zero credentials)
+- `chain inspect` — print the compiled interpretation of a chain: synthesized pipeline, stages, agent bindings, resolved prompt templates, schema registry
+- `chain export` — emit the equivalent full-pipeline YAML + synthesized schema JSON + referenced fixtures into a directory; the output is immediately runnable under `overlord run` / `overlord exec`
 
 ## Core Principles
 
@@ -103,6 +178,37 @@ they never silently continue.
 Zero runtime config. Everything — pipeline topology, agent bindings, prompts,
 timeouts, retry policies, schema refs — lives in YAML. Hot-reload is
 supported on SIGHUP.
+
+### Chain mode compiles into pipeline mode
+Chain mode (`overlord chain …`) is an **authoring layer**, not a
+separate runtime. The chain compiler in `internal/chain/compile.go`
+lowers a chain YAML into the same `config.Config` the full pipeline
+mode consumes:
+
+- Each `chain.steps[n]` becomes a stage + agent pair.
+- `{{vars.<name>}}` placeholders are resolved at compile time;
+  `{{input}}` and `{{steps.<id>.output}}` are preserved for per-task
+  substitution by the wrapper adapter in `internal/chain/adapter.go`.
+- Two JSON schemas (`chain_text@v1`, `chain_json@v1`) are synthesized
+  at compile time and registered via `contract.NewRegistryFromRaw`,
+  so the broker's existing validator enforces them like any other
+  stage contract.
+- Per-step outputs propagate across stages in `task.Metadata["chain"]`
+  — a non-reserved metadata key, so the broker's normal
+  `mergeMetadata` path carries it without any broker changes.
+
+The chain-step wrapper adapter calls the real provider adapter
+underneath (`anthropic`, `openai`, etc.) via
+`registry.NewFromConfigWithPlugins`. Envelope wrapping, contract
+validation, retries, dead-letter, tracing, and metrics all apply to
+chain-mode runs exactly as they apply to pipeline-mode runs.
+
+`overlord chain export` is the **canonical graduation path**: it
+writes the compiled `overlord.yaml`, synthesized schemas, and any
+referenced fixtures into a directory that is immediately runnable
+under `overlord run` / `overlord exec`. Authors copy the output,
+hand-edit it (adding fan-out, conditional routing, retry budgets,
+etc.) as the workflow matures, and never leave the shared runtime.
 
 ### Scaffolded projects and the runtime auth guardrail
 
@@ -346,3 +452,23 @@ the reverse proxy or firewall level in production.
   catching the scaffolded "commented auth + public bind" footgun at
   runtime. The slog.Warn guardrail only runs on the `--allow-public-noauth`
   opt-in path.
+- Do not introduce a second execution engine for chain mode. Chain
+  features must land by extending `internal/chain/compile.go` (and
+  the wrapper adapter in `internal/chain/adapter.go` when runtime
+  behavior is needed) so the broker stays the single orchestrator.
+- Do not bypass the envelope, sanitizer, contract validator, or
+  retries for chain-mode runs. The chain-step wrapper adapter
+  delegates to real provider adapters and never talks to the broker
+  directly — every built-in safety net applies the same way as in
+  pipeline mode.
+- Do not merge chain and pipeline commands into a single verb. The
+  product distinction between `overlord chain …` (simple authoring)
+  and `overlord run` / `overlord exec` / `overlord init` (strict
+  pipeline) is the clearest signal users have for which layer they
+  are in. Aliasing or collapsing the two would re-introduce the
+  heavyweight-front-door problem chain mode exists to solve.
+- Do not silently synthesize new `chain_*` schema names in
+  compile-layer changes. The names `chain_text` and `chain_json` are
+  the only reserved synthesized schemas today; any additions must be
+  documented in `docs/chain.md` and guarded against conflict with
+  user-authored pipeline schemas in `overlord chain export`.

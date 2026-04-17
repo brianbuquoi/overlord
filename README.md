@@ -1,10 +1,49 @@
 # Overlord
 
-Overlord is a YAML-driven orchestration engine for AI agent pipelines.
-Define multi-stage workflows that route tasks through LLM providers
-(Anthropic, OpenAI, Google Gemini, Ollama) with typed I/O contracts,
-automatic prompt injection sanitization, and schema versioning — all
-configured in a single YAML file.
+Overlord is a local-first orchestration tool for AI agent workflows.
+It gives you two layers on one runtime:
+
+- **Chain mode** — a minimal authoring layer for linear prompt
+  workflows. One YAML, a handful of steps, each a prompt and a model.
+  Zero schema ceremony. This is the recommended first stop.
+- **Pipeline mode** — the strict, production-oriented orchestration
+  layer. Multi-stage DAGs with fan-out, conditional routing, typed
+  versioned schemas, retries, dead-letter replay, auth, metrics, and
+  tracing. This is where you graduate when the workflow is ready.
+
+Chain mode **compiles into** pipeline mode. The runtime is the same
+broker in both cases — there is no second engine. Starting simple and
+scaling up means editing YAML, not rewriting your workflow.
+
+```bash
+# Chain mode — start here.
+overlord chain init write-review
+overlord chain run --chain ./write-review/chain.yaml \
+  --input-file ./write-review/sample_input.txt
+
+# Pipeline mode — graduate when you need fan-out, conditional
+# routing, retry budgets, or the server/dashboard.
+overlord chain export --chain ./write-review/chain.yaml --out ./pipeline
+overlord run --config ./pipeline/overlord.yaml
+```
+
+See [docs/chain.md](docs/chain.md) for the chain authoring reference
+and the graduation path.
+
+## Why not a general agent framework or visual workflow tool?
+
+- **Code-reviewable by default.** One YAML file per workflow (plus
+  optional schemas and fixtures). Everything is diffable, grep-able,
+  and lives in your repo.
+- **Local-first.** Both layers run in-process against a memory store.
+  No server required until you want one.
+- **Operationally trustworthy.** The runtime ships with an anti-
+  injection sanitizer envelope, schema versioning, typed contracts,
+  retries, dead-letter replay, auth, Prometheus metrics, and
+  OpenTelemetry tracing. Chain mode inherits all of it for free.
+- **No vendor lock-in on models.** Anthropic, OpenAI (Chat +
+  Responses), Google Gemini, Ollama, and a built-in `mock` provider
+  for offline demos. A plugin system extends this without forking.
 
 ## How it works
 
@@ -16,6 +55,12 @@ it downstream, and handles retries with configurable backoff. **Fan-out
 stages** execute multiple agents in parallel and collect results using
 gather (wait for all) or race (first to satisfy) modes with configurable
 require policies (all/any/majority).
+
+A **chain** is a linear pipeline authored in a minimal YAML shape:
+`chain.id`, `chain.vars`, `chain.steps`, `chain.output`. Each step is a
+single prompt + model reference. The chain compiler produces a normal
+pipeline, one stage per step, with synthesized schemas — then the
+broker runs it. See [docs/chain.md](docs/chain.md).
 
 ```
                        ┌──────────┐
@@ -64,7 +109,26 @@ Install:
 go install github.com/brianbuquoi/overlord/cmd/overlord@latest
 ```
 
-Scaffold a starter project and run it:
+### Chain mode (start here)
+
+```bash
+overlord chain init write-review
+overlord chain run --chain ./write-review/chain.yaml \
+  --input-file ./write-review/sample_input.txt
+```
+
+The scaffolded chain uses the built-in `mock` provider so you see a
+real multi-step run with zero credentials on the first invocation. To
+switch to a real LLM, open `chain.yaml`, replace the step's
+`model: mock/*` with a real provider/model (e.g.
+`anthropic/claude-sonnet-4-5`, `openai/gpt-4o`,
+`google/gemini-2.5-pro`, `ollama/llama3`), and delete the `fixture:`
+line.
+
+See [docs/chain.md](docs/chain.md) for the chain reference, template
+catalog, and graduation path to pipeline mode.
+
+### Pipeline mode (for production workloads)
 
 ```bash
 overlord init summarize
@@ -75,24 +139,38 @@ overlord exec --config overlord.yaml --id summarize \
   --payload '{"text": "..."}'
 ```
 
-Zero API key needed — the scaffolded project uses the built-in `mock`
-provider so you see a working pipeline on the first run. To switch to a
-real LLM, open `overlord.yaml`, uncomment the real-provider block, and
-change the stage's agent reference from `<id>-mock` to `<id>`.
+The scaffolded project uses the built-in `mock` provider so you see a
+working pipeline on the first run. To switch to a real LLM, open
+`overlord.yaml`, uncomment the real-provider block, and change the
+stage's agent reference from `<id>-mock` to `<id>`.
 
-See [docs/init.md](docs/init.md) for the full template catalog, flag
-reference, exit-code matrix, file tree, and migration guide.
+See [docs/init.md](docs/init.md) for the pipeline template catalog,
+flag reference, exit-code matrix, and file tree.
 
 For long-running, multi-task deployments use `overlord run` (HTTP API,
 web dashboard, broker workers). See [docs/exec.md](docs/exec.md) for
 the `exec` command reference and [docs/deployment.md](docs/deployment.md)
 for server-mode operations.
 
-If you prefer to hand-author your config — for split infra+pipeline
-files, custom templates, or non-scaffolded workflows — the
-[Configuration reference](#configuration-reference) below walks through
-the raw YAML shape. `overlord init` is a convenience bootstrap; every
-config it generates can be edited freely afterwards.
+### Graduating from chain to pipeline
+
+```bash
+overlord chain export --chain ./chain.yaml --out ./pipeline
+overlord validate --config ./pipeline/overlord.yaml
+overlord run      --config ./pipeline/overlord.yaml
+```
+
+`chain export` emits the full-pipeline equivalent of a chain —
+`overlord.yaml`, `schemas/`, and any referenced fixtures — into a
+directory that is immediately runnable under the pipeline commands.
+From there, hand-edit `overlord.yaml` to add fan-out, conditional
+routing, retry budgets, split infra config, or anything else pipeline
+mode supports.
+
+If you prefer to hand-author your pipeline config — for split
+infra+pipeline files, custom templates, or non-scaffolded workflows —
+the [Configuration reference](#configuration-reference) below walks
+through the raw YAML shape.
 
 ## Configuration reference
 
