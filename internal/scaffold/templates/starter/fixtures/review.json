@@ -1,0 +1,3 @@
+{
+  "text": "Good first pass. The positioning is clear: one file, one command, and the runtime story stays intact. Two sharpenings worth making: (1) call out that `overlord run` is the beginner verb and `overlord serve` is the service verb — readers tend to look for a single distinguishing cue; (2) mention explicitly that graduating to the strict format is non-destructive (the workflow YAML remains the source of truth) so nobody thinks `export --advanced` is a one-way migration."
+}

@@ -1,47 +1,56 @@
 # `overlord init` — scaffold a runnable project
 
 `overlord init` writes a complete greenfield project from an embedded
-template, then runs a sample payload through the generated pipeline using
+template, then runs a sample input through the generated workflow using
 the first-party `mock` provider. Zero credentials, zero network calls — you
-see a working pipeline on the first run and decide later whether to swap in
+see working output on the first run and decide later whether to swap in
 a real LLM.
 
 Use `init` for:
 
-- **First-time evaluation** — go from `go install` to visible pipeline
-  output without picking an LLM provider or setting an API key.
-- **New project scaffolding** — every scaffolded project has sensible
-  defaults (memory store, commented auth, `.gitignore` for secrets) that
-  match the manual-authoring patterns documented in the main README.
-- **Examples for teaching or demos** — the `hello` and `summarize`
-  templates are intentionally short and easy to modify.
+- **First-time evaluation** — go from `go install` to visible output
+  without picking an LLM provider or setting an API key.
+- **New project scaffolding** — the default starter produces a minimal
+  workflow file (`overlord.yaml` + `sample_input.txt` + fixtures) you can
+  run immediately with `overlord run`.
+- **Examples for teaching or demos** — the advanced templates (`hello`,
+  `summarize`) are short strict-pipeline examples that illustrate the
+  escape-hatch format.
 
-Use `overlord run` or `overlord exec` once you have a pipeline; `init` is
-a one-time bootstrap.
+Use `overlord run` once you have a workflow; `init` is a one-time
+bootstrap.
 
 ## Usage
 
 ```
-overlord init <template> [dir] [flags]
+overlord init [template] [dir] [flags]
 ```
 
-- `<template>` — required. One of the names returned by the embedded
-  template catalog (see the table below).
+- `[template]` — optional. Defaults to `starter`, which scaffolds the
+  simple workflow format. Pass `hello` or `summarize` for the advanced
+  strict-pipeline templates.
 - `[dir]` — optional. Target directory. Defaults to `./<template>`.
 
-Missing the template argument prints the available templates and exits
-with code 2. No interactive prompt — `init` is friendly to CI.
+Omitting the template argument writes the starter workflow into
+`./starter`.
 
 ## Templates
 
-| Template    | Shape                                           | Use when...                                                          |
-|-------------|-------------------------------------------------|----------------------------------------------------------------------|
-| `hello`     | Single-stage pipeline (`greet`)                 | You want the smallest runnable example — one agent, one schema pair. |
-| `summarize` | Two-stage linear chain (`summarize` → `validate`) | You want to see multi-stage routing and per-stage schema handoff.    |
+| Template    | Shape                                           | Use when...                                                                |
+|-------------|-------------------------------------------------|----------------------------------------------------------------------------|
+| `starter`   | **Default.** Workflow format (one YAML file, two steps, mock provider) | You want the simple `overlord run --input-file sample_input.txt` story.    |
+| `hello`     | Strict-mode single-stage pipeline (`greet`)     | You want the smallest strict-pipeline example — one agent, one schema pair. |
+| `summarize` | Strict-mode two-stage linear pipeline (`summarize` → `validate`) | You want to see multi-stage routing and per-stage schema handoff in the strict format. |
 
-Every template defines two agent slots per stage: a `mock` variant
-(active by default) and a commented real-provider variant using Anthropic.
-The migration guide below explains the swap.
+The starter template is the default for a reason: it is the format most
+new users should author against. The strict-pipeline templates remain
+available for projects that need fan-out, conditional routing, retry
+budgets, or the full `schema_registry` surface — or for projects that
+have already graduated via `overlord export --advanced`.
+
+Each strict-pipeline template defines two agent slots per stage: a `mock`
+variant (active by default) and a commented real-provider variant using
+Anthropic. The migration guide below explains the swap.
 
 ## Flags
 
@@ -72,6 +81,35 @@ The matrix is intentionally distinct from `overlord exec` — init has its
 own failure modes.
 
 ## What init produces
+
+### Starter (default)
+
+Running `overlord init` (no args) produces:
+
+```
+starter/
+├── overlord.yaml        # workflow file — two steps, mock provider
+├── sample_input.txt     # plain text fed in via `--input-file`
+└── fixtures/
+    ├── draft.json       # mock response for step 1
+    └── review.json      # mock response for step 2
+```
+
+The starter is intentionally minimal — no strict-pipeline artifacts
+(`schemas/`, `.env.example`, `.gitignore`) because workflow mode
+synthesizes its schemas at compile time. To run the scaffold:
+
+```bash
+cd starter
+overlord run --input-file sample_input.txt
+```
+
+To swap in a real LLM, change a step's `model:` to a real provider/model
+(e.g. `anthropic/claude-sonnet-4-5`) and delete the matching `fixture:`
+line. Provider credentials come from standard environment variables
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`).
+
+### Advanced templates
 
 Scaffolding `hello` into `./hello` produces:
 

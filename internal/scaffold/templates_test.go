@@ -134,21 +134,46 @@ func renderedTemplate(t *testing.T, name string) string {
 }
 
 // TestListTemplates_Sorted verifies the public ListTemplates accessor
-// returns exactly the two first-party templates in sorted order. Adding
-// a third template is a conscious change — this test forces an update.
+// returns exactly the first-party templates in sorted order. Adding
+// a new template is a conscious change — this test forces an update.
 func TestListTemplates_Sorted(t *testing.T) {
 	got := ListTemplates()
-	want := []string{"hello", "summarize"}
+	want := []string{"hello", "starter", "summarize"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("ListTemplates = %v, want %v", got, want)
 	}
+}
+
+// isWorkflowTemplate reports whether a template ships a workflow-shaped
+// overlord.yaml rather than a strict-pipeline one. The strict-contract
+// tests below intentionally skip these — workflows have their own
+// end-to-end coverage in cmd/overlord/init_test.go and
+// internal/workflow/workflow_test.go.
+func isWorkflowTemplate(name string) bool {
+	switch name {
+	case "starter":
+		return true
+	}
+	return false
+}
+
+// strictTemplates returns the subset of first-party templates that
+// ship a strict-pipeline overlord.yaml.
+func strictTemplates() []string {
+	out := make([]string, 0)
+	for _, n := range ListTemplates() {
+		if !isWorkflowTemplate(n) {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // TestEveryTemplate_Structure exercises the per-template structural
 // contract: every required file present, every required dir present, no
 // stray dot-prefix files dropped by a missing `all:` prefix.
 func TestEveryTemplate_Structure(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			materializeTemplate(t, name, dir, templateContext{
@@ -207,7 +232,7 @@ func TestEveryTemplate_Structure(t *testing.T) {
 // in every template's .gitignore — these protect credentials and
 // backup-file leakage and are part of the Unit 2 deliverable contract.
 func TestEveryTemplate_GitignoreContent(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			data, err := FS.ReadFile(filepath.Join(templatesRoot, name, ".gitignore"))
 			if err != nil {
@@ -237,7 +262,7 @@ func TestEveryTemplate_GitignoreContent(t *testing.T) {
 // greenlight. The placeholder must be obviously-fake to trip scanners if
 // committed unchanged.
 func TestEveryTemplate_EnvExamplePlaceholder(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			data, err := FS.ReadFile(filepath.Join(templatesRoot, name, ".env.example"))
 			if err != nil {
@@ -280,7 +305,7 @@ var (
 // block banner markers appear exactly once and bracket a body where every
 // non-blank line is currently comment-prefixed.
 func TestEveryTemplate_RealProviderBannerDelimited(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			body := renderedTemplate(t, name)
 
@@ -319,7 +344,7 @@ func TestEveryTemplate_RealProviderBannerDelimited(t *testing.T) {
 // TestEveryTemplate_AuthCommented asserts the commented auth: block
 // delimited by the auth banner is present in every template.
 func TestEveryTemplate_AuthCommented(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			body := renderedTemplate(t, name)
 			if !authOpenRe.MatchString(body) {
@@ -365,7 +390,7 @@ func TestEveryTemplate_AuthCommented(t *testing.T) {
 // the strongest integration check Unit 2 can run without Unit 3's writer:
 // the YAML parses, schema paths resolve, agent/stage bindings validate.
 func TestEveryTemplate_RenderedConfigLoads(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			materializeTemplate(t, name, dir, templateContext{
@@ -400,7 +425,7 @@ func TestEveryTemplate_RenderedConfigLoads(t *testing.T) {
 // resolves to DefaultAnthropicModel after render. This is the guard
 // against the constant drifting out of the scaffolder.
 func TestEveryTemplate_ModelSubstitution(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			raw := readTemplateYAML(t, name)
 			if !strings.Contains(raw, "{{ .Model }}") {
@@ -465,7 +490,7 @@ func uncommentRealProviderBlock(t *testing.T, body string) string {
 // parse cleanly with config.Load. This is the contract the migration
 // doc promises users.
 func TestEveryTemplate_MigrationSwap(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			materializeTemplate(t, name, dir, templateContext{
@@ -542,7 +567,7 @@ func TestEveryTemplate_MigrationSwap(t *testing.T) {
 // means fixture breakage surfaces at `go test` time without needing to
 // build a real adapter + broker.
 func TestEveryTemplate_FixturesValidateAgainstSchema(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			materializeTemplate(t, name, dir, templateContext{
@@ -603,7 +628,7 @@ func TestEveryTemplate_FixturesValidateAgainstSchema(t *testing.T) {
 // sample_payload.json is valid JSON AND matches the first stage's
 // input_schema. This is the invariant the auto-run demo relies on.
 func TestEveryTemplate_SamplePayloadValidatesAgainstFirstStageInput(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			materializeTemplate(t, name, dir, templateContext{

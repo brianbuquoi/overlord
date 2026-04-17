@@ -21,6 +21,7 @@ import (
 	"github.com/brianbuquoi/overlord/internal/agent/registry"
 	"github.com/brianbuquoi/overlord/internal/broker"
 	"github.com/brianbuquoi/overlord/internal/scaffold"
+	"github.com/brianbuquoi/overlord/internal/workflow"
 )
 
 // Exit codes returned by `overlord init`. The matrix is intentionally
@@ -92,15 +93,18 @@ func initCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "init <template> [dir]",
-		Short: "Scaffold a new Overlord project and run a sample pipeline",
+		Use:   "init [template] [dir]",
+		Short: "Scaffold a new Overlord project and run a sample workflow",
 		Long: `Scaffold a new project from an embedded template, then run a sample
-payload through the generated pipeline using the first-party mock provider
+input through the generated workflow using the first-party mock provider
 (no credentials, no network). After the demo completes, a next-steps block
 tells you how to swap in a real LLM.
 
-Template arg is required. The optional positional dir argument controls
-the target directory; defaults to "./<template>".
+Template arg is optional — the default template ("starter") scaffolds the
+simple workflow: format. Pass an explicit template name for the strict
+pipeline templates (hello, summarize). The optional positional dir
+argument controls the target directory; defaults to "./<template>"
+(or "." when no template is given).
 
 Flags:
   --force             scaffold into a non-empty directory
@@ -179,12 +183,12 @@ func runInit(cmd *cobra.Command, args []string, a initArgs) error {
 	stderr := cmd.ErrOrStderr()
 	stdout := cmd.OutOrStdout()
 
-	// 1. Template arg required — print the list + return code 2 if absent.
-	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
-		fmt.Fprintln(stderr, templateHelpMessage(""))
-		return &initExitError{Code: initExitInvalidTarget, Msg: "missing template argument"}
+	// 1. Template name defaults to the workflow starter. Explicit names
+	//    still work for the strict-pipeline templates (hello, summarize).
+	template := defaultInitTemplate
+	if len(args) >= 1 && strings.TrimSpace(args[0]) != "" {
+		template = args[0]
 	}
-	template := args[0]
 
 	// 2. Unknown template — print the list + "unknown template: ..." + code 2.
 	if !isKnownTemplate(template) {
@@ -345,29 +349,47 @@ func templateHelpMessage(unknown string) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// defaultInitTemplate is the template `overlord init` scaffolds when
+// the caller supplies no template arg. It must stay in sync with the
+// embedded templates/ tree and must always be a workflow-shaped
+// project so the default first-run experience matches the simple
+// product story: one YAML file, no strict-config concepts.
+const defaultInitTemplate = "starter"
+
 // templateDescription returns a one-line description for each embedded
 // template. Hardcoded so `overlord init` can render help without parsing
 // the scaffolded YAML at runtime.
 func templateDescription(name string) string {
 	switch name {
+	case "starter":
+		return "simple workflow project (default — run with `overlord run`)"
 	case "hello":
-		return "single-stage pipeline for first-run smoke test"
+		return "strict-mode single-stage pipeline (advanced)"
 	case "summarize":
-		return "2-stage linear chain (intake → validate)"
+		return "strict-mode 2-stage linear pipeline (advanced)"
 	default:
 		return "(scaffolded project)"
 	}
 }
 
-// runDemo runs one payload through the scaffolded pipeline with a
+// runDemo runs one payload through the scaffolded project with a
 // fully-specified broker lifecycle (goroutine + cancelable context +
 // wg.Wait + Stopper.Stop), mirroring cmd/overlord/exec.go. Returns the
 // final stage payload on success, or a non-nil error describing the
 // failure mode (timeout, FAILED state, build error, etc.).
 //
+// Workflow-shaped scaffolds (the default) go through the workflow
+// runner so the beginner path never requires a hand-built
+// sample_payload.json. Strict-pipeline scaffolds keep the original
+// sample_payload.json + broker.Submit flow.
+//
 // The broker is always drained before returning, even on error paths.
 func runDemo(ctx context.Context, target string, stderr io.Writer) (payload json.RawMessage, runErr error) {
 	configPath := filepath.Join(target, "overlord.yaml")
+
+	if workflow.IsWorkflowFile(configPath) {
+		return runDemoWorkflow(ctx, target, stderr)
+	}
 
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -502,6 +524,48 @@ func runDemo(ctx context.Context, target string, stderr io.Writer) (payload json
 	}
 }
 
+// runDemoWorkflow is the workflow-shape counterpart of runDemo. It
+// loads sample_input.txt, runs the workflow to a terminal state via
+// workflow.Run, and returns the final payload so the init command
+// prints it on stdout. The rest of the init flow (next-steps,
+// SIGINT handling, exit codes) does not care which variant ran.
+func runDemoWorkflow(ctx context.Context, target string, stderr io.Writer) (json.RawMessage, error) {
+	configPath := filepath.Join(target, "overlord.yaml")
+	file, err := workflow.Load(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("load scaffolded workflow: %w", err)
+	}
+	inputPath := filepath.Join(target, "sample_input.txt")
+	sample, err := os.ReadFile(inputPath)
+	if err != nil {
+		// sample_input.txt is optional — workflows with no external
+		// input still run. Tolerate missing-file errors here and feed
+		// an empty string.
+		sample = nil
+	}
+	basePath, absErr := filepath.Abs(target)
+	if absErr != nil {
+		basePath = target
+	}
+	logger := newDemoLogger(stderr)
+	fmt.Fprintf(stderr, "Running workflow %s (mock provider, no credentials)…\n", file.Workflow.ID)
+	result, runErr := workflow.Run(ctx, file, basePath, workflow.RunOptions{
+		Input:   string(sample),
+		Timeout: demoTimeout,
+		Logger:  logger,
+	})
+	if runErr != nil {
+		return nil, runErr
+	}
+	if result == nil || result.Task == nil {
+		return nil, fmt.Errorf("workflow produced no result")
+	}
+	if result.Task.State != broker.TaskStateDone && result.Task.State != broker.TaskStateReplayed {
+		return nil, fmt.Errorf("workflow ended in state %s", result.Task.State)
+	}
+	return result.Task.Payload, nil
+}
+
 // demoOutcome enumerates the reasons waitForDemoTerminal returns early.
 type demoOutcome int
 
@@ -549,11 +613,15 @@ func lastKnownState(t *broker.Task) broker.TaskState {
 	return t.State
 }
 
-// formatNextSteps reads the scaffolded config to extract the pipeline ID
-// and first-stage input schema, then renders the stable ASCII next-steps
-// block. Plain text only — no ANSI colors.
+// formatNextSteps reads the scaffolded config and renders the stable
+// ASCII next-steps block. Plain text only — no ANSI colors. Workflow
+// scaffolds get the beginner-friendly `overlord run` block; strict
+// pipelines keep the `overlord exec --payload` block.
 func formatNextSteps(absTarget string) (string, error) {
 	configPath := filepath.Join(absTarget, "overlord.yaml")
+	if workflow.IsWorkflowFile(configPath) {
+		return formatNextStepsWorkflow(absTarget), nil
+	}
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return "", fmt.Errorf("load scaffolded config: %w", err)
@@ -593,6 +661,26 @@ func formatNextSteps(absTarget string) (string, error) {
 	b.WriteString("  # To use a real LLM, uncomment the real provider block in overlord.yaml\n")
 	b.WriteString("  # and change the stage's agent reference from <id>-mock to <id>.")
 	return b.String(), nil
+}
+
+// formatNextStepsWorkflow renders the beginner-friendly next-steps
+// block. `overlord run --input-file sample_input.txt` is the core
+// verb; the `serve` hint is mentioned so operators who want a
+// long-running service know where to look.
+func formatNextStepsWorkflow(absTarget string) string {
+	quoted := shellQuote(absTarget)
+	var b strings.Builder
+	b.WriteString("Next steps:\n")
+	fmt.Fprintf(&b, "  cd %s && overlord run --input-file sample_input.txt\n", quoted)
+	b.WriteString("  # Serve the workflow as a local service:\n")
+	b.WriteString("  #   overlord serve\n")
+	b.WriteString("  # Swap mock/* for a real provider (e.g. anthropic/claude-sonnet-4-5,\n")
+	b.WriteString("  # openai/gpt-4o, google/gemini-2.5-pro) in overlord.yaml and remove\n")
+	b.WriteString("  # the matching fixture: line to run against a live LLM.\n")
+	b.WriteString("  # Graduate to the advanced strict format when you need fan-out or\n")
+	b.WriteString("  # conditional routing:\n")
+	b.WriteString("  #   overlord export --advanced --out ./advanced")
+	return b.String()
 }
 
 // fallbackNextSteps is used when the scaffolded config can't be parsed

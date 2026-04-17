@@ -53,17 +53,46 @@ func runInitCmd(t *testing.T, args ...string) (exitCode int, stdout, stderr stri
 // Argument and template validation
 // =============================================================================
 
-func TestInit_MissingTemplateArg(t *testing.T) {
-	t.Chdir(t.TempDir())
-	code, _, stderr := runInitCmd(t)
-	if code != initExitInvalidTarget {
-		t.Fatalf("expected exit %d, got %d\nstderr: %s", initExitInvalidTarget, code, stderr)
+// TestInit_StarterHappyPath runs the default workflow starter end-to-
+// end. This is the first-run experience a new user walks through and
+// must keep producing a real output line on stdout.
+func TestInit_StarterHappyPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "starter-proj")
+	code, stdout, stderr := runInitCmd(t, "starter", dir)
+	if code != initExitSuccess {
+		t.Fatalf("expected exit 0, got %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "available templates:") {
-		t.Errorf("stderr missing template list\nstderr: %s", stderr)
+	// The review fixture contains this phrase, which flows through
+	// the chain metadata and the final workflow payload verbatim.
+	if !strings.Contains(stdout, "positioning is clear") {
+		t.Errorf("stdout missing starter demo payload:\nstdout: %q\nstderr: %q", stdout, stderr)
 	}
-	if !strings.Contains(stderr, "hello") {
-		t.Errorf("stderr missing hello template\nstderr: %s", stderr)
+	if !strings.Contains(stderr, "overlord run --input-file sample_input.txt") {
+		t.Errorf("stderr missing workflow-first next-steps:\nstderr: %s", stderr)
+	}
+}
+
+// TestInit_NoArgsScaffoldsStarter documents the default behavior of
+// `overlord init` — with no template argument the command scaffolds
+// the workflow starter template, which is the beginner-friendly
+// default product surface.
+func TestInit_NoArgsScaffoldsStarter(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	code, _, stderr := runInitCmd(t, "--no-run")
+	if code != initExitSuccess {
+		t.Fatalf("expected exit 0, got %d\nstderr: %s", code, stderr)
+	}
+	// Default target is "./starter" — produced files must include
+	// overlord.yaml (workflow-shaped) and sample_input.txt.
+	if _, err := os.Stat(filepath.Join(tmp, "starter", "overlord.yaml")); err != nil {
+		t.Errorf("starter overlord.yaml not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "starter", "sample_input.txt")); err != nil {
+		t.Errorf("starter sample_input.txt not created: %v", err)
+	}
+	if !strings.Contains(stderr, "overlord run --input-file sample_input.txt") {
+		t.Errorf("next-steps missing run instruction: %s", stderr)
 	}
 }
 

@@ -1,0 +1,1 @@
+We are launching a new Overlord CLI release and need a short announcement email: what changed, why it matters to platform teams, and where to read the release notes.

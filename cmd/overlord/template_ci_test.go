@@ -67,6 +67,15 @@ func TestShippedTemplates(t *testing.T) {
 	for _, name := range scaffold.ListTemplates() {
 		name := name
 		t.Run(name, func(t *testing.T) {
+			if isWorkflowTemplate(name) {
+				// Workflow-shaped templates are covered by
+				// TestInit_StarterHappyPath and the workflow-package
+				// end-to-end test. They intentionally skip the strict
+				// `auth:` / `.gitignore` / `-mock agent` contract this
+				// gate enforces.
+				t.Skipf("skipping strict-pipeline CI contract for workflow template %q", name)
+				return
+			}
 			start := time.Now()
 			assertTemplateFullFlow(t, name)
 			elapsed := time.Since(start)
@@ -76,6 +85,18 @@ func TestShippedTemplates(t *testing.T) {
 			t.Logf("template %s: full CI flow wall-clock %s (budget %s)", name, elapsed, templateTimeBudget)
 		})
 	}
+}
+
+// isWorkflowTemplate reports whether a shipped template scaffolds a
+// workflow-shaped overlord.yaml (versus a strict-pipeline one). The
+// shipped list is small enough that a switch keeps the intent
+// explicit.
+func isWorkflowTemplate(name string) bool {
+	switch name {
+	case "starter":
+		return true
+	}
+	return false
 }
 
 // assertTemplateFullFlow runs every Unit 6 assertion against a single
