@@ -364,11 +364,19 @@ func TestCLI_RootHelp_ContainsExample(t *testing.T) {
 	if !strings.Contains(output, "Quick start:") {
 		t.Error("root help should contain 'Quick start:' section")
 	}
-	if !strings.Contains(output, "overlord submit") {
-		t.Error("root help should show submit example")
+	// The workflow-first narrative leads with init → run → serve →
+	// export. `submit` and `validate` are still valid subcommands but
+	// are advanced; root help should teach the beginner path first.
+	for _, want := range []string{"overlord init", "overlord run", "overlord serve", "overlord export"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("root help should mention %q", want)
+		}
 	}
-	if !strings.Contains(output, "overlord validate") {
-		t.Error("root help should show validate example")
+	// Chain mode is intentionally hidden from root help so new users
+	// see the two-layer story (workflow → strict) rather than a third
+	// authoring surface.
+	if strings.Contains(output, "overlord chain ") {
+		t.Error("root help should not advertise the `chain` subcommand (hidden legacy surface)")
 	}
 }
 

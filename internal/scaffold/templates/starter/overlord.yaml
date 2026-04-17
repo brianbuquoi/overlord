@@ -16,7 +16,10 @@ version: "1"
 # `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`,
 # `google/gemini-2.5-pro`, or `ollama/llama3`) and remove the
 # `fixture:` line for that step. Provider credentials come from
-# environment variables — see docs/chain.md for the full list.
+# environment variables — copy .env.example to .env and fill in the
+# key for whichever provider you pick. See docs/init.md for the full
+# provider table and README.md for the workflow → strict graduation
+# story.
 
 workflow:
   id: starter

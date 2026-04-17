@@ -102,28 +102,27 @@ func rootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "overlord",
 		Short: "AI Agent Orchestration Platform",
-		Long: `Overlord is an orchestration engine for AI agent pipelines.
+		Long: `Overlord runs linear LLM workflows locally and graduates them to a
+full strict-config pipeline (with fan-out, retries, dead-letter replay,
+dashboard, and auth) when you outgrow the simple shape.
 
-Pipelines are defined in YAML. Each pipeline has stages that route tasks
-through LLM agents (Anthropic, OpenAI, Google, Ollama) with typed,
-versioned I/O contracts and automatic prompt injection sanitization.
+A workflow is a short YAML with a few steps; each step picks a model
+(anthropic/openai/google/ollama/mock) and a prompt. Every run is
+sanitizer-wrapped and contract-validated by the broker.
 
 Quick start:
-  # Validate your pipeline config
-  overlord validate --config pipeline.yaml
+  # Scaffold a workflow project you can run with zero credentials.
+  overlord init my-workflow
 
-  # Start the engine
-  overlord run --config pipeline.yaml
+  # Run it locally; output lands on stdout.
+  overlord run --input "summarize this"
 
-  # Submit a task
-  overlord submit --config pipeline.yaml --id my-pipeline \
-    --payload '{"request": "hello"}'
+  # Serve it as a long-running local service (dashboard + HTTP API).
+  overlord serve
 
-  # Check task status
-  overlord status --config pipeline.yaml --task <task-id>
-
-  # Watch a task until it completes
-  overlord status --config pipeline.yaml --task <task-id> --watch`,
+  # Graduate to the strict/advanced layer when you need fan-out,
+  # conditional routing, retry budgets, or multi-store deployments.
+  overlord export --advanced --out ./advanced`,
 		Version:       overlordVersion,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -149,8 +148,11 @@ Quick start:
 	// Chain mode is retained as a legacy/internal authoring surface.
 	// The default simple front door is `workflow:` + `overlord run`;
 	// the chain commands still work for projects authored against the
-	// prior layer.
-	root.AddCommand(chainCmd())
+	// prior layer, but we hide them from root help so new users see the
+	// workflow → strict graduation path instead of a third option.
+	chain := chainCmd()
+	chain.Hidden = true
+	root.AddCommand(chain)
 
 	return root
 }
