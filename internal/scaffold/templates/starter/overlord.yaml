@@ -29,8 +29,14 @@ workflow:
   vars:
     audience: "engineering leaders"
 
+  # Give each step a meaningful `id:`. They become the stage IDs in
+  # the exported strict config (overlord export --advanced), so
+  # picking a clear name now saves a rename later. Skipping the id
+  # works — the compiler will auto-generate `step_1`, `step_2`, etc.
+  # — but those generic names persist into any advanced edits.
   steps:
-    - model: mock/draft
+    - id: draft
+      model: mock/draft
       fixture: fixtures/draft.json
       prompt: |
         You are writing a first draft for {{vars.audience}}.
@@ -40,7 +46,8 @@ workflow:
 
         Respond with plain prose.
 
-    - model: mock/review
+    - id: review
+      model: mock/review
       fixture: fixtures/review.json
       prompt: |
         You are reviewing a draft. Focus on:
