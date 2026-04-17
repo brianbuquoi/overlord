@@ -1,0 +1,58 @@
+version: "1"
+
+# Scaffolded by `overlord chain init write-review`.
+#
+# Two-step chain: a draft model writes a short note, a review model
+# critiques it. Both steps run against the built-in mock provider by
+# default so the scaffolded demo produces output with zero credentials.
+# To graduate to a real LLM, change the step's `model:` to a real
+# provider/model (e.g. `anthropic/claude-sonnet-4-5`) and delete the
+# `fixture:` line.
+
+chain:
+  id: write-review
+
+  input:
+    type: text
+
+  vars:
+    topic: "Write a short design note for a CLI feature."
+
+  steps:
+    - id: draft
+      model: mock/draft
+      fixture: fixtures/draft.json
+      prompt: |
+        You are writing a first draft.
+
+        Task:
+        {{vars.topic}}
+
+        Source material:
+        {{input}}
+
+        Respond with the draft as plain prose.
+
+    - id: review
+      model: mock/review
+      fixture: fixtures/review.json
+      prompt: |
+        You are reviewing a draft.
+
+        Focus on:
+        - correctness
+        - missing edge cases
+        - unclear reasoning
+        - implementation risks
+
+        Original task:
+        {{vars.topic}}
+
+        Draft under review:
+        {{steps.draft.output}}
+
+        Respond with the review as plain prose.
+
+  output:
+    from: steps.review.output
+    type: text

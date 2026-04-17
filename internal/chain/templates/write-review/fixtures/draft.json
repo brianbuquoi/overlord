@@ -1,0 +1,3 @@
+{
+  "text": "Overlord is adding a lightweight `chain` mode for local prompt workflows. Authors write a minimal YAML with steps, each step names a model and a prompt, and references previous step outputs via double-brace placeholders. The chain compiles into a normal pipeline so the same broker handles retries, sanitization, and contracts. The first release is linear only and wraps text inputs as JSON internally. Graduation is an export command that emits the equivalent full pipeline config for hand-editing."
+}

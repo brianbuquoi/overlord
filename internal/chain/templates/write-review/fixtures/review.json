@@ -1,0 +1,3 @@
+{
+  "text": "Good framing — positioning chain mode as an authoring layer over the existing runtime is the right call; it avoids a second engine and keeps the production path intact. Two risks worth naming: (1) the {{input}} wire format (JSON wrap of raw text) is easy to misread in logs — note it in docs; (2) mock-only scaffolds should print the swap-to-real-provider instructions at run time so new users discover graduation naturally. Missing: no fan-out in v1 — state that explicitly so authors don't ask for parallel reviewers in chain syntax."
+}

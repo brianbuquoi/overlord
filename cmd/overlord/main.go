@@ -143,6 +143,10 @@ Quick start:
 	root.AddCommand(deadLetterCmd())
 	root.AddCommand(completionCmd())
 	root.AddCommand(versionCmd())
+	// Chain mode: the lightweight authoring layer. Compiles into the
+	// same runtime used by `run`/`exec` so existing pipeline features
+	// (contracts, sanitizer, retries, tracing) still apply.
+	root.AddCommand(chainCmd())
 
 	return root
 }
