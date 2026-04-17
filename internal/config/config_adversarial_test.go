@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -351,7 +352,7 @@ func TestAdversarial_WatchReloadsOnFileChange(t *testing.T) {
 
 	done := make(chan *Config, 1)
 
-	err := Watch(path, func(cfg *Config) {
+	err := Watch(context.Background(), path, func(cfg *Config) {
 		// Non-blocking send: only the first callback matters.
 		select {
 		case done <- cfg:
@@ -388,7 +389,7 @@ func TestAdversarial_WatchRejectsInvalidConfig(t *testing.T) {
 	var mu sync.Mutex
 	callCount := 0
 
-	err := Watch(path, func(cfg *Config) {
+	err := Watch(context.Background(), path, func(cfg *Config) {
 		mu.Lock()
 		defer mu.Unlock()
 		callCount++
@@ -429,7 +430,7 @@ func TestAdversarial_WatchDebounce(t *testing.T) {
 	callCount := 0
 	var lastConfig *Config
 
-	err := Watch(path, func(cfg *Config) {
+	err := Watch(context.Background(), path, func(cfg *Config) {
 		mu.Lock()
 		defer mu.Unlock()
 		callCount++

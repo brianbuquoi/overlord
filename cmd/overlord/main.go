@@ -571,7 +571,8 @@ func runServerFromConfig(cmd *cobra.Command, a serverArgs) error {
 	// Hot-reload on SIGHUP — only meaningful when the process is
 	// watching a concrete YAML file on disk.
 	if a.hotReload && a.configPath != "" {
-		if err := config.Watch(a.configPath, func(newCfg *config.Config) {
+		watchCtx := ctx // shutdown via the same parent context the server uses
+		if err := config.Watch(watchCtx, a.configPath, func(newCfg *config.Config) {
 			newBasePath := configBasePath(a.configPath)
 			newReg, err := buildContractRegistry(newCfg, newBasePath)
 			if err != nil {

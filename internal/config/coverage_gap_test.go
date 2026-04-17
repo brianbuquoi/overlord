@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,58 +87,90 @@ func setupMinimalCfg(t *testing.T) string {
 }
 
 // ---------------------------------------------------------------------------
-// 1.1 TestWatch_NoDebounce
+// 1.1 TestWatch_DebouncesBursts + TestWatch_ContextCancel
 // ---------------------------------------------------------------------------
 
-// TestWatch_NoDebounce documents that Watch does NOT debounce filesystem
-// events. Each write to the config file triggers a separate reload callback.
-// This is a known behavioural characteristic, not a bug -- but callers should
-// be aware that rapid config writes produce rapid reload calls.
-func TestWatch_NoDebounce(t *testing.T) {
+// TestWatch_DebouncesBursts locks in the post-refactor contract: a rapid
+// burst of FS writes coalesces into a single onChange callback once the
+// debounce window has elapsed. This protects against reload storms on
+// editor saves (vim/VSCode/JetBrains typically issue multiple Create +
+// Write events per atomic rename-into-place).
+func TestWatch_DebouncesBursts(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
 	writeCfgFile(t, cfgPath, minimalValidYAML())
 	writeMinimalSchemaFile(t, filepath.Join(dir, "schemas", "in_v1.json"))
 	writeMinimalSchemaFile(t, filepath.Join(dir, "schemas", "out_v1.json"))
 
-	var callCount atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
-	err := Watch(cfgPath, func(cfg *Config) {
+	var callCount atomic.Int64
+	if err := Watch(ctx, cfgPath, func(cfg *Config) {
 		callCount.Add(1)
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Watch returned error: %v", err)
 	}
 
-	// Give the watcher goroutine time to start.
+	// Give the watcher goroutine time to install its fsnotify handle.
+	time.Sleep(50 * time.Millisecond)
+
+	// Burst: 10 writes within one debounce window. Events delivered to
+	// the watcher should coalesce via the internal timer so exactly one
+	// callback fires.
+	for i := 0; i < 10; i++ {
+		writeCfgFile(t, cfgPath, minimalValidYAML())
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Wait long enough for the debounce window plus a margin so the
+	// reload has time to fire. fsDebounceInterval is private to the
+	// package but we can observe its effect.
+	time.Sleep(300 * time.Millisecond)
+
+	got := callCount.Load()
+	if got == 0 {
+		t.Fatalf("expected at least 1 onChange call after a write burst, got 0")
+	}
+	if got >= 10 {
+		t.Fatalf("expected the write burst to be coalesced into fewer callbacks; got %d (no debounce)", got)
+	}
+	t.Logf("onChange called %d times for a 10-write burst (debounce working)", got)
+}
+
+// TestWatch_ContextCancel confirms the watcher goroutine returns when
+// ctx is cancelled — the audit's lifecycle concern.
+func TestWatch_ContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	writeCfgFile(t, cfgPath, minimalValidYAML())
+	writeMinimalSchemaFile(t, filepath.Join(dir, "schemas", "in_v1.json"))
+	writeMinimalSchemaFile(t, filepath.Join(dir, "schemas", "out_v1.json"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var called atomic.Int64
+	if err := Watch(ctx, cfgPath, func(cfg *Config) {
+		called.Add(1)
+	}); err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+
+	// Cancel, then write the file. The onChange callback must NOT fire
+	// because the watcher goroutine should have exited.
+	cancel()
+
+	// Give the goroutine time to return.
 	time.Sleep(100 * time.Millisecond)
 
-	// Write the config file 3 times with 50ms intervals.
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		writeCfgFile(t, cfgPath, minimalValidYAML())
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(fsDebounceInterval + 50*time.Millisecond)
 	}
 
-	// Allow time for all events to be processed.
-	deadline := time.After(3 * time.Second)
-	for {
-		if callCount.Load() >= 3 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("expected onChange to be called at least 3 times (no debounce), got %d calls", callCount.Load())
-		default:
-			time.Sleep(20 * time.Millisecond)
-		}
+	if got := called.Load(); got != 0 {
+		t.Errorf("expected 0 callbacks after ctx cancel; got %d — watcher did not shut down", got)
 	}
-
-	// Watch has no debounce: each write fired a separate callback.
-	got := callCount.Load()
-	if got < 3 {
-		t.Fatalf("expected at least 3 onChange calls (no debounce), got %d", got)
-	}
-	t.Logf("onChange called %d times for 3 writes -- confirms Watch does NOT debounce", got)
 }
 
 // ---------------------------------------------------------------------------
