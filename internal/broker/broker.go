@@ -929,6 +929,14 @@ func (b *Broker) waitForBudget(ctx context.Context, pipelineID string, stage *co
 // transition or the final requeue leaves the task visible in the
 // store for redelivery and increments broker_store_errors_total
 // instead of emitting a success event.
+//
+// The state-writing store calls use a bounded persistence context
+// derived from Background() (not the worker ctx). Shutdown cancels
+// the worker ctx, but the RETRYING→PENDING bookkeeping must still
+// land so a task mid-backoff is not stranded in RETRYING forever.
+// The intermediate sleep keeps honoring the worker ctx so shutdown
+// still aborts the backoff wait — only the durable writes are
+// isolated from caller cancel.
 func (b *Broker) retryTask(ctx context.Context, stage *config.Stage, task *Task) {
 	if b.metrics != nil {
 		b.metrics.TaskRetriesTotal.WithLabelValues(task.PipelineID, stage.ID).Inc()
@@ -938,10 +946,13 @@ func (b *Broker) retryTask(ctx context.Context, stage *config.Stage, task *Task)
 
 	retrying := TaskStateRetrying
 	attempts := task.Attempts
-	if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{
+	upCtx, upCancel := b.persistCtx()
+	err := b.store.UpdateTask(upCtx, task.ID, TaskUpdate{
 		State:    &retrying,
 		Attempts: &attempts,
-	}); err != nil {
+	})
+	upCancel()
+	if err != nil {
 		b.recordStoreError("update_task", task.PipelineID, stage.ID, err)
 		return
 	}
@@ -953,10 +964,13 @@ func (b *Broker) retryTask(ctx context.Context, stage *config.Stage, task *Task)
 	b.sleepFn(ctx, delay)
 
 	pending := TaskStatePending
-	if err := b.store.RequeueTask(ctx, task.ID, stage.ID, TaskUpdate{
+	rqCtx, rqCancel := b.persistCtx()
+	err = b.store.RequeueTask(rqCtx, task.ID, stage.ID, TaskUpdate{
 		State:    &pending,
 		Attempts: &attempts,
-	}); err != nil {
+	})
+	rqCancel()
+	if err != nil {
 		b.recordStoreError("requeue_task", task.PipelineID, stage.ID, err)
 		return
 	}
@@ -1202,15 +1216,28 @@ func (b *Broker) routeSuccess(ctx context.Context, pipelineID string, stage *con
 // store error the task stays in its pre-failure state in the store;
 // broker_store_errors_total is incremented so operators see the
 // divergence without the dead-letter counter silently ticking up.
+//
+// Store writes use a bounded persistence context derived from
+// Background() so a worker ctx that was cancelled (shutdown, or the
+// waitForBudget ctx.Done branch) does not prevent the terminal
+// state transition from landing. The worker ctx is still threaded
+// into mergeMetadata/UpdateTask wrappers below, but each call
+// overrides its own ctx with persistCtx — see comment in
+// retryTask for the overall model.
 func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.Stage, task *Task, reason string) {
-	b.mergeMetadata(ctx, task, map[string]any{"failure_reason": reason})
+	mdCtx, mdCancel := b.persistCtx()
+	b.mergeMetadata(mdCtx, task, map[string]any{"failure_reason": reason})
+	mdCancel()
 
 	next := stage.OnFailure
 	if next == "" || next == "dead-letter" {
 		from := task.State
 		state := TaskStateFailed
 		deadLetter := true
-		if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state, RoutedToDeadLetter: &deadLetter}); err != nil {
+		upCtx, upCancel := b.persistCtx()
+		err := b.store.UpdateTask(upCtx, task.ID, TaskUpdate{State: &state, RoutedToDeadLetter: &deadLetter})
+		upCancel()
+		if err != nil {
 			b.recordStoreError("update_task", pipelineID, stage.ID, err)
 			return
 		}
@@ -1244,7 +1271,10 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 	b.mu.RUnlock()
 	if !ok {
 		state := TaskStateFailed
-		if err := b.store.UpdateTask(ctx, task.ID, TaskUpdate{State: &state}); err != nil {
+		upCtx, upCancel := b.persistCtx()
+		err := b.store.UpdateTask(upCtx, task.ID, TaskUpdate{State: &state})
+		upCancel()
+		if err != nil {
 			b.recordStoreError("update_task", pipelineID, stage.ID, err)
 			return
 		}
@@ -1259,7 +1289,8 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 	attempts := 0
 	maxAttempts := nextStage.Retry.MaxAttempts
 	transitions := task.CrossStageTransitions
-	if err := b.store.RequeueTask(ctx, task.ID, next, TaskUpdate{
+	rqCtx, rqCancel := b.persistCtx()
+	err := b.store.RequeueTask(rqCtx, task.ID, next, TaskUpdate{
 		State:                 &state,
 		StageID:               &next,
 		Attempts:              &attempts,
@@ -1269,7 +1300,9 @@ func (b *Broker) failTask(ctx context.Context, pipelineID string, stage *config.
 		OutputSchemaVersion:   &nextStage.OutputSchema.Version,
 		MaxAttempts:           &maxAttempts,
 		CrossStageTransitions: &transitions,
-	}); err != nil {
+	})
+	rqCancel()
+	if err != nil {
 		b.recordStoreError("requeue_task", pipelineID, next, err)
 		return
 	}
@@ -1390,6 +1423,34 @@ func (b *Broker) recordTerminalMetrics(task *Task, pipelineID, stageID, finalSta
 		delete(b.taskSpans, task.ID)
 	}
 	b.mu.Unlock()
+}
+
+// defaultPersistTimeout bounds every terminal/requeue store write
+// that uses the broker's persistence context. Five seconds is long
+// enough for any reasonable store operation to complete and short
+// enough that a wedged store does not hang shutdown past the normal
+// drain window. Kept a package-level constant rather than a config
+// field — this is a backstop for fail-closed bookkeeping, not a
+// policy lever.
+const defaultPersistTimeout = 5 * time.Second
+
+// persistCtx returns a bounded context for durable bookkeeping that
+// is intentionally divorced from any caller context. The worker ctx
+// is cancelled on shutdown or during a waitForBudget abort; terminal
+// writes and retry-requeue writes must still land or the task is
+// stranded in a non-terminal state until operator intervention.
+//
+// Derived from context.Background() with defaultPersistTimeout, so a
+// wedged store cannot pin shutdown past that window. Callers MUST
+// call the returned CancelFunc once the store call returns — the
+// usual defer pattern is fine.
+//
+// This is the implementation half of the audit finding that
+// shutdown/cancel paths were calling failTask / retryTask with an
+// already-cancelled ctx and silently losing the terminal state
+// transition.
+func (b *Broker) persistCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), defaultPersistTimeout)
 }
 
 // mergeMetadata updates task metadata both in-memory and in the
