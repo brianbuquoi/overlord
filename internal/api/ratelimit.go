@@ -14,6 +14,13 @@ type tokenBucket struct {
 	burst   int           // max tokens (bucket capacity)
 	cleanup time.Duration // how often to sweep stale buckets
 	now     func() time.Time
+
+	// done is closed by cleanupLoop when it exits. Tests use this to
+	// wait deterministically for goroutine teardown — the SEC-014
+	// regression previously raced on tb.cleanup, which the goroutine
+	// reads from another goroutine, by trying to tune the tick rate
+	// after construction.
+	done chan struct{}
 }
 
 type bucket struct {
@@ -32,6 +39,7 @@ func newTokenBucket(ctx context.Context, rate float64, burst int) *tokenBucket {
 		burst:   burst,
 		cleanup: 5 * time.Minute,
 		now:     time.Now,
+		done:    make(chan struct{}),
 	}
 	go tb.cleanupLoop(ctx)
 	return tb
@@ -66,8 +74,10 @@ func (tb *tokenBucket) allow(key string) bool {
 
 // cleanupLoop periodically removes stale entries. Exits cleanly when
 // ctx is cancelled so tests and short-lived servers do not leak the
-// goroutine.
+// goroutine. tb.done is closed on exit so callers can wait for
+// teardown without racing on internal fields.
 func (tb *tokenBucket) cleanupLoop(ctx context.Context) {
+	defer close(tb.done)
 	ticker := time.NewTicker(tb.cleanup)
 	defer ticker.Stop()
 	for {

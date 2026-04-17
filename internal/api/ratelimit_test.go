@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -12,37 +11,31 @@ import (
 // short-lived server or test that constructed a limiter leaked a
 // background goroutine. Cancelling the context must release the
 // goroutine deterministically.
+//
+// The goroutine's select is woken immediately by ctx.Done() regardless
+// of the cleanup ticker interval, so we don't need to shrink tb.cleanup
+// from the default 5-minute value. Waiting on tb.done is race-free:
+// cleanupLoop closes it before returning, so the receive blocks until
+// after every field access is complete.
 func TestTokenBucket_CleanupStopsOnContextCancel(t *testing.T) {
-	base := runtime.NumGoroutine()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	tb := newTokenBucket(ctx, 10, 10)
-	// Force a short cleanup interval so the loop is actually running
-	// against the ticker rather than sitting on the first wake-up.
-	tb.cleanup = 10 * time.Millisecond
 
-	// Allow the goroutine to start and loop at least once.
+	// Touch the limiter so we know the goroutine has had a chance to
+	// start — this is not required for correctness (close(done) happens
+	// from the goroutine itself), but it keeps the test's intent clear.
 	if !tb.allow("k") {
 		t.Fatal("first allow must succeed")
-	}
-	time.Sleep(50 * time.Millisecond)
-
-	peak := runtime.NumGoroutine()
-	if peak <= base {
-		t.Fatalf("expected goroutine count to grow; base=%d peak=%d", base, peak)
 	}
 
 	cancel()
 
-	// Poll for the goroutine to exit rather than sleep a fixed duration.
-	deadline := time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() <= base {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-tb.done:
+		// The goroutine exited cleanly on ctx.Done(). SEC-014 verified.
+	case <-time.After(1 * time.Second):
+		t.Fatal("cleanup goroutine did not exit within 1s of ctx cancel")
 	}
-	t.Fatalf("cleanup goroutine did not exit after ctx cancel; base=%d current=%d", base, runtime.NumGoroutine())
 }
 
 // TestTokenBucket_AllowBasics confirms the core rate-limit behavior is
