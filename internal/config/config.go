@@ -393,7 +393,7 @@ func validateAgents(agents []Agent) error {
 	for _, a := range agents {
 		if n := len(a.SystemPrompt); n > MaxSystemPromptBytes {
 			return fmt.Errorf(
-				"agent %q: system_prompt is %d bytes which exceeds the %d-byte ceiling (SEC4-006). Shrink the prompt or move bulky context into a stage input schema.",
+				"agent %q: system_prompt is %d bytes which exceeds the %d-byte ceiling (SEC4-006) — shrink the prompt or move bulky context into a stage input schema",
 				a.ID, n, MaxSystemPromptBytes,
 			)
 		}
