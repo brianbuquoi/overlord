@@ -161,7 +161,7 @@ func TestRun_JSONInputPreservesObjectInPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	raw, _ := result.Task.Metadata[ChainMetaKey]
+	raw := result.Task.Metadata[ChainMetaKey]
 	b, _ := json.Marshal(raw)
 	var cm chainMeta
 	if err := json.Unmarshal(b, &cm); err != nil {
