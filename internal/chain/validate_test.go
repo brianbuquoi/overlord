@@ -120,6 +120,105 @@ func TestValidate_OutputFromUnknownStep(t *testing.T) {
 	}
 }
 
+// output.from v1 must reference the last step. Pointing at an
+// intermediate step is a documented validation error — authors who
+// need it graduate via `overlord chain export`.
+func TestValidate_OutputFromIntermediateStepRejected(t *testing.T) {
+	c := newTestChain()
+	c.Output = &Output{From: "steps.draft.output"}
+	err := Validate(c)
+	if err == nil || !strings.Contains(err.Error(), "must reference the last step") {
+		t.Fatalf("want last-step error, got: %v", err)
+	}
+}
+
+func TestValidate_OutputFromLastStepAccepted(t *testing.T) {
+	c := newTestChain()
+	c.Output = &Output{From: "steps.review.output"}
+	if err := Validate(c); err != nil {
+		t.Fatalf("last-step ref rejected: %v", err)
+	}
+}
+
+// A bare provider is only allowed for "mock". Every real provider
+// must be written as <provider>/<model>.
+func TestValidate_BareProviderRejectedForRealProvider(t *testing.T) {
+	c := newTestChain()
+	c.Steps[0].Model = "anthropic"
+	c.Steps[0].Fixture = ""
+	err := Validate(c)
+	if err == nil || !strings.Contains(err.Error(), "bare provider names are only allowed for \"mock\"") {
+		t.Fatalf("want bare-provider rejection, got: %v", err)
+	}
+}
+
+// Bare "mock" remains allowed because the mock provider never
+// consults the model field.
+func TestValidate_BareMockStillAccepted(t *testing.T) {
+	c := newTestChain()
+	c.Steps[0].Model = "mock"
+	if err := Validate(c); err != nil {
+		t.Fatalf("bare mock rejected: %v", err)
+	}
+}
+
+// A model string with an explicit provider but empty model half
+// (e.g. "anthropic/") is rejected as an incomplete reference.
+func TestValidate_EmptyModelAfterSlashRejected(t *testing.T) {
+	c := newTestChain()
+	c.Steps[0].Model = "anthropic/"
+	c.Steps[0].Fixture = ""
+	err := Validate(c)
+	if err == nil || !strings.Contains(err.Error(), "empty model") {
+		t.Fatalf("want empty-model error, got: %v", err)
+	}
+}
+
+// Inline output.schema is only valid when output.type: json.
+func TestValidate_OutputSchemaRequiresJSONType(t *testing.T) {
+	c := newTestChain()
+	c.Output = &Output{
+		Type:   "text",
+		Schema: map[string]any{"type": "object"},
+	}
+	err := Validate(c)
+	if err == nil || !strings.Contains(err.Error(), "only valid when chain.output.type is \"json\"") {
+		t.Fatalf("want schema-requires-json error, got: %v", err)
+	}
+}
+
+// Inline output.schema must be a JSONSchema the compiler can compile.
+func TestValidate_OutputSchemaRejectsInvalidJSONSchema(t *testing.T) {
+	c := newTestChain()
+	c.Output = &Output{
+		Type: "json",
+		// "type" must be a string in JSONSchema; feeding an int here
+		// makes the JSONSchema compiler reject the document.
+		Schema: map[string]any{"type": 42},
+	}
+	err := Validate(c)
+	if err == nil || !strings.Contains(err.Error(), "invalid JSONSchema") {
+		t.Fatalf("want invalid-schema error, got: %v", err)
+	}
+}
+
+func TestValidate_OutputSchemaValidJSONSchemaAccepted(t *testing.T) {
+	c := newTestChain()
+	c.Output = &Output{
+		Type: "json",
+		Schema: map[string]any{
+			"type":     "object",
+			"required": []any{"summary"},
+			"properties": map[string]any{
+				"summary": map[string]any{"type": "string"},
+			},
+		},
+	}
+	if err := Validate(c); err != nil {
+		t.Fatalf("valid inline schema rejected: %v", err)
+	}
+}
+
 func TestValidate_EmptySteps(t *testing.T) {
 	c := &Chain{ID: "x", Steps: nil}
 	if err := Validate(c); err == nil {

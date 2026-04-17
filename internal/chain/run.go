@@ -191,9 +191,13 @@ func wrapAgents(compiled *Compiled, base map[string]agent.Agent) map[string]brok
 			}
 		}
 	}
+	inputType := "text"
+	if compiled.Chain != nil {
+		inputType = compiled.Chain.InputType()
+	}
 	for id, b := range base {
 		stepID := stepByAgent[id]
-		wrapped[id] = NewStepAdapter(b, id, stepID).(broker.Agent)
+		wrapped[id] = NewStepAdapter(b, id, stepID, inputType).(broker.Agent)
 	}
 	return wrapped
 }

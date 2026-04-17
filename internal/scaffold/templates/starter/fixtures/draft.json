@@ -1,0 +1,3 @@
+{
+  "text": "Subject: Overlord v0.7 — one YAML, one workflow, one local command.\n\nTeams, we just shipped Overlord v0.7. The headline change is the new `workflow:` format: one file, a linear sequence of steps, each step a prompt plus a model. Run it locally with `overlord run`, serve it with `overlord serve`, and graduate to the strict schema + fan-out world with `overlord export --advanced` only when you need it. The runtime (broker, retries, sanitizer, dashboard) is unchanged — this is a simpler front door, not a new engine. Full release notes at https://github.com/brianbuquoi/overlord/releases."
+}

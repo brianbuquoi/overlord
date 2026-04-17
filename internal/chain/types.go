@@ -55,10 +55,18 @@ type Chain struct {
 
 // Input declares how the chain receives its initial payload.
 type Input struct {
-	// Type is either "text" (default) or "json". In text mode the CLI
-	// accepts a raw string via --input/--input-file and wraps it as
-	// {"text": "..."} before submission. In json mode the CLI accepts
-	// a JSON object verbatim.
+	// Type is either "text" (default) or "json":
+	//
+	//   - text: the CLI accepts a raw string via --input/--input-file
+	//     and wraps it as {"text": "..."} on the wire so every
+	//     built-in adapter sees a uniform object. {{input}} in step
+	//     prompts renders as that raw string.
+	//   - json: the CLI accepts a JSON object verbatim. The JSON is
+	//     forwarded unchanged to the first stage. {{input}} in step
+	//     prompts renders as the full original JSON object string
+	//     (never a single field of it) so authors can feed the whole
+	//     object into a prompt, or pluck individual fields with their
+	//     own string handling on the model side.
 	Type string `yaml:"type"`
 }
 
@@ -70,9 +78,11 @@ type Step struct {
 	ID string `yaml:"id"`
 
 	// Model is a "<provider>/<model>" string, e.g.
-	// "anthropic/claude-sonnet-4-5", "openai/gpt-4o", "mock/any".
-	// The provider portion must be a known built-in provider (see
-	// internal/agent/registry).
+	// "anthropic/claude-sonnet-4-5", "openai/gpt-4o". The provider
+	// portion must be a known built-in provider (see
+	// internal/agent/registry). A bare provider (no slash) is accepted
+	// **only** for the `mock` provider, where the model string is
+	// unused anyway.
 	Model string `yaml:"model"`
 
 	// Prompt is the step's system prompt. Template references:
@@ -104,14 +114,31 @@ type Step struct {
 // Output declares the chain's final-output shape.
 type Output struct {
 	// From is the reference expression the chain runner treats as the
-	// final payload. v1 accepts only "steps.<id>.output". Empty means
-	// "use the last step's output".
+	// final payload. v1 accepts only "steps.<id>.output" and the
+	// referenced step must be the chain's **last** step — intermediate
+	// step selection is not supported in chain mode. Authors who need
+	// it should graduate via `overlord chain export`. Empty means "use
+	// the last step's output".
 	From string `yaml:"from,omitempty"`
 
 	// Type is either "text" (default) or "json". Controls how the
 	// final payload is surfaced by `overlord chain run` and which
 	// synthesized schema the last stage validates against.
 	Type string `yaml:"type,omitempty"`
+
+	// Schema is an optional inline JSONSchema the last stage's output
+	// payload is validated against. Only valid when Type is "json";
+	// setting it with any other type is a validation error. The shape
+	// is a map that YAML parses directly and the compiler serializes
+	// to JSON before handing to the schema registry — so any valid
+	// JSONSchema fragment works (type, required, properties, etc.).
+	//
+	// v1 keeps this deliberately lightweight: there is no $ref support,
+	// no version bumping, and no registry ceremony. The schema is
+	// synthesized under the reserved name chain_json@v1. Authors who
+	// need full schema-registry semantics should graduate via
+	// `overlord chain export` and hand-edit the exported pipeline.
+	Schema map[string]any `yaml:"schema,omitempty"`
 }
 
 // InputType returns the normalized input type, defaulting to "text".

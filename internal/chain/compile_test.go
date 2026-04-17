@@ -87,3 +87,48 @@ func TestCompile_InvalidModelStringForNonMockProvider(t *testing.T) {
 		t.Fatal("expected error for unknown provider")
 	}
 }
+
+// Inline output.schema must replace the default open-object schema so
+// the compiled registry enforces the user's contract on the final
+// stage.
+func TestCompile_InlineOutputSchemaOverridesDefault(t *testing.T) {
+	c := newTestChain()
+	c.Output = &Output{
+		Type: "json",
+		Schema: map[string]any{
+			"type":     "object",
+			"required": []any{"summary"},
+			"properties": map[string]any{
+				"summary": map[string]any{"type": "string"},
+			},
+		},
+	}
+	compiled, err := Compile(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := schemaKey(jsonSchemaName, jsonSchemaVersion)
+	raw, ok := compiled.Schemas[key]
+	if !ok {
+		t.Fatalf("synthesized schemas missing %q", key)
+	}
+	if !strings.Contains(string(raw), "\"summary\"") {
+		t.Fatalf("compiled schema bytes did not preserve user fields: %s", raw)
+	}
+	cs, err := compiled.Registry.Lookup(jsonSchemaName, jsonSchemaVersion)
+	if err != nil {
+		t.Fatalf("lookup json schema: %v", err)
+	}
+	// The user schema declared `summary` required; a payload missing
+	// it must fail validation, a payload with it must pass.
+	if err := cs.Schema.Validate(map[string]any{}); err == nil {
+		t.Fatalf("expected validation error for empty object under required-summary schema")
+	}
+	if err := cs.Schema.Validate(map[string]any{"summary": "ok"}); err != nil {
+		t.Fatalf("valid payload rejected: %v", err)
+	}
+}
+
+// See TestExport_RoundTrip_InlineOutputSchema in run_test.go for the
+// end-to-end export round-trip of an inline output schema through a
+// scaffolded chain (so real fixture files exist on disk).

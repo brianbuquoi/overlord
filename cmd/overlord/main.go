@@ -39,6 +39,7 @@ import (
 	pgstore "github.com/brianbuquoi/overlord/internal/store/postgres"
 	redisstore "github.com/brianbuquoi/overlord/internal/store/redis"
 	"github.com/brianbuquoi/overlord/internal/tracing"
+	"github.com/brianbuquoi/overlord/internal/workflow"
 	pluginapi "github.com/brianbuquoi/overlord/pkg/plugin"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -131,8 +132,10 @@ Quick start:
 	root.PersistentFlags().String("api-key", "", "API key for authenticated requests (or set OVERLORD_API_KEY)")
 
 	root.AddCommand(runCmd())
+	root.AddCommand(serveCmd())
 	root.AddCommand(execCmd())
 	root.AddCommand(initCmd())
+	root.AddCommand(exportCmd())
 	root.AddCommand(submitCmd())
 	root.AddCommand(statusCmd())
 	root.AddCommand(validateCmd())
@@ -143,9 +146,10 @@ Quick start:
 	root.AddCommand(deadLetterCmd())
 	root.AddCommand(completionCmd())
 	root.AddCommand(versionCmd())
-	// Chain mode: the lightweight authoring layer. Compiles into the
-	// same runtime used by `run`/`exec` so existing pipeline features
-	// (contracts, sanitizer, retries, tracing) still apply.
+	// Chain mode is retained as a legacy/internal authoring surface.
+	// The default simple front door is `workflow:` + `overlord run`;
+	// the chain commands still work for projects authored against the
+	// prior layer.
 	root.AddCommand(chainCmd())
 
 	return root
@@ -273,7 +277,14 @@ func buildBroker(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, c
 	if err != nil {
 		return nil, fmt.Errorf("contract registry: %w", err)
 	}
+	return buildBrokerWithRegistry(cfg, plugins, basePath, reg, logger, m, t)
+}
 
+// buildBrokerWithRegistry builds a broker using a pre-built contract
+// registry. Workflow `serve` uses this path so the in-memory schemas
+// synthesized at compile time flow straight into the broker without
+// the file-reading registry build.
+func buildBrokerWithRegistry(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, basePath string, reg *contract.Registry, logger *slog.Logger, m *metrics.Metrics, t *tracing.Tracer) (*broker.Broker, error) {
 	st, err := buildStore(cfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("store: %w", err)
@@ -289,229 +300,325 @@ func buildBroker(cfg *config.Config, plugins map[string]pluginapi.AgentPlugin, c
 
 // --- run command ---
 
+// runCmd is the default local execution command for workflows. The
+// same verb still accepts a strict-pipeline config for backward
+// compatibility: when the config has a top-level `pipelines:` block
+// (no `workflow:`), `run` boots the server exactly as before. The
+// split is detected per invocation so existing docs and automation
+// keep working unchanged.
 func runCmd() *cobra.Command {
 	var configPath string
+	var input string
+	var inputFile string
+	var outputFmt string
+	var timeout time.Duration
+	var quiet bool
 	var port string
 	var bindFlag string
 	var allowPublicNoauth bool
 
 	cmd := &cobra.Command{
 		Use:   "run",
-		Short: "Start the orchestration engine",
+		Short: "Run a workflow locally with a single input",
+		Long: `Run executes a workflow end-to-end against the in-process broker and
+prints the final output. For workflow-shaped configs (top-level
+` + "`" + `workflow:` + "`" + ` block) this is a one-shot local run — no port is bound and
+no credentials are required when the workflow uses the built-in mock
+provider.
+
+When the config is a strict pipeline config (top-level ` + "`" + `pipelines:` + "`" + `
+block), ` + "`" + `run` + "`" + ` preserves its historical behavior and starts the full
+server (broker, HTTP API, dashboard). Prefer ` + "`" + `overlord serve` + "`" + ` for the
+long-running service path regardless of shape.
+
+Examples:
+  overlord run --input "Write a launch email"
+  overlord run --input-file sample_input.txt
+  echo "summarize this" | overlord run --input-file -`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			logger := newLogger()
-
-			cfg, err := loadConfig(configPath)
-			if err != nil {
-				return fmtConfigError(configPath, err)
+			effectiveConfig := configPath
+			if effectiveConfig == "" {
+				effectiveConfig = "overlord.yaml"
 			}
 
-			basePath := configBasePath(configPath)
-
-			// Validate schema_registry files exist.
-			for _, entry := range cfg.SchemaRegistry {
-				p := entry.Path
-				if !filepath.IsAbs(p) {
-					p = filepath.Join(basePath, p)
-				}
-				if _, err := os.Stat(p); err != nil {
-					return fmt.Errorf("schema file not found: %s (referenced by %s@%s)\nHint: check the path in schema_registry or run 'overlord validate --config %s'",
-						p, entry.Name, entry.Version, configPath)
-				}
+			if workflow.IsWorkflowFile(effectiveConfig) {
+				return runWorkflow(cmd, effectiveConfig, workflowRunArgs{
+					input:     input,
+					inputFile: inputFile,
+					outputFmt: outputFmt,
+					timeout:   timeout,
+					quiet:     quiet,
+				})
 			}
 
-			// Initialize observability.
-			m := metrics.New()
-
-			// Read OTLP auth headers from env var if configured (never from YAML value).
-			var otlpHeaders string
-			if env := cfg.Observability.Tracing.OTLPHeadersEnv; env != "" {
-				otlpHeaders = os.Getenv(env)
-			}
-			tracerCfg := tracing.Config{
-				Enabled:      cfg.Observability.Tracing.Enabled,
-				Exporter:     cfg.Observability.Tracing.Exporter,
-				OTLPEndpoint: cfg.Observability.Tracing.OTLPEndpoint,
-				OTLPInsecure: cfg.Observability.Tracing.OTLPInsecure,
-				OTLPHeaders:  otlpHeaders,
-			}
-			t, err := tracing.New(context.Background(), tracerCfg)
-			if err != nil {
-				return fmt.Errorf("tracing: %w", err)
-			}
-			defer t.Shutdown(context.Background())
-
-			// Load plugins (if configured).
-			plugins, err := internalplugin.LoadPlugins(cfg.Plugins, logger)
-			if err != nil {
-				return fmt.Errorf("plugins: %w", err)
-			}
-			if len(plugins) > 0 {
-				logger.Info("plugins loaded", "count", len(plugins))
-			}
-
-			b, err := buildBroker(cfg, plugins, configPath, logger, m, t)
-			if err != nil {
-				return err
-			}
-
-			logger.Info("overlord starting",
-				"config", configPath,
-				"pipelines", len(cfg.Pipelines),
-				"agents", len(cfg.Agents),
-				"schemas", len(cfg.SchemaRegistry),
-				"store", pipelineStoreType(cfg),
-				"port", port,
-				"bind", bindFlag,
-				"allow_public_noauth", allowPublicNoauth,
-				"tracing_enabled", cfg.Observability.Tracing.Enabled,
-			)
-
-			// Start broker workers.
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				b.Run(ctx)
-			}()
-
-			// Load auth keys if auth is enabled.
-			var authKeys []auth.APIKey
-			if cfg.Auth.Enabled {
-				authKeys, err = auth.LoadKeys(cfg.Auth.Keys)
-				if err != nil {
-					return fmt.Errorf("auth: %w", err)
-				}
-				logger.Info("API authentication enabled", "keys", len(authKeys))
-			}
-
-			// Start HTTP/WS API.
-			metricsPath := cfg.Observability.MetricsPath
-			srv := api.NewServerWithContext(ctx, b, logger, m, metricsPath, authKeys)
-			bindAddr, err := resolveBindAddr(bindFlag, port, os.Getenv("OVERLORD_BIND"))
-			if err != nil {
-				cancel()
-				return fmt.Errorf("bind: %w", err)
-			}
-			if shouldRefusePublicNoauth(cfg, bindAddr, allowPublicNoauth) {
-				cancel()
-				return fmt.Errorf(
-					"refusing to start: bind=%s is non-loopback and auth.enabled=false — enable auth or pass --allow-public-noauth (see %s)",
-					bindAddr, authGuardrailDocURL,
-				)
-			}
-			// Warning path retained for --allow-public-noauth opt-in so operators
-			// who knowingly override still see a log record. Not re-invoked on
-			// SIGHUP hot-reload (startup-only).
-			if allowPublicNoauth {
-				checkAuthGuardrail(logger, cfg, bindAddr)
-			}
-			ln, err := net.Listen("tcp", bindAddr)
-			if err != nil {
-				cancel()
-				return fmt.Errorf("listen: %w", err)
-			}
-			logger.Info("API server listening", "addr", ln.Addr().String())
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-					logger.Error("API server error", "error", err)
-				}
-			}()
-
-			// Hot-reload on SIGHUP.
-			if err := config.Watch(configPath, func(newCfg *config.Config) {
-				newBasePath := configBasePath(configPath)
-				newReg, err := buildContractRegistry(newCfg, newBasePath)
-				if err != nil {
-					logger.Error("hot-reload: contract registry failed", "error", err)
-					return
-				}
-				// Re-load plugins so newly-added .so files are picked up.
-				// Note: Go's plugin package caches already-loaded .so files,
-				// so existing plugins are not re-initialized.
-				reloadedPlugins, err := internalplugin.LoadPlugins(newCfg.Plugins, logger)
-				if err != nil {
-					logger.Error("hot-reload: plugins failed", "error", err)
-					return
-				}
-				newAgents, err := buildAgents(newCfg, reloadedPlugins, logger, newReg, newBasePath, m)
-				if err != nil {
-					logger.Error("hot-reload: agents failed", "error", err)
-					return
-				}
-				// Drain in-flight RPCs on old agents before swapping.
-				// buildAgents always constructs fresh adapters, so every
-				// Stopper/Drainer from the old map is orphaned by the reload.
-				oldAgents := b.Agents()
-				oldDrainers := registry.Drainers(oldAgents)
-				oldStoppers := registry.Stoppers(oldAgents)
-				for _, d := range oldDrainers {
-					d.Drain()
-				}
-
-				// Wait for in-flight RPCs to complete before swapping.
-				drainCtx, drainCancel := context.WithTimeout(ctx, 10*time.Second)
-				waitForDrain(drainCtx, oldDrainers, logger)
-				drainCancel()
-
-				// Swap to the new agent map — new tasks route to new agents.
-				b.Reload(newCfg, newAgents, contract.NewValidator(newReg))
-
-				// Stop old plugin subprocesses now that they are drained.
-				for _, s := range oldStoppers {
-					if err := s.Stop(); err != nil {
-						logger.Warn("agent stop error during hot-reload", "error", err)
-					}
-				}
-				logger.Info("config reloaded",
-					"pipelines", len(newCfg.Pipelines),
-					"agents", len(newCfg.Agents),
-					"schemas", len(newCfg.SchemaRegistry),
-					"plugins", len(reloadedPlugins),
-				)
-			}); err != nil {
-				logger.Warn("config watch failed", "error", err)
-			}
-
-			// Graceful shutdown on SIGTERM/SIGINT.
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-			sig := <-sigCh
-			logger.Info("shutting down", "signal", sig.String())
-
-			shutCtx, shutCancel := context.WithTimeout(context.Background(), api.ShutdownTimeout)
-			defer shutCancel()
-			srv.Shutdown(shutCtx)
-
-			cancel() // Stop broker workers.
-			wg.Wait()
-
-			// Stop any agents that manage external processes (e.g. plugin
-			// subprocesses). Runs after broker drain so no new tasks are
-			// dispatched to them.
-			for _, s := range registry.Stoppers(b.Agents()) {
-				if err := s.Stop(); err != nil {
-					logger.Warn("agent stop error during shutdown", "error", err)
-				}
-			}
-
-			logger.Info("shutdown complete")
-			return nil
+			// Legacy / strict-pipeline path — start the full server.
+			return runServerFromConfig(cmd, serverArgs{
+				configPath:        effectiveConfig,
+				port:              port,
+				bindFlag:          bindFlag,
+				allowPublicNoauth: allowPublicNoauth,
+				hotReload:         true,
+			})
 		},
 	}
 
-	cmd.Flags().StringVar(&configPath, "config", "", "path to pipeline YAML config file")
-	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port (combined with --bind host when --bind has no port)")
-	cmd.Flags().StringVar(&bindFlag, "bind", envOrDefault("OVERLORD_BIND", ""), "HTTP bind address (host or host:port); defaults to 127.0.0.1")
-	cmd.Flags().BoolVar(&allowPublicNoauth, "allow-public-noauth", false, "explicitly allow non-loopback bind with auth disabled (requires operator opt-in)")
-	cmd.MarkFlagRequired("config")
+	cmd.Flags().StringVar(&configPath, "config", "", "path to overlord.yaml (defaults to ./overlord.yaml)")
+	cmd.Flags().StringVar(&input, "input", "", "workflow input text (workflow mode only)")
+	cmd.Flags().StringVar(&inputFile, "input-file", "", "read workflow input from a file (\"-\" for stdin)")
+	cmd.Flags().StringVar(&outputFmt, "output", "text", "workflow output format: text | json")
+	cmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "maximum wait time for the workflow to reach a terminal state")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress progress output")
+	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port (pipeline-mode only)")
+	cmd.Flags().StringVar(&bindFlag, "bind", envOrDefault("OVERLORD_BIND", ""), "HTTP bind address (pipeline-mode only)")
+	cmd.Flags().BoolVar(&allowPublicNoauth, "allow-public-noauth", false, "explicitly allow non-loopback bind with auth disabled (pipeline-mode only)")
 	return cmd
+}
+
+// serverArgs bundles the flags shared by `overlord run` (pipeline
+// shape) and `overlord serve`. Extracted into a struct so the server
+// loop can be re-entered without each caller re-stating the flag set.
+type serverArgs struct {
+	configPath        string
+	port              string
+	bindFlag          string
+	allowPublicNoauth bool
+	// hotReload controls whether a SIGHUP triggers config.Watch-driven
+	// reload. Workflow-compiled configs live in memory only — no file
+	// to watch — so the serve path sets this to false; the legacy
+	// strict-pipeline path keeps it true.
+	hotReload bool
+	// compiledCfg lets callers pass a pre-built *config.Config in
+	// place of configPath. Workflow serve uses this to hand the
+	// compiled config straight to the server without round-tripping
+	// through disk.
+	compiledCfg *config.Config
+	// compiledRegistry is the already-built contract registry matching
+	// compiledCfg. Workflow compiled configs reference synthesized
+	// schemas that are not on disk, so the server loop must skip the
+	// file-reading buildContractRegistry pass when a caller provides
+	// this field.
+	compiledRegistry *contract.Registry
+	// baseDir overrides the base path used to resolve mock fixtures
+	// when compiledCfg is set. Workflow serve passes the directory
+	// containing the workflow YAML so relative fixture paths still
+	// resolve.
+	baseDir string
+}
+
+// runServerFromConfig boots the full broker + HTTP API + dashboard
+// stack. The body is the original runCmd logic extracted into a
+// reusable helper so `serve` and pipeline-mode `run` share a single
+// implementation.
+func runServerFromConfig(cmd *cobra.Command, a serverArgs) error {
+	logger := newLogger()
+
+	var cfg *config.Config
+	var err error
+	if a.compiledCfg != nil {
+		cfg = a.compiledCfg
+	} else {
+		cfg, err = loadConfig(a.configPath)
+		if err != nil {
+			return fmtConfigError(a.configPath, err)
+		}
+	}
+
+	basePath := a.baseDir
+	if basePath == "" {
+		basePath = configBasePath(a.configPath)
+	}
+
+	// Validate schema_registry files exist (skipped for compiled
+	// in-memory configs where the registry was synthesized).
+	if a.compiledRegistry == nil {
+		for _, entry := range cfg.SchemaRegistry {
+			p := entry.Path
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(basePath, p)
+			}
+			if _, err := os.Stat(p); err != nil {
+				return fmt.Errorf("schema file not found: %s (referenced by %s@%s)\nHint: check the path in schema_registry or run 'overlord validate --config %s'",
+					p, entry.Name, entry.Version, a.configPath)
+			}
+		}
+	}
+
+	// Initialize observability.
+	m := metrics.New()
+
+	// Read OTLP auth headers from env var if configured (never from YAML value).
+	var otlpHeaders string
+	if env := cfg.Observability.Tracing.OTLPHeadersEnv; env != "" {
+		otlpHeaders = os.Getenv(env)
+	}
+	tracerCfg := tracing.Config{
+		Enabled:      cfg.Observability.Tracing.Enabled,
+		Exporter:     cfg.Observability.Tracing.Exporter,
+		OTLPEndpoint: cfg.Observability.Tracing.OTLPEndpoint,
+		OTLPInsecure: cfg.Observability.Tracing.OTLPInsecure,
+		OTLPHeaders:  otlpHeaders,
+	}
+	t, err := tracing.New(context.Background(), tracerCfg)
+	if err != nil {
+		return fmt.Errorf("tracing: %w", err)
+	}
+	defer t.Shutdown(context.Background())
+
+	// Load plugins (if configured).
+	plugins, err := internalplugin.LoadPlugins(cfg.Plugins, logger)
+	if err != nil {
+		return fmt.Errorf("plugins: %w", err)
+	}
+	if len(plugins) > 0 {
+		logger.Info("plugins loaded", "count", len(plugins))
+	}
+
+	var b *broker.Broker
+	if a.compiledRegistry != nil {
+		b, err = buildBrokerWithRegistry(cfg, plugins, basePath, a.compiledRegistry, logger, m, t)
+	} else {
+		b, err = buildBroker(cfg, plugins, a.configPath, logger, m, t)
+	}
+	if err != nil {
+		return err
+	}
+
+	logger.Info("overlord starting",
+		"config", a.configPath,
+		"pipelines", len(cfg.Pipelines),
+		"agents", len(cfg.Agents),
+		"schemas", len(cfg.SchemaRegistry),
+		"store", pipelineStoreType(cfg),
+		"port", a.port,
+		"bind", a.bindFlag,
+		"allow_public_noauth", a.allowPublicNoauth,
+		"tracing_enabled", cfg.Observability.Tracing.Enabled,
+	)
+
+	// Start broker workers.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.Run(ctx)
+	}()
+
+	// Load auth keys if auth is enabled.
+	var authKeys []auth.APIKey
+	if cfg.Auth.Enabled {
+		authKeys, err = auth.LoadKeys(cfg.Auth.Keys)
+		if err != nil {
+			return fmt.Errorf("auth: %w", err)
+		}
+		logger.Info("API authentication enabled", "keys", len(authKeys))
+	}
+
+	// Start HTTP/WS API.
+	metricsPath := cfg.Observability.MetricsPath
+	srv := api.NewServerWithContext(ctx, b, logger, m, metricsPath, authKeys)
+	bindAddr, err := resolveBindAddr(a.bindFlag, a.port, os.Getenv("OVERLORD_BIND"))
+	if err != nil {
+		cancel()
+		return fmt.Errorf("bind: %w", err)
+	}
+	if shouldRefusePublicNoauth(cfg, bindAddr, a.allowPublicNoauth) {
+		cancel()
+		return fmt.Errorf(
+			"refusing to start: bind=%s is non-loopback and auth.enabled=false — enable auth or pass --allow-public-noauth (see %s)",
+			bindAddr, authGuardrailDocURL,
+		)
+	}
+	if a.allowPublicNoauth {
+		checkAuthGuardrail(logger, cfg, bindAddr)
+	}
+	ln, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("listen: %w", err)
+	}
+	logger.Info("API server listening", "addr", ln.Addr().String())
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			logger.Error("API server error", "error", err)
+		}
+	}()
+
+	// Hot-reload on SIGHUP — only meaningful when the process is
+	// watching a concrete YAML file on disk.
+	if a.hotReload && a.configPath != "" {
+		if err := config.Watch(a.configPath, func(newCfg *config.Config) {
+			newBasePath := configBasePath(a.configPath)
+			newReg, err := buildContractRegistry(newCfg, newBasePath)
+			if err != nil {
+				logger.Error("hot-reload: contract registry failed", "error", err)
+				return
+			}
+			reloadedPlugins, err := internalplugin.LoadPlugins(newCfg.Plugins, logger)
+			if err != nil {
+				logger.Error("hot-reload: plugins failed", "error", err)
+				return
+			}
+			newAgents, err := buildAgents(newCfg, reloadedPlugins, logger, newReg, newBasePath, m)
+			if err != nil {
+				logger.Error("hot-reload: agents failed", "error", err)
+				return
+			}
+			oldAgents := b.Agents()
+			oldDrainers := registry.Drainers(oldAgents)
+			oldStoppers := registry.Stoppers(oldAgents)
+			for _, d := range oldDrainers {
+				d.Drain()
+			}
+
+			drainCtx, drainCancel := context.WithTimeout(ctx, 10*time.Second)
+			waitForDrain(drainCtx, oldDrainers, logger)
+			drainCancel()
+
+			b.Reload(newCfg, newAgents, contract.NewValidator(newReg))
+
+			for _, s := range oldStoppers {
+				if err := s.Stop(); err != nil {
+					logger.Warn("agent stop error during hot-reload", "error", err)
+				}
+			}
+			logger.Info("config reloaded",
+				"pipelines", len(newCfg.Pipelines),
+				"agents", len(newCfg.Agents),
+				"schemas", len(newCfg.SchemaRegistry),
+				"plugins", len(reloadedPlugins),
+			)
+		}); err != nil {
+			logger.Warn("config watch failed", "error", err)
+		}
+	}
+
+	// Graceful shutdown on SIGTERM/SIGINT.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigCh
+	logger.Info("shutting down", "signal", sig.String())
+
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), api.ShutdownTimeout)
+	defer shutCancel()
+	srv.Shutdown(shutCtx)
+
+	cancel() // Stop broker workers.
+	wg.Wait()
+
+	for _, s := range registry.Stoppers(b.Agents()) {
+		if err := s.Stop(); err != nil {
+			logger.Warn("agent stop error during shutdown", "error", err)
+		}
+	}
+
+	logger.Info("shutdown complete")
+	return nil
 }
 
 // authGuardrailDocURL is the canonical documentation link emitted by the

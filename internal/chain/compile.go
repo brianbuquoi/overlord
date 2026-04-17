@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -33,6 +34,13 @@ type Compiled struct {
 	Schemas   map[string][]byte
 	Templates map[string]string
 	BasePath  string
+
+	// Chain is a reference back to the source chain used to compile
+	// this result. It is kept so the wrapper adapter can ask for the
+	// chain's declared input.type when seeding {{input}} on the first
+	// step — any information the adapter needs flows through the
+	// compiled record instead of a side channel.
+	Chain *Chain
 }
 
 // Schema names and versions used throughout chain mode. They are
@@ -46,6 +54,13 @@ const (
 	textSchemaVersion = "v1"
 	jsonSchemaName    = "chain_json"
 	jsonSchemaVersion = "v1"
+	// inputJSONSchemaName/Version guard the first stage's input when
+	// a chain declares input.type: json. It is intentionally distinct
+	// from chain_json@v1 (the final-stage output contract, which an
+	// author can tighten via output.schema) so tightening the output
+	// does not accidentally reject the initial payload.
+	inputJSONSchemaName    = "chain_input_json"
+	inputJSONSchemaVersion = "v1"
 
 	// stepPromptDefaultTimeout bounds the per-step LLM call. 120s is
 	// generous for a single prompt round-trip and matches the default
@@ -84,12 +99,25 @@ var textSchemaJSON = []byte(`{
 
 // jsonSchemaJSON is the final-stage schema used when a chain declares
 // output.type: json. It accepts any object so the caller's prompt can
-// produce whatever structured payload fits the use case; tightening
-// this is an explicit graduation step into pipeline mode.
+// produce whatever structured payload fits the use case; authors can
+// tighten it via chain.output.schema without graduating, or graduate
+// via `overlord chain export` for full schema-registry control.
 var jsonSchemaJSON = []byte(`{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "chain.json",
   "description": "Open object schema for chain output.type: json.",
+  "type": "object"
+}`)
+
+// inputJSONSchemaJSON is the first-stage input schema used when a
+// chain declares input.type: json. It accepts any object so any
+// JSON-object payload the caller submits is forwarded into the
+// chain. The output-side chain_json@v1 schema can be tightened by
+// the author independently.
+var inputJSONSchemaJSON = []byte(`{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chain.input.json",
+  "description": "Open object schema for chain input.type: json.",
   "type": "object"
 }`)
 
@@ -118,12 +146,28 @@ func CompileWithBase(ch *Chain, basePath string) (*Compiled, error) {
 	}
 
 	outputType := ch.OutputType()
+	inputType := ch.InputType()
 
 	schemas := map[string][]byte{
 		schemaKey(textSchemaName, textSchemaVersion): cloneBytes(textSchemaJSON),
 	}
+	if inputType == "json" {
+		schemas[schemaKey(inputJSONSchemaName, inputJSONSchemaVersion)] = cloneBytes(inputJSONSchemaJSON)
+	}
 	if outputType == "json" {
-		schemas[schemaKey(jsonSchemaName, jsonSchemaVersion)] = cloneBytes(jsonSchemaJSON)
+		jsonBytes := cloneBytes(jsonSchemaJSON)
+		// An inline output.schema overrides the default open-object
+		// schema. The validator already ensured the schema serializes
+		// and compiles cleanly, so we treat failures here as
+		// internal errors.
+		if ch.Output != nil && len(ch.Output.Schema) > 0 {
+			data, err := json.Marshal(ch.Output.Schema)
+			if err != nil {
+				return nil, fmt.Errorf("compile chain.output.schema: %w", err)
+			}
+			jsonBytes = data
+		}
+		schemas[schemaKey(jsonSchemaName, jsonSchemaVersion)] = jsonBytes
 	}
 
 	templates := make(map[string]string, len(ch.Steps))
@@ -131,7 +175,7 @@ func CompileWithBase(ch *Chain, basePath string) (*Compiled, error) {
 		templates[st.ID] = ResolveVarsOnly(st.Prompt, ch.Vars)
 	}
 
-	stages, err := compileStages(ch, outputType)
+	stages, err := compileStages(ch, inputType, outputType)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +187,13 @@ func CompileWithBase(ch *Chain, basePath string) (*Compiled, error) {
 
 	schemaRegistry := []config.SchemaEntry{
 		{Name: textSchemaName, Version: textSchemaVersion, Path: schemaFileName(textSchemaName, textSchemaVersion)},
+	}
+	if inputType == "json" {
+		schemaRegistry = append(schemaRegistry, config.SchemaEntry{
+			Name:    inputJSONSchemaName,
+			Version: inputJSONSchemaVersion,
+			Path:    schemaFileName(inputJSONSchemaName, inputJSONSchemaVersion),
+		})
 	}
 	if outputType == "json" {
 		schemaRegistry = append(schemaRegistry, config.SchemaEntry{
@@ -192,28 +243,16 @@ func CompileWithBase(ch *Chain, basePath string) (*Compiled, error) {
 		Schemas:   schemas,
 		Templates: templates,
 		BasePath:  basePath,
+		Chain:     ch,
 	}, nil
 }
 
-func compileStages(ch *Chain, outputType string) ([]config.Stage, error) {
+func compileStages(ch *Chain, inputType, outputType string) ([]config.Stage, error) {
 	stages := make([]config.Stage, 0, len(ch.Steps))
-	finalStepID := ch.OutputFrom()
-
-	// Find the index of the final step (the one supplying chain output).
-	// Steps after the final step still route through the pipeline but
-	// their outputs are discarded. v1 keeps this simple: the final step
-	// must be the last step. Validated by OutputFrom() returning the
-	// last step when no output.from is set, and by requiring references
-	// to resolve to a known step (the validator enforces this).
+	// v1: chain.output.from must reference the chain's last step (the
+	// validator enforces this). The last stage therefore always routes
+	// to "done" and is the one that carries the output.type schema.
 	finalIdx := len(ch.Steps) - 1
-	if finalStepID != "" {
-		for i, st := range ch.Steps {
-			if st.ID == finalStepID {
-				finalIdx = i
-				break
-			}
-		}
-	}
 
 	for i, st := range ch.Steps {
 		timeout := stepPromptDefaultTimeout
@@ -230,6 +269,13 @@ func compileStages(ch *Chain, outputType string) ([]config.Stage, error) {
 
 		inputSchema := config.StageSchemaRef{Name: textSchemaName, Version: textSchemaVersion}
 		outputSchema := config.StageSchemaRef{Name: textSchemaName, Version: textSchemaVersion}
+		if i == 0 && inputType == "json" {
+			// First stage accepts the raw JSON object the caller
+			// submitted. Intermediate steps keep the text wire
+			// format (stage N+1 reads the extractTextPayload
+			// output of stage N).
+			inputSchema = config.StageSchemaRef{Name: inputJSONSchemaName, Version: inputJSONSchemaVersion}
+		}
 		if i == finalIdx && outputType == "json" {
 			outputSchema = config.StageSchemaRef{Name: jsonSchemaName, Version: jsonSchemaVersion}
 		}
@@ -262,7 +308,7 @@ func compileStages(ch *Chain, outputType string) ([]config.Stage, error) {
 func compileAgents(ch *Chain, templates map[string]string) ([]config.Agent, error) {
 	agents := make([]config.Agent, 0, len(ch.Steps))
 	for _, st := range ch.Steps {
-		provider, model, err := splitModel(st.Model)
+		provider, model, _, err := splitModel(st.Model)
 		if err != nil {
 			return nil, fmt.Errorf("step %q: %w", st.ID, err)
 		}

@@ -1,9 +1,12 @@
 package chain
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/brianbuquoi/overlord/internal/contract"
 )
 
 // validID matches the same character class pipelines and agents use —
@@ -69,6 +72,15 @@ func Validate(c *Chain) error {
 		}
 	}
 
+	if c.Output != nil && len(c.Output.Schema) > 0 {
+		if outputType != "json" {
+			return fmt.Errorf("chain.output.schema is only valid when chain.output.type is \"json\" (got %q)", outputType)
+		}
+		if err := validateInlineOutputSchema(c.Output.Schema); err != nil {
+			return fmt.Errorf("chain.output.schema: %w", err)
+		}
+	}
+
 	for name := range c.Vars {
 		if !validID.MatchString(name) {
 			return fmt.Errorf("chain.vars key %q contains invalid characters", name)
@@ -96,12 +108,19 @@ func Validate(c *Chain) error {
 		if st.Model == "" {
 			return fmt.Errorf("step %q: model must not be empty", st.ID)
 		}
-		provider, _, err := splitModel(st.Model)
+		provider, _, bare, err := splitModel(st.Model)
 		if err != nil {
 			return fmt.Errorf("step %q: %w", st.ID, err)
 		}
 		if _, ok := knownProviders[provider]; !ok {
 			return fmt.Errorf("step %q: unknown provider %q (valid: %s)", st.ID, provider, providerList())
+		}
+		// Only the mock provider accepts a bare provider string
+		// (`mock`) because its model field is unused. Every other
+		// built-in adapter needs a concrete model, and a bare
+		// "anthropic" / "openai" string is almost always a typo.
+		if bare && provider != "mock" {
+			return fmt.Errorf("step %q: model %q must be in the form %q/<model> (e.g. %q/claude-sonnet-4-5); bare provider names are only allowed for \"mock\"", st.ID, st.Model, provider, provider)
 		}
 
 		if strings.TrimSpace(st.Prompt) == "" {
@@ -126,6 +145,18 @@ func Validate(c *Chain) error {
 	if out := c.OutputFrom(); out != "" {
 		if _, ok := seen[out]; !ok {
 			return fmt.Errorf("chain.output.from references unknown step %q", out)
+		}
+		// v1 constraint: chain.output.from must reference the last
+		// step. Supporting an intermediate step would require the
+		// runtime to either surface a non-terminal task's payload or
+		// truncate the pipeline at an earlier stage — both break the
+		// "chains compile into a normal pipeline" model. Authors who
+		// genuinely need intermediate-step output should graduate to
+		// pipeline mode via `overlord chain export`, where any stage
+		// can route to `done` explicitly.
+		lastID := c.Steps[len(c.Steps)-1].ID
+		if out != lastID {
+			return fmt.Errorf("chain.output.from references step %q but must reference the last step %q (v1 limitation: intermediate-step output is not supported — graduate via `overlord chain export`)", out, lastID)
 		}
 	}
 
@@ -166,21 +197,49 @@ func Validate(c *Chain) error {
 	return nil
 }
 
-// splitModel parses a "<provider>/<model>" string. The provider must
-// not contain a slash; the model half is whatever remains and may be
-// empty only for the mock provider (where model is unused).
-func splitModel(s string) (provider, model string, err error) {
+// splitModel parses a "<provider>/<model>" string into its two
+// components. The bare return flag distinguishes "no slash present"
+// (bare provider form, e.g. "mock") from "slash present with empty
+// halves". The validator consumes bare to enforce that only the mock
+// provider may omit the model.
+func splitModel(s string) (provider, model string, bare bool, err error) {
 	idx := strings.Index(s, "/")
 	if idx < 0 {
-		// Accept bare provider for mock only (model is unused there).
-		return s, "", nil
+		return s, "", true, nil
 	}
 	provider = s[:idx]
 	model = s[idx+1:]
 	if provider == "" {
-		return "", "", fmt.Errorf("model %q has empty provider", s)
+		return "", "", false, fmt.Errorf("model %q has empty provider", s)
 	}
-	return provider, model, nil
+	if model == "" {
+		return "", "", false, fmt.Errorf("model %q has empty model after %q/", s, provider)
+	}
+	return provider, model, false, nil
+}
+
+// validateInlineOutputSchema ensures a user-authored output.schema
+// round-trips to valid JSON and compiles as a JSONSchema. The chain
+// compiler will compile the same schema bytes into the runtime
+// registry, so failing fast here surfaces authoring errors at load
+// time — any caller that goes through chain.Load (chain run, chain
+// inspect, chain export) sees the error before the broker starts.
+func validateInlineOutputSchema(schema map[string]any) error {
+	if len(schema) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return fmt.Errorf("cannot serialize to JSON: %w", err)
+	}
+	if _, err := contract.NewRegistryFromRaw([]contract.RawSchemaEntry{{
+		Name:    jsonSchemaName,
+		Version: jsonSchemaVersion,
+		Data:    data,
+	}}); err != nil {
+		return fmt.Errorf("invalid JSONSchema: %w", err)
+	}
+	return nil
 }
 
 // providerList returns a stable human-readable list for error messages.

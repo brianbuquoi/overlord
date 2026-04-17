@@ -64,7 +64,7 @@ func assertTemplateTreePresent(t *testing.T, name, target string) {
 // directory, same filesystem as the parent, default Options. Expect
 // tempdir → os.Rename, rendered tree present, empty backups.
 func TestWrite_HappyPath_SameFilesystem(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			parent := t.TempDir()
 			target := filepath.Join(parent, name)
@@ -92,7 +92,7 @@ func TestWrite_HappyPath_SameFilesystem(t *testing.T) {
 // scaffolded overlord.yaml parses cleanly via config.Load. This is the
 // strongest end-to-end check the writer can do without touching Unit 5.
 func TestWrite_RenderedConfigLoads(t *testing.T) {
-	for _, name := range ListTemplates() {
+	for _, name := range strictTemplates() {
 		t.Run(name, func(t *testing.T) {
 			parent := t.TempDir()
 			target := filepath.Join(parent, name)

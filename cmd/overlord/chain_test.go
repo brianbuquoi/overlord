@@ -88,6 +88,59 @@ func TestChainCmd_ScaffoldInspectRun(t *testing.T) {
 	}
 }
 
+// TestChainCmd_RunReadsStdinWhenInputFileIsDash feeds a chain's
+// input via stdin. This is the documented "--input-file -" sentinel
+// and the CLI wires it through cmd.InOrStdin() so pipes, heredocs,
+// and test harnesses all work without touching the filesystem.
+func TestChainCmd_RunReadsStdinWhenInputFileIsDash(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "wr")
+	// Scaffold the template through the CLI so the run has fixtures
+	// available under dir/wr/.
+	cmd := rootCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"chain", "init", "write-review", target})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("chain init: %v", err)
+	}
+
+	cmd = rootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetIn(strings.NewReader("stdin payload for the chain"))
+	cmd.SetArgs([]string{
+		"chain", "run",
+		"--chain", filepath.Join(target, "chain.yaml"),
+		"--input-file", "-",
+		"--quiet",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("chain run --input-file -: %v", err)
+	}
+	// Running the mock-backed chain always emits the review fixture's
+	// prose; the fact that no error fired is the functional assertion
+	// that stdin was read and injected as --input.
+	if !strings.Contains(out.String(), "positioning chain mode") {
+		t.Fatalf("chain run via stdin did not produce expected output: %q", out.String())
+	}
+}
+
+// TestChainCmd_RunStdinAndInputMutuallyExclusive ensures the existing
+// exclusivity check still catches the user passing both --input and
+// --input-file.
+func TestChainCmd_RunStdinAndInputMutuallyExclusive(t *testing.T) {
+	cmd := rootCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetIn(strings.NewReader("x"))
+	cmd.SetArgs([]string{"chain", "run", "--chain", "whatever.yaml", "--input", "a", "--input-file", "-"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mutually-exclusive error, got %v", err)
+	}
+}
+
 // TestChainCmd_RunRejectsPipelineConfigMistake catches the common
 // mistake of pointing `chain run` at a full pipeline config.
 func TestChainCmd_RunRejectsPipelineConfigMistake(t *testing.T) {

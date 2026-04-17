@@ -1,40 +1,31 @@
-# Chain mode
+# Chain mode (legacy authoring surface)
 
-Chain mode is Overlord's lightweight authoring layer for linear prompt
-workflows. Authors write a short YAML describing a sequence of model
-calls; the chain compiler lowers that YAML into the same
-`config.Config` the broker runtime already accepts, and the compiled
-pipeline runs on the existing engine — retries, sanitizer envelope,
-contracts, metrics, and tracing included.
+Chain mode is the prior authoring layer, kept in the binary for
+projects already running on `overlord chain run` / `overlord chain
+export`. New projects should start with the workflow format
+(`workflow:` in `overlord.yaml`) — see the README and
+[docs/init.md](init.md) — which shares the same compile path under
+the hood.
 
-Chain mode is the recommended first stop when you want to:
+This document describes chain YAML and the `overlord chain …`
+subcommands. It is not the beginner-facing product story.
 
-- Wire Claude into a multi-step prompt without thinking about schema
-  versions, stage routing, or retry budgets up front.
-- Stand up a two- or three-call workflow locally with zero credentials
-  via the `mock` provider.
-- Prototype something that *might* graduate into a full pipeline
-  later, without throwing the prototype away when it does.
+## Why chain mode still exists
 
-Chain mode is **not** a separate engine, a separate format, or a
-separate runtime. It is a front door.
+The workflow surface (default product story) compiles through the
+chain layer via `internal/workflow/compile.go` →
+`chain.CompileWithBase`. Keeping the chain commands live means:
 
-## When to choose chain vs full pipeline
+- projects authored against the chain format continue to work with
+  no forced migration;
+- the compile path has one source of truth (`internal/chain`), and
+  the workflow surface is a thin translator on top;
+- the graduation story (`chain export` → strict YAML) still works
+  for chain-authored projects.
 
-| You want to…                                                  | Use chain | Use pipeline |
-|---------------------------------------------------------------|:---------:|:------------:|
-| Run a short `draft → review` or `summarize → critique` flow   |     ✓     |              |
-| Demo a multi-model idea with no credentials                   |     ✓     |              |
-| Author one YAML file for a linear workflow                    |     ✓     |              |
-| Use fan-out across multiple reviewers in parallel             |           |      ✓       |
-| Route tasks conditionally based on agent output               |           |      ✓       |
-| Declare explicit schemas, retry budgets, or dead-letter paths |           |      ✓       |
-| Run a long-lived server with the HTTP API and dashboard       |           |      ✓       |
-| Split infra config from pipeline config                       |           |      ✓       |
-
-If you are not sure, start with chain. Everything you author in chain
-mode can be emitted as pipeline YAML via `overlord chain export` when
-the workflow is ready to graduate.
+If you do not have a chain-authored project already, read the
+README and use `overlord run` / `overlord serve` / `overlord init`
+against a workflow file instead.
 
 ## The shape
 
@@ -84,109 +75,116 @@ chain:
 
 Three placeholders are supported in a step's `prompt`:
 
-- `{{input}}` — the chain's initial text (or JSON blob) submitted at
-  run time.
+- `{{input}}` — the chain's initial input.
+  - For `input.type: text` this is the raw string the caller passed
+    to `--input` / `--input-file`.
+  - For `input.type: json` this is the full JSON object string — the
+    whole payload, not a single field of it.
 - `{{vars.<name>}}` — a variable declared in the chain's `vars` map.
   Resolved at compile time.
-- `{{steps.<id>.output>}}` — the text output of an earlier step.
-  Resolved at runtime.
+- `{{steps.<id>.output}}` — the text output of an earlier step.
 
-Forward references (`{{steps.X.output}}` from a step that runs before
-`X`) are a compile-time error.
+Chain mode does **not** support the `{{prev}}` shorthand; that is a
+workflow-mode ergonomic. Translate `{{prev}}` → `{{steps.<id>.output}}`
+when porting a workflow to chain mode.
 
 ### Supported providers
 
-Any provider the runtime already understands: `anthropic`, `openai`,
+Any provider the runtime understands: `anthropic`, `openai`,
 `openai-responses`, `google`, `ollama`, `mock`, `copilot`. Write the
-model string as `<provider>/<model>` (e.g. `anthropic/claude-sonnet-4-5`,
-`openai/gpt-4o`). Bare `mock` is accepted for mock-provider steps; a
-`fixture:` path is required and must be a JSON file relative to the
-chain YAML's directory.
+model string as `<provider>/<model>`. A bare provider name (e.g.
+`anthropic` with no model) is **rejected** for every real provider;
+bare `mock` is allowed.
 
 ### Input and output
 
-- `input.type: text` wraps the raw string as `{"text": "..."}` on the
-  wire so every built-in adapter sees a uniform object.
-- `input.type: json` accepts a JSON **object** verbatim.
-- `output.type: text` (default) unwraps the final step's `.text` field
-  when printing.
+- `input.type: text` wraps the raw string as `{"text": "..."}` on
+  the wire. `{{input}}` in a step prompt renders as the raw string.
+- `input.type: json` accepts a JSON **object** verbatim. `{{input}}`
+  renders as the full JSON object string.
+- `output.type: text` (default) unwraps the final step's `.text`
+  field when printing.
 - `output.type: json` treats the final step's payload as structured
-  JSON; the LLM is expected to produce a JSON object.
+  JSON. Optional inline schema validates the final payload.
+
+### Selecting the final output
+
+`chain.output.from` is optional and, when set, must reference the
+chain's last step in the `steps.<id>.output` form. Picking an
+intermediate step is not supported — graduate via `overlord chain
+export` and hand-edit the exported strict config.
+
+### Validating JSON output
+
+```yaml
+output:
+  type: json
+  schema:
+    type: object
+    required: [summary, findings, verdict]
+    properties:
+      summary:  { type: string }
+      findings: { type: array, items: { type: object } }
+      verdict:  { type: string, enum: [approve, reject, revise] }
+```
 
 ## CLI
 
 ```bash
-# Scaffold a starter chain project (uses the mock provider).
+# Scaffold a chain project (uses the mock provider).
 overlord chain init write-review
 
 # Run a chain with a text input.
 overlord chain run --chain ./chain.yaml --input "some text"
-
-# Or read the input from a file (use "-" for stdin with --input-file).
 overlord chain run --chain ./chain.yaml --input-file ./prompt.txt
+echo "summarize this" | overlord chain run --chain ./chain.yaml --input-file -
 
 # Show the compiled interpretation (pipeline, stages, agents, schemas).
 overlord chain inspect --chain ./chain.yaml
 
-# Emit the equivalent full pipeline YAML + schemas for graduation.
+# Emit the equivalent strict pipeline YAML + schemas for graduation.
 overlord chain export --chain ./chain.yaml --out ./pipeline/
 ```
 
-`chain inspect` prints:
+`chain inspect` prints the synthesized pipeline name, each step's
+agent binding (provider + model), input/output schemas, and the
+resolved system-prompt template.
 
-- The synthesized pipeline name, stage list, and per-stage agent
-  binding (provider + model).
-- The input/output schemas and routing.
-- The *resolved* system-prompt template for each step, with `{{vars.*}}`
-  substituted and `{{input}}` / `{{steps.X.output}}` preserved.
+## Graduating to strict mode
 
-## Graduating to full pipeline mode
+`overlord chain export --chain ./chain.yaml --out ./pipeline/` writes
+the strict-mode equivalent of a chain. The exported directory is a
+normal strict-mode project runnable under `overlord exec` /
+`overlord serve`.
 
-`overlord chain export --chain ./chain.yaml --out ./pipeline/` writes:
+Workflow users have a parallel command: `overlord export --advanced
+--out ./advanced` is the workflow → strict graduation path. Both
+commands emit the same shape and share the same
+`chain.Export` / `workflow.Export` implementation.
 
-```
-pipeline/
-  overlord.yaml          # full-pipeline-mode config
-  schemas/               # synthesized schemas (chain_text_v1.json, …)
-  fixtures/              # any mock fixtures referenced by the chain
-```
+## Internals
 
-The exported directory is a **normal pipeline-mode project**. Run it
-with:
+Chain mode preserves the full strict runtime:
 
-```bash
-overlord validate --config pipeline/overlord.yaml
-overlord exec --config pipeline/overlord.yaml --id <chain-id> \
-  --payload '{"text":"..."}'
-overlord run --config pipeline/overlord.yaml
-```
+- `chain.Load` + `chain.Validate` parse and check the YAML.
+- `chain.CompileWithBase` lowers the chain into a `config.Config`
+  with synthesized schemas:
+  - `chain_text@v1` — the inter-stage text wire format
+    (`{"text": "..."}`).
+  - `chain_json@v1` — the final-stage contract when
+    `output.type: json`.
+  - `chain_input_json@v1` — the first-stage input contract when
+    `input.type: json`.
+- `chain.NewStepAdapter` wraps each built-in adapter with runtime
+  placeholder substitution and per-step output metadata.
 
-From there, hand-edit `overlord.yaml` to add whatever full pipeline
-mode offers — fan-out, conditional routing, retry budgets, dead-letter
-policies, authentication, tracing, dashboard config. Nothing about
-graduation is reversible in the runtime sense: the chain YAML is your
-source, the exported pipeline is the artifact.
+The strict-pipeline broker runs the compiled config verbatim. The
+sanitizer envelope still wraps prior-stage output on every non-first
+stage; the contract validator still rejects non-conforming payloads;
+retries, dead-letter, and tracing all apply.
 
-## Internals (for the curious)
-
-Chain mode preserves the full strict runtime. What the compile layer
-does:
-
-- Parses the chain YAML and validates step IDs, references, variables,
-  and provider names.
-- Synthesizes two JSON schemas on the fly (`chain_text@v1`,
-  `chain_json@v1`) and registers them via `contract.NewRegistryFromRaw`.
-- Emits a normal `config.Config` with one pipeline, one stage per step,
-  and one agent per step. The agent's `system_prompt` holds the step's
-  prompt with `{{vars.*}}` resolved — runtime placeholders are
-  preserved intact.
-- Wraps each built-in adapter in a `chain.NewStepAdapter`. The wrapper
-  substitutes runtime placeholders (`{{input}}`, `{{steps.X.output}}`)
-  against values carried in `task.Metadata["chain"]`, records its
-  own output into the same metadata map for later steps to reference,
-  and delegates the actual LLM call to the wrapped adapter.
-
-The broker never sees chain mode. It runs a normal pipeline with a
-normal agent set. The sanitizer envelope still wraps prior-stage
-output on every non-first stage; the contract validator still rejects
-non-conforming payloads; retries, dead-letter, and tracing all apply.
+Workflow mode (`internal/workflow/compile.go`) rides the same
+machinery: it auto-generates step IDs, rewrites `{{prev}}`, translates
+the workflow into a `chain.Chain`, and delegates to
+`chain.CompileWithBase`. Every feature added to the chain compile
+layer is automatically available to workflow authors.

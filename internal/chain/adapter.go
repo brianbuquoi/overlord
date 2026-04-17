@@ -28,16 +28,31 @@ const ChainMetaKey = "chain"
 // rewrite the system-prompt string passed to the underlying LLM
 // adapter and stash a bit of metadata for the next stage.
 type stepAdapter struct {
-	base    agent.Agent
-	stepID  string
-	agentID string
+	base      agent.Agent
+	stepID    string
+	agentID   string
+	inputType string // "text" or "json" — controls how {{input}} is seeded on the first step.
 }
 
 // NewStepAdapter wraps base as a chain step bound to stepID. The
 // returned adapter implements both agent.Agent and broker.Agent (same
 // method set).
-func NewStepAdapter(base agent.Agent, agentID, stepID string) agent.Agent {
-	return &stepAdapter{base: base, stepID: stepID, agentID: agentID}
+//
+// inputType mirrors the chain's declared input.type and controls how
+// the first step renders {{input}} from the initial task payload:
+//
+//   - "text": the payload is {"text": "..."}; {{input}} renders as
+//     that inner text.
+//   - "json": the payload is a JSON object; {{input}} renders as the
+//     full JSON object string verbatim so nothing is silently
+//     dropped.
+//
+// Any other value is treated as "text" for backward compatibility.
+func NewStepAdapter(base agent.Agent, agentID, stepID, inputType string) agent.Agent {
+	if inputType == "" {
+		inputType = "text"
+	}
+	return &stepAdapter{base: base, stepID: stepID, agentID: agentID, inputType: inputType}
 }
 
 // ID returns the agent ID the broker knows this adapter by. Mirrors
@@ -67,7 +82,7 @@ func (a *stepAdapter) Execute(ctx context.Context, task *broker.Task) (*broker.T
 
 	cm := readChainMeta(task.Metadata)
 	if cm.Input == "" {
-		cm.Input = extractTextPayload(task.Payload)
+		cm.Input = renderInitialInput(task.Payload, a.inputType)
 	}
 
 	// Substitute placeholders inside the (possibly envelope-wrapped)
@@ -151,6 +166,11 @@ func (c chainMeta) toMap() map[string]any {
 // responses, so every built-in adapter already produces conforming
 // output. Otherwise the raw JSON is returned, which is what chain
 // authors want for json output refs.
+//
+// This function is used for downstream step references
+// ({{steps.<id>.output}}), where the inter-stage wire format is
+// chain_text@v1 ({"text": "..."}) regardless of the chain's output
+// type. For the first step's {{input}} seed see renderInitialInput.
 func extractTextPayload(payload json.RawMessage) string {
 	if len(payload) == 0 {
 		return ""
@@ -162,4 +182,30 @@ func extractTextPayload(payload json.RawMessage) string {
 		}
 	}
 	return string(payload)
+}
+
+// renderInitialInput maps the first-stage task payload into the
+// string value {{input}} resolves to. Chain authors set input.type to
+// declare the contract:
+//
+//   - "text": the payload is {"text": "..."} (wrapped by
+//     BuildInitialPayload). {{input}} renders as that inner text so
+//     prompts can drop the chain's raw input straight in.
+//   - "json": the payload is a JSON object submitted verbatim.
+//     {{input}} renders as the full JSON object string — never as a
+//     single field of it — so prompts that feed the whole object into
+//     the model (e.g. "Given the following JSON: {{input}}") never
+//     silently lose fields.
+//
+// Any unknown input type falls back to text-mode behavior for safety.
+func renderInitialInput(payload json.RawMessage, inputType string) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	switch inputType {
+	case "json":
+		return string(payload)
+	default:
+		return extractTextPayload(payload)
+	}
 }

@@ -88,9 +88,23 @@ Examples:
 				return fmt.Errorf("--input and --input-file are mutually exclusive")
 			}
 			if inputFile != "" {
-				data, err := os.ReadFile(inputFile)
-				if err != nil {
-					return fmt.Errorf("read input file: %w", err)
+				var (
+					data []byte
+					err  error
+				)
+				if inputFile == "-" {
+					// Documented stdin sentinel — read until EOF so the
+					// chain can be driven by pipes and heredocs without
+					// touching the filesystem.
+					data, err = io.ReadAll(cmd.InOrStdin())
+					if err != nil {
+						return fmt.Errorf("read stdin: %w", err)
+					}
+				} else {
+					data, err = os.ReadFile(inputFile)
+					if err != nil {
+						return fmt.Errorf("read input file: %w", err)
+					}
 				}
 				input = string(data)
 			}
