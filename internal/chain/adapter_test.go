@@ -62,7 +62,7 @@ func TestStepAdapter_EnvelopeGuardsPriorOutput(t *testing.T) {
 	}
 
 	rec := &recordingAgent{id: "step_2", prov: "fake", returnText: "ok"}
-	adapter := NewStepAdapter(rec, "step_2", "step_2")
+	adapter := NewStepAdapter(rec, "step_2", "step_2", "text")
 
 	if _, err := adapter.Execute(context.Background(), task); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -135,7 +135,7 @@ func TestStepAdapter_SanitizesInjectionSentinels(t *testing.T) {
 	}
 
 	rec := &recordingAgent{id: "step_2", prov: "fake", returnText: "ok"}
-	adapter := NewStepAdapter(rec, "step_2", "step_2")
+	adapter := NewStepAdapter(rec, "step_2", "step_2", "text")
 
 	if _, err := adapter.Execute(context.Background(), task); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -164,7 +164,7 @@ func TestStepAdapter_RawOutputStoredForInspection(t *testing.T) {
 		Prompt: "hi",
 	}
 	rec := &recordingAgent{id: "step_1", prov: "fake", returnText: raw}
-	adapter := NewStepAdapter(rec, "step_1", "step_1")
+	adapter := NewStepAdapter(rec, "step_1", "step_1", "text")
 
 	result, err := adapter.Execute(context.Background(), task)
 	if err != nil {
