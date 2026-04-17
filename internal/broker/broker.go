@@ -88,6 +88,13 @@ type Store interface {
 	// state. See internal/store/store.go for the full error taxonomy
 	// (ErrTaskNotFound / ErrTaskAlreadyDiscarded / ErrTaskNotDiscardable).
 	DiscardDeadLetter(ctx context.Context, taskID string) error
+
+	// CancelTask atomically transitions a non-terminal task to FAILED with
+	// a "cancelled by operator" failure_reason. Returns the pre-cancel
+	// task snapshot so callers can surface context. See
+	// internal/store/store.go for the full error taxonomy
+	// (ErrTaskNotFound / ErrTaskAlreadyTerminal).
+	CancelTask(ctx context.Context, taskID string) (*Task, error)
 }
 
 // ErrQueueEmpty is returned by Store.DequeueTask when no tasks are available.

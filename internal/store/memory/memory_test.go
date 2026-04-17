@@ -639,6 +639,144 @@ func TestDiscardDeadLetter_LosesToReplayClaim(t *testing.T) {
 	}
 }
 
+// SEC2-003 regression coverage for CancelTask.
+
+func TestCancelTask_HappyPath(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStatePending
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := m.CancelTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if snapshot.State != broker.TaskStatePending {
+		t.Errorf("snapshot state: got %s want PENDING (pre-cancel)", snapshot.State)
+	}
+	stored, _ := m.GetTask(ctx, task.ID)
+	if stored.State != broker.TaskStateFailed {
+		t.Errorf("stored state: got %s want FAILED", stored.State)
+	}
+	if stored.Metadata["failure_reason"] != "cancelled by operator" {
+		t.Errorf("metadata.failure_reason: got %v want 'cancelled by operator'", stored.Metadata["failure_reason"])
+	}
+}
+
+func TestCancelTask_NotFound(t *testing.T) {
+	m := New()
+	_, err := m.CancelTask(context.Background(), "missing")
+	if err != store.ErrTaskNotFound {
+		t.Fatalf("got %v, want ErrTaskNotFound", err)
+	}
+}
+
+func TestCancelTask_AlreadyTerminalRejected(t *testing.T) {
+	terminal := []broker.TaskState{
+		broker.TaskStateDone,
+		broker.TaskStateFailed,
+		broker.TaskStateDiscarded,
+		broker.TaskStateReplayed,
+	}
+	for _, st := range terminal {
+		t.Run(string(st), func(t *testing.T) {
+			m := New()
+			ctx := context.Background()
+			task := newTask("p1", "s1")
+			if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+				t.Fatal(err)
+			}
+			final := st
+			if err := m.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &final}); err != nil {
+				t.Fatal(err)
+			}
+			_, err := m.CancelTask(ctx, task.ID)
+			if err != store.ErrTaskAlreadyTerminal {
+				t.Fatalf("terminal=%s: got %v, want ErrTaskAlreadyTerminal", st, err)
+			}
+			// Critical SEC2-003 invariant: the stored state must NOT
+			// have been overwritten to FAILED by the failed cancel.
+			got, _ := m.GetTask(ctx, task.ID)
+			if got.State != st {
+				t.Errorf("stored state after rejected cancel: got %s want %s", got.State, st)
+			}
+		})
+	}
+}
+
+// TestCancelTask_ExecutingTaskReportsPriorState confirms the CLI's
+// "Note: task was EXECUTING" branch still works with the CAS primitive:
+// the returned snapshot must reflect the pre-cancel state.
+func TestCancelTask_ExecutingTaskReportsPriorState(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	executing := broker.TaskStateExecuting
+	if err := m.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &executing}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := m.CancelTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if snapshot.State != broker.TaskStateExecuting {
+		t.Errorf("snapshot state: got %s want EXECUTING", snapshot.State)
+	}
+	stored, _ := m.GetTask(ctx, task.ID)
+	if stored.State != broker.TaskStateFailed {
+		t.Errorf("stored state: got %s want FAILED", stored.State)
+	}
+}
+
+// TestCancelTask_ConcurrentExactlyOneWins drives N goroutines at the
+// same live task. Exactly one sees nil; the rest see
+// ErrTaskAlreadyTerminal. No goroutine ever successfully cancels twice.
+func TestCancelTask_ConcurrentExactlyOneWins(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+
+	const N = 32
+	results := make(chan error, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := m.CancelTask(ctx, task.ID)
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	winners, already := 0, 0
+	for err := range results {
+		switch err {
+		case nil:
+			winners++
+		case store.ErrTaskAlreadyTerminal:
+			already++
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if winners != 1 {
+		t.Errorf("winners: got %d want 1", winners)
+	}
+	if already != N-1 {
+		t.Errorf("already-terminal: got %d want %d", already, N-1)
+	}
+}
+
 // TestDiscardDeadLetter_ConcurrentExactlyOneWins drives a horde of
 // goroutines at the same dead-lettered task: exactly one sees nil,
 // everyone else sees ErrTaskAlreadyDiscarded. Double-discards never

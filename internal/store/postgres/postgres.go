@@ -389,6 +389,60 @@ func (p *PostgresStore) RollbackReplayClaim(ctx context.Context, taskID string) 
 	return store.ErrTaskNotReplayPending
 }
 
+// CancelTask atomically transitions a non-terminal task to FAILED with a
+// "cancelled by operator" failure_reason via a conditional UPDATE
+// ... RETURNING. The predicate refuses every terminal state
+// (DONE / FAILED / DISCARDED / REPLAYED) so a concurrent completion
+// cannot be clobbered by a late cancel (SEC2-003).
+//
+// Returns the pre-cancel task snapshot so callers can surface context.
+func (p *PostgresStore) CancelTask(ctx context.Context, taskID string) (*broker.Task, error) {
+	// Read the current state first so we can return the pre-cancel
+	// snapshot on success. The subsequent UPDATE still gates on the
+	// non-terminal predicate, so a concurrent completer that wins the
+	// race gets the authoritative final state and our UPDATE matches
+	// zero rows → ErrTaskAlreadyTerminal.
+	snapshot, err := p.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	query := fmt.Sprintf(`WITH attempted AS (
+		UPDATE %s
+		SET state = 'FAILED',
+		    metadata = COALESCE(metadata, '{}'::jsonb) || '{"failure_reason":"cancelled by operator"}'::jsonb,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND state NOT IN ('DONE','FAILED','DISCARDED','REPLAYED')
+		RETURNING id
+	),
+	current_state AS (
+		SELECT state FROM %s WHERE id = $1
+	)
+	SELECT attempted.id, current_state.state AS _current_state
+	FROM attempted
+	FULL OUTER JOIN current_state ON true`, p.table, p.table)
+
+	var gotID, currentState *string
+	err = p.pool.QueryRow(ctx, query, taskID).Scan(&gotID, &currentState)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Task disappeared between the snapshot read and the update.
+			return nil, store.ErrTaskNotFound
+		}
+		return nil, fmt.Errorf("postgres: cancel task: %w", err)
+	}
+	if gotID != nil {
+		return snapshot, nil
+	}
+	// attempted side NULL: the row exists but did not satisfy the
+	// non-terminal predicate — a concurrent completion won the race.
+	if currentState == nil {
+		return nil, store.ErrTaskNotFound
+	}
+	return nil, store.ErrTaskAlreadyTerminal
+}
+
 // DiscardDeadLetter atomically transitions a FAILED+dead-lettered task to
 // DISCARDED via a conditional UPDATE ... RETURNING. The predicate is the
 // claim token: once a concurrent replay flips the task to REPLAY_PENDING,

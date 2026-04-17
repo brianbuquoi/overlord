@@ -323,6 +323,12 @@ func (f *failingStore) DiscardDeadLetter(_ context.Context, _ string) error {
 	}
 	return nil
 }
+func (f *failingStore) CancelTask(_ context.Context, _ string) (*broker.Task, error) {
+	// The API does not surface cancel today, so this stub is only here
+	// to satisfy the Store interface for tests that hand a *failingStore
+	// to the broker.
+	return nil, errors.New(internalLeakMarker + " cancel unexpected")
+}
 
 // newTestServerWithStore builds a Server whose broker uses the given Store.
 // Agents are healthy stubs; registry is empty; logger is the default.

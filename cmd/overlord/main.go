@@ -1684,32 +1684,25 @@ or REPLAYED), an error is returned.`,
 }
 
 func cancelTask(ctx context.Context, b *broker.Broker, taskID string, w interface{ Write([]byte) (int, error) }) error {
-	task, err := b.GetTask(ctx, taskID)
-	if err != nil {
-		return fmt.Errorf("task %q not found: %w", taskID, err)
-	}
-
-	if isTerminal(task.State) {
-		return fmt.Errorf("task %s is already in terminal state %s and cannot be cancelled", taskID, task.State)
-	}
-
-	failedState := broker.TaskStateFailed
-	update := broker.TaskUpdate{
-		State: &failedState,
-		Metadata: map[string]any{
-			"failure_reason": "cancelled by operator",
-		},
-	}
-
-	if err := b.Store().UpdateTask(ctx, taskID, update); err != nil {
+	// CancelTask is the atomic CAS primitive introduced by SEC2-003.
+	// The prior read-check-write shape (GetTask → state check →
+	// UpdateTask) could clobber a concurrent completion between the
+	// check and the write.
+	snapshot, err := b.Store().CancelTask(ctx, taskID)
+	switch {
+	case err == nil:
+		fmt.Fprintf(w, "Task %s cancelled.\n", taskID)
+		if snapshot.State == broker.TaskStateExecuting {
+			fmt.Fprintf(w, "Note: task was EXECUTING. The current execution may complete, but the task\nwill not be routed to further stages.\n")
+		}
+		return nil
+	case errors.Is(err, store.ErrTaskNotFound):
+		return fmt.Errorf("task %q not found", taskID)
+	case errors.Is(err, store.ErrTaskAlreadyTerminal):
+		return fmt.Errorf("task %s is already in a terminal state and cannot be cancelled", taskID)
+	default:
 		return fmt.Errorf("failed to cancel task %s: %w", taskID, err)
 	}
-
-	fmt.Fprintf(w, "Task %s cancelled.\n", taskID)
-	if task.State == broker.TaskStateExecuting {
-		fmt.Fprintf(w, "Note: task was EXECUTING. The current execution may complete, but the task\nwill not be routed to further stages.\n")
-	}
-	return nil
 }
 
 // --- pipelines command ---
