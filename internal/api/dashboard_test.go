@@ -221,7 +221,7 @@ func TestDashboard_RateLimitExclusion(t *testing.T) {
 	// Create server with a very low rate limit to test exclusion.
 	srv := NewServerWithContext(context.Background(), b, logger, nil, "")
 	// Override the limiter to a tiny limit for testing.
-	srv.limiter = newTokenBucket(1, 1) // 1 req/s, burst 1
+	srv.limiter = newTokenBucket(t.Context(), 1, 1) // 1 req/s, burst 1
 	// Rebuild routes with new limiter.
 	srv.srv.Handler = srv.routes()
 	defer srv.Shutdown(context.Background())
@@ -664,7 +664,7 @@ func TestDashboard_CustomPath_RateLimitExclusion(t *testing.T) {
 	logger := slog.Default()
 	b := broker.New(cfg, st, agents, reg, logger, nil, nil)
 	srv := NewServerWithContext(context.Background(), b, logger, nil, "")
-	srv.limiter = newTokenBucket(1, 1) // very restrictive
+	srv.limiter = newTokenBucket(t.Context(), 1, 1) // very restrictive
 	srv.srv.Handler = srv.routes()
 	defer srv.Shutdown(context.Background())
 

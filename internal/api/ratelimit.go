@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -20,7 +21,11 @@ type bucket struct {
 	lastSeen time.Time
 }
 
-func newTokenBucket(rate float64, burst int) *tokenBucket {
+// newTokenBucket constructs a rate limiter. The background cleanup
+// goroutine runs until ctx is cancelled — short-lived servers or tests
+// must cancel ctx to release it (the audit flagged the prior
+// no-stop-channel shape as a goroutine leak).
+func newTokenBucket(ctx context.Context, rate float64, burst int) *tokenBucket {
 	tb := &tokenBucket{
 		buckets: make(map[string]*bucket),
 		rate:    rate,
@@ -28,7 +33,7 @@ func newTokenBucket(rate float64, burst int) *tokenBucket {
 		cleanup: 5 * time.Minute,
 		now:     time.Now,
 	}
-	go tb.cleanupLoop()
+	go tb.cleanupLoop(ctx)
 	return tb
 }
 
@@ -59,18 +64,25 @@ func (tb *tokenBucket) allow(key string) bool {
 	return true
 }
 
-// cleanupLoop periodically removes stale entries.
-func (tb *tokenBucket) cleanupLoop() {
+// cleanupLoop periodically removes stale entries. Exits cleanly when
+// ctx is cancelled so tests and short-lived servers do not leak the
+// goroutine.
+func (tb *tokenBucket) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(tb.cleanup)
 	defer ticker.Stop()
-	for range ticker.C {
-		tb.mu.Lock()
-		cutoff := time.Now().Add(-tb.cleanup)
-		for k, b := range tb.buckets {
-			if b.lastSeen.Before(cutoff) {
-				delete(tb.buckets, k)
+	for {
+		select {
+		case <-ticker.C:
+			tb.mu.Lock()
+			cutoff := time.Now().Add(-tb.cleanup)
+			for k, b := range tb.buckets {
+				if b.lastSeen.Before(cutoff) {
+					delete(tb.buckets, k)
+				}
 			}
+			tb.mu.Unlock()
+		case <-ctx.Done():
+			return
 		}
-		tb.mu.Unlock()
 	}
 }

@@ -147,12 +147,18 @@ connections could consume significant memory via per-client send buffers.
 the cap are rejected at registration with a 503-style close frame so legitimate
 clients see a clear signal rather than a hung socket.
 
-### SEC-014: Token bucket cleanup goroutine leaks
-**Location:** `internal/api/ratelimit.go` — `cleanupLoop()`
+### SEC-014: Token bucket cleanup goroutine leaks — RESOLVED
+**Location:** `internal/api/ratelimit.go` — `newTokenBucket`, `cleanupLoop`
 **Severity:** Low
-**Description:** The cleanup goroutine runs forever with no stop mechanism. Harmless
-in production but leaks in tests.
-**Recommendation:** Accept a context parameter and stop on cancellation.
+**Status:** Resolved
+**Description:** The cleanup goroutine ran forever with no stop mechanism.
+Harmless in production but leaked a goroutine per constructor call in tests
+and short-lived servers.
+**Resolution:** `newTokenBucket` now takes `context.Context` and threads it
+into `cleanupLoop`, which returns on `ctx.Done()`. `NewServerWithContext`
+forwards its context to the limiter so the limiter shares the server's
+lifecycle. `TestTokenBucket_CleanupStopsOnContextCancel` is the regression
+guard.
 
 ### SEC2-003: cancel command TOCTOU race
 **Location:** `cmd/overlord/main.go` — `cancelTask()`
@@ -432,7 +438,7 @@ without a total count.
 | SEC-016 | Broker swallowed store errors + Postgres requeue duplicate-key | High | Resolved |
 | SEC-012 | Redis UpdateTask not atomic | Medium | Resolved |
 | SEC-013 | Unbounded WebSocket client count | Low | Resolved |
-| SEC-014 | Token bucket cleanup goroutine leak | Low | Open |
+| SEC-014 | Token bucket cleanup goroutine leak | Low | Resolved |
 | SEC-015 | No DisallowUnknownFields | Informational | Accepted |
 | SEC-016 | Path param validation adequate | Informational | Confirmed |
 | SEC2-003 | cancel command TOCTOU race | Medium | Open |

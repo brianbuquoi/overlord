@@ -102,7 +102,7 @@ func NewServerWithContext(ctx context.Context, b *broker.Broker, logger *slog.Lo
 
 	s := &Server{
 		broker:           b,
-		limiter:          newTokenBucket(100, 100), // 100 req/s per IP, burst of 100
+		limiter:          newTokenBucket(ctx, 100, 100), // 100 req/s per IP, burst of 100
 		replayAllLimiter: newReplayAllRateLimiter(),
 		logger:           logger,
 		metrics:          m,
