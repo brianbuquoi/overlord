@@ -4,6 +4,134 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] — 2026-04-17 — Workflow-first front door + audit sweep
+
+This release reframes the product around a single-file `workflow:` surface
+and lands the remaining open items from the Codex security audit rounds.
+No hard breaking changes since v0.6.1 — existing strict-config projects
+continue to load unchanged — but the authoring story new users see is now
+workflow-first, with strict mode repositioned as the advanced escape hatch
+reached via `overlord export --advanced`.
+
+### Added
+
+- **Workflow authoring surface** (PR #5, #8, #18). A top-level `workflow:`
+  block in `overlord.yaml` is now the default format. `overlord run`
+  executes it locally, `overlord serve` serves it as a long-running local
+  service, and `overlord export --advanced` graduates it to the strict
+  config layer (`schema_registry` + `pipelines` + `agents` + `stores` +
+  `auth`). Workflows compile through the chain layer into the existing
+  strict runtime — there is no second engine. Features retained:
+  `{{prev}}` shorthand, `vars`, text/JSON input/output with optional
+  inline schema, and a `runtime:` overlay for bind/store/auth/dashboard.
+- **Chain authoring layer** (PR #5, plus `feat(chain): lightweight chain-mode
+  authoring layer`). Lowered compatibility surface for existing `chain:`
+  projects; `overlord chain run|init|inspect|export` still works and uses
+  the same compile path as workflow mode.
+- **In-memory schema registry + `OnSuccess` MarshalYAML** in `internal/contract`
+  and `internal/config`, used by the chain/workflow compilers to synthesize
+  `chain_text@v1`, `chain_json@v1`, and `chain_input_json@v1`.
+- **`overlord export --advanced`** preserves author-specified step IDs and
+  emits a rename hint when IDs had to be rewritten (PR #18).
+- **Starter safety files.** `overlord init` default (workflow) template now
+  ships `.gitignore` and `.env.example` as part of the embedded scaffold
+  tree (PR #8 UX follow-up).
+
+### Security
+
+- **SEC-010 — per-call envelope nonce** (PR #23). Sanitizer envelope
+  delimiters are now randomized per call, closing the predictable-delimiter
+  escape vector.
+- **SEC-013 — WebSocket client cap** (`sec(api): cap WebSocket clients`).
+  API now rejects new WS connections past a configured ceiling instead of
+  growing the client map unbounded.
+- **SEC-014 — context-aware rate-limit cleanup** (PR #16, plus the race-free
+  regression test in PR #24). Token-bucket janitor goroutine now honours
+  shutdown context; no leak on server stop.
+- **SEC-015 — envelope bypass in chain adapter** (PR #9). Placeholder
+  substitution in the chain step adapter now goes through the sanitizer,
+  closing the path that let prior-step output reach a downstream prompt
+  outside the envelope.
+- **SEC-016 — fail-closed state transitions** (PR #12). `EnqueueTask` was
+  split into `EnqueueTask` + `RequeueTask`; broker routing and retry paths
+  now treat persistence failures as hard errors instead of silently
+  continuing. All three store backends (memory/Redis/Postgres) implement
+  `RequeueTask` as a single atomic op.
+- **SEC2-003 — atomic `cancel`** (PR #19). `CancelTask` in the store is now
+  compare-and-swap; closes the TOCTOU race where a running task could be
+  cancelled after it had already transitioned to a terminal state.
+- **SEC2-005 — `migrate run` defaults to terminal-only** (PR #21). The
+  migration CLI now refuses non-interactive execution without an explicit
+  opt-in, guarding against accidental runs against a live broker.
+- **SEC4-003 — WebSocket ping/pong keepalive** (`sec(api): cap WebSocket
+  clients and add ping/pong keepalive`). Dead connections are detected and
+  evicted instead of holding slots against the new client cap.
+- **SEC4-006 — `agent.system_prompt` size cap** (PR #17). Config loader
+  rejects system prompts larger than 512 KiB with a clear error.
+- **SEC4-008d — atomic dead-letter discard** (`sec(store): atomic
+  DiscardDeadLetter`). Discard now CAS-checks the task is still in the
+  dead-letter state, closing the replay/discard race.
+- **SEC4-010 — IPv6 brute-force tracking**. Auth brute-force tracking
+  buckets IPv6 addresses on a wider prefix so a single attacker cannot
+  rotate through a `/128`.
+- **Plaintext bearer refused** (`sec,docs: refuse plaintext bearer auth`).
+  API now rejects bearer tokens that were not hashed at config load, with
+  a rewritten deployment guide covering the supported auth shapes.
+- **Plugin opt-in gate** (PR #14). Subprocess and `.so` plugins are
+  fail-closed: they do not load unless explicitly enabled in config.
+
+### Fixed
+
+- `fix(config): context-aware Watch with write-burst debounce` (PR #22) —
+  config hot-reload no longer leaks a goroutine on shutdown and debounces
+  editor write bursts.
+- `fix(chain,workflow): lower {{...}} placeholders at export time` (PR #13)
+  — exported advanced YAML no longer contains unresolved workflow
+  placeholders.
+- `fix(workflow): hard-error on stray top-level keys + run strict validator
+  at compile` (PR #11) — typos in `workflow:` files fail fast instead of
+  being silently ignored.
+- `fix(broker,store): split EnqueueTask + fail-closed state transitions`
+  (PR #12) — see SEC-016 above.
+- `fix(broker): use bounded persistence ctx for terminal and requeue writes`
+  — terminal-state writes now have their own timeout so a slow store cannot
+  wedge shutdown.
+- `fix(cli): make overlord run trustworthy and init friendlier` — clearer
+  error paths for the default run command and scaffold flow.
+- `fix(api): race-free SEC-014 regression test` (PR #24) — removed a
+  flake-prone sleep-based assertion from the rate-limit cleanup test.
+
+### Changed
+
+- `chore(cli): route validate/health/migrate output through cobra writers`
+  (PR #20) — commands now honour `--quiet` and redirect cleanly under test.
+- `style(config): drop trailing period from system_prompt size error`
+  (ST1005).
+- `test(integration): centralize Postgres schema + semantic JSON compare` —
+  integration suite no longer depends on external schema files.
+- `test(chain): lock in reserved synthesized-schema invariants` — explicit
+  regression tests for the three `chain_*` schemas so the list does not
+  drift silently.
+- `build(make): preserve integration test exit status across teardown` —
+  failing integration tests no longer get masked by a clean compose-down.
+
+### Docs
+
+- README and CLAUDE.md reframed for the workflow-first product story; the
+  prior two-layer "chain vs pipeline" framing is gone from the front door.
+- `docs/advanced.md` added as the strict-config reference.
+- `docs/chain.md` retained as the legacy authoring-layer reference.
+- KNOWN_GAPS.md: SEC-013, SEC4-003, SEC4-010 closed; remaining medium/low
+  items enumerated with links.
+
+### Upgrade notes
+
+Drop-in replacement for v0.6.1 for strict-config projects. New projects
+scaffolded via `overlord init` land on the workflow surface by default;
+use `overlord init hello` or `overlord init summarize` for the
+prior strict-mode starters. `overlord version` still works and now reports
+`0.7.0`.
+
 ## [0.6.1] — 2026-04-16 — Post-release polish
 
 ### Added
