@@ -381,8 +381,22 @@ var validScopes = map[string]bool{
 //     time so a half-finished migration cannot silently ship — the
 //     alternative (log at debug and ignore) hid fail-open behavior in
 //     both directions (Codex audit finding #3).
+// MaxSystemPromptBytes caps the size of config.Agent.SystemPrompt. A
+// well-constructed prompt is a few KB at most; the 512 KiB ceiling is
+// generous enough for pathological templating while stopping a
+// megabyte-scale prompt from being silently accepted, loaded into every
+// request envelope, and amplified into downstream API call sizes. The
+// audit filed this as SEC4-006.
+const MaxSystemPromptBytes = 512 * 1024
+
 func validateAgents(agents []Agent) error {
 	for _, a := range agents {
+		if n := len(a.SystemPrompt); n > MaxSystemPromptBytes {
+			return fmt.Errorf(
+				"agent %q: system_prompt is %d bytes which exceeds the %d-byte ceiling (SEC4-006). Shrink the prompt or move bulky context into a stage input schema.",
+				a.ID, n, MaxSystemPromptBytes,
+			)
+		}
 		if len(a.Fixtures) == 0 {
 			continue
 		}

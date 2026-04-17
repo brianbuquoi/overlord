@@ -75,17 +75,10 @@ func TestKnownGap_SEC3001_RecordSuccessResetsBruteForce(t *testing.T) {
 // Regression coverage is TestWSKeepaliveInvariants in
 // internal/api/websocket_test.go.
 
-// =============================================================================
-// SEC4-006: No config-level size limit on system_prompt
-// =============================================================================
-
-func TestKnownGap_SEC4006_UnboundedSystemPrompt(t *testing.T) {
-	t.Skip("SEC4-006 OPEN: No config-level size limit on system_prompt. " +
-		"Fix: enforce max length (e.g. 512KB) during config validation.")
-
-	// When fixed: create config with a system_prompt > 512KB and verify
-	// validation rejects it.
-}
+// SEC4-006 RESOLVED: config.validateAgents rejects any agent whose
+// system_prompt exceeds MaxSystemPromptBytes (512 KiB). The regression
+// lives in TestValidateAgents_SystemPromptOverCeilingRejected in
+// internal/config/agent_validation_test.go.
 
 // =============================================================================
 // SEC4-008: Replay dead-letter TOCTOU race
