@@ -1242,17 +1242,16 @@ func TestDiscardAll_PerTaskFailure(t *testing.T) {
 		t.Fatalf("seeded %d tasks, want 5", len(ids))
 	}
 
-	// Pick 2 specific task IDs to fail on UpdateTask (only the discard
-	// transition: we filter on the target state).
+	// Pick 2 specific task IDs to fail during the atomic discard claim.
+	// DiscardAll now uses the SEC4-008d CAS primitive instead of UpdateTask,
+	// so inject the fault at that entry point.
 	failSet := map[string]struct{}{ids[0]: {}, ids[1]: {}}
 	mem := mstore.Memory()
-	mstore.OnUpdateTask = func(ctx context.Context, taskID string, update broker.TaskUpdate) error {
-		if update.State != nil && *update.State == broker.TaskStateDiscarded {
-			if _, bad := failSet[taskID]; bad {
-				return mock.ErrInjected
-			}
+	mstore.OnDiscardDeadLetter = func(ctx context.Context, taskID string) error {
+		if _, bad := failSet[taskID]; bad {
+			return mock.ErrInjected
 		}
-		return mem.UpdateTask(ctx, taskID, update)
+		return mem.DiscardDeadLetter(ctx, taskID)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letter/discard-all?pipeline_id=test-pipeline", nil)

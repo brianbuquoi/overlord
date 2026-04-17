@@ -230,9 +230,12 @@ func TestEveryTemplate_Structure(t *testing.T) {
 
 // TestEveryTemplate_GitignoreContent enforces the exact required entries
 // in every template's .gitignore — these protect credentials and
-// backup-file leakage and are part of the Unit 2 deliverable contract.
+// backup-file leakage. Applies to every first-party template, strict or
+// workflow: the starter is the default beginner path and explicitly
+// documents how to swap in a real provider via env vars, so it needs the
+// same safety net as the strict templates.
 func TestEveryTemplate_GitignoreContent(t *testing.T) {
-	for _, name := range strictTemplates() {
+	for _, name := range ListTemplates() {
 		t.Run(name, func(t *testing.T) {
 			data, err := FS.ReadFile(filepath.Join(templatesRoot, name, ".gitignore"))
 			if err != nil {
@@ -260,9 +263,10 @@ func TestEveryTemplate_GitignoreContent(t *testing.T) {
 // TestEveryTemplate_EnvExamplePlaceholder guards against accidentally
 // using an sk-prefixed placeholder, which secret scanners would otherwise
 // greenlight. The placeholder must be obviously-fake to trip scanners if
-// committed unchanged.
+// committed unchanged. Applies to every first-party template including
+// the workflow starter.
 func TestEveryTemplate_EnvExamplePlaceholder(t *testing.T) {
-	for _, name := range strictTemplates() {
+	for _, name := range ListTemplates() {
 		t.Run(name, func(t *testing.T) {
 			data, err := FS.ReadFile(filepath.Join(templatesRoot, name, ".env.example"))
 			if err != nil {

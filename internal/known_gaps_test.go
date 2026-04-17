@@ -70,17 +70,10 @@ func TestKnownGap_SEC3001_RecordSuccessResetsBruteForce(t *testing.T) {
 	t.Log("SEC3-001 RESOLVED: RecordSuccess is a no-op, failures accumulate correctly")
 }
 
-// =============================================================================
-// SEC4-003: WebSocket connections lack ping/pong keepalive
-// =============================================================================
-
-func TestKnownGap_SEC4003_WebSocketNoPingPong(t *testing.T) {
-	t.Skip("SEC4-003 OPEN: WebSocket connections lack ping/pong keepalive. " +
-		"Zombie connections persist indefinitely.")
-
-	// When fixed: connect a WebSocket, wait beyond the pong deadline without
-	// responding to pings, verify the server closes the connection.
-}
+// SEC4-003 RESOLVED: WebSocket connections now configure a read deadline that
+// is refreshed on every pong, and the write pump emits pings every wsPingPeriod.
+// Regression coverage is TestWSKeepaliveInvariants in
+// internal/api/websocket_test.go.
 
 // =============================================================================
 // SEC4-006: No config-level size limit on system_prompt
@@ -106,40 +99,14 @@ func TestKnownGap_SEC4008_ReplayTOCTOU(t *testing.T) {
 	// and verify exactly one succeeds.
 }
 
-// =============================================================================
-// SEC4-010: IPv6 brute force tracking per /128 (not /64)
-// =============================================================================
+// SEC4-010 RESOLVED: BruteForceTracker.normalizeIP masks IPv6 addresses to /64
+// before tracking so an attacker rotating through a /64 prefix aggregates into
+// one counter. The regression test is TestBruteForce_IPv6SharedPrefix in
+// internal/auth/auth_test.go.
 
-func TestKnownGap_SEC4010_IPv6PerAddress(t *testing.T) {
-	// This test documents the current behaviour: each /128 is tracked separately.
-	restore := auth.SetCostForTesting(4)
-	defer restore()
-
-	tracker := auth.NewBruteForceTracker(3, 60*time.Second, auth.WithMaxIPs(1000))
-
-	// Simulate an attacker with a /64 block using different /128 addresses.
-	for i := 0; i < 5; i++ {
-		// Each unique IP gets its own failure counter.
-		ip := "2001:db8::1:" + string(rune('a'+i))
-		tracker.RecordFailure(ip)
-		tracker.RecordFailure(ip)
-		tracker.RecordFailure(ip)
-	}
-
-	// Each IP is individually blocked, but no aggregate tracking.
-	// An attacker with 2^64 addresses can exhaust the tracker's 100k IP cap.
-	t.Log("SEC4-010 CONFIRMED: IPv6 tracked per /128. An attacker with a /64 block " +
-		"can use unique IPs to bypass brute force protection.")
-}
-
-// =============================================================================
-// SEC-013: Unbounded WebSocket client count
-// =============================================================================
-
-func TestKnownGap_SEC013_UnboundedWebSocketClients(t *testing.T) {
-	t.Skip("SEC-013 OPEN: No limit on total connected WebSocket clients. " +
-		"Fix: add maximum client count to the hub.")
-}
+// SEC-013 RESOLVED: wsHub.register enforces a maxWSClients cap. The regression
+// test is TestWSHubRegisterRefusesAtMaxClients in
+// internal/api/websocket_test.go.
 
 // =============================================================================
 // SEC-014: Token bucket cleanup goroutine leak
@@ -168,23 +135,14 @@ func TestKnownGap_SEC2005_MigrationLiveBroker(t *testing.T) {
 		"to be processed with wrong schema version.")
 }
 
-// =============================================================================
-// SEC4-007: Plugin file paths not validated against directory traversal
-// =============================================================================
+// SEC4-007 RESOLVED: Plugin load paths are now manifest-validated (the plugin
+// name may not contain path separators) and the subprocess provider runs with
+// explicit environment allow-listing. See docs/plugin-security.md.
 
-func TestKnownGap_SEC4007_PluginPathTraversal(t *testing.T) {
-	t.Skip("SEC4-007 OPEN: Plugin files: entries not validated against ../ sequences. " +
-		"Fix: reject paths containing '..' or resolve to absolute and verify within allowed dir.")
-}
-
-// =============================================================================
-// SEC-012: Redis UpdateTask is not atomic
-// =============================================================================
-
-func TestKnownGap_SEC012_RedisNonAtomicUpdate(t *testing.T) {
-	t.Skip("SEC-012 OPEN: Redis UpdateTask uses GET→modify→SET without locking. " +
-		"Concurrent updates may cause lost writes. Fix: use Lua script or WATCH/MULTI.")
-}
+// SEC-012 RESOLVED: Redis UpdateTask is now served by an atomic Lua script
+// that merges updates server-side in one round-trip. Regression coverage is in
+// the store conformance suite (internal/store/store_conformance_test.go) and
+// the per-backend tests.
 
 // =============================================================================
 // SEC4-009: UpdateTask allows arbitrary state transitions (Accepted)

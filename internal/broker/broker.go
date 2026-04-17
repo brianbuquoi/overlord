@@ -81,6 +81,13 @@ type Store interface {
 	// state (it may have already been completed or rolled back by another
 	// caller).
 	RollbackReplayClaim(ctx context.Context, taskID string) error
+
+	// DiscardDeadLetter atomically transitions a FAILED+dead-lettered task
+	// to DISCARDED. The state transition is the claim token so a late
+	// discard cannot silently overwrite a concurrent replay's winning
+	// state. See internal/store/store.go for the full error taxonomy
+	// (ErrTaskNotFound / ErrTaskAlreadyDiscarded / ErrTaskNotDiscardable).
+	DiscardDeadLetter(ctx context.Context, taskID string) error
 }
 
 // ErrQueueEmpty is returned by Store.DequeueTask when no tasks are available.

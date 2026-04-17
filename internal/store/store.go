@@ -23,6 +23,17 @@ var (
 	// exists but is not in REPLAY_PENDING — it may have already been completed
 	// or rolled back by another caller.
 	ErrTaskNotReplayPending = errors.New("task is not in REPLAY_PENDING state")
+	// ErrTaskNotDiscardable is returned by DiscardDeadLetter when the task
+	// exists but is not in a discardable state (i.e. not FAILED+dead-lettered)
+	// and is not already DISCARDED. The most common cause is that a concurrent
+	// replay claim moved the task out of the dead-letter state before this
+	// discard landed.
+	ErrTaskNotDiscardable = errors.New("task is not in a discardable state")
+	// ErrTaskAlreadyDiscarded is returned by DiscardDeadLetter when the task
+	// is already DISCARDED. Kept distinct from ErrTaskNotDiscardable so the
+	// HTTP API can preserve its ALREADY_DISCARDED response code and a
+	// genuine retry can be distinguished from a lost-race state mismatch.
+	ErrTaskAlreadyDiscarded = errors.New("task is already discarded")
 )
 
 // Store is the interface for task persistence and queuing.
@@ -70,4 +81,19 @@ type Store interface {
 	// state (it may have already been completed or rolled back by another
 	// caller).
 	RollbackReplayClaim(ctx context.Context, taskID string) error
+
+	// DiscardDeadLetter atomically transitions a FAILED+dead-lettered task
+	// to DISCARDED. The state transition is the claim token so a concurrent
+	// replay cannot silently see its REPLAY_PENDING / REPLAYED outcome
+	// overwritten by a late discard — the audit called out SEC4-008d as
+	// the remaining replay-vs-discard race after SEC4-008/a/b/c closed
+	// the replay side.
+	//
+	// Returns ErrTaskNotFound if the task does not exist.
+	// Returns ErrTaskAlreadyDiscarded if the task is already DISCARDED
+	// (idempotent retry — the caller can treat this as success).
+	// Returns ErrTaskNotDiscardable if the task is in any other state
+	// (including REPLAY_PENDING, REPLAYED, DONE, or a non-dead-lettered
+	// FAILED).
+	DiscardDeadLetter(ctx context.Context, taskID string) error
 }

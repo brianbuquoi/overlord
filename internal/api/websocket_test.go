@@ -157,3 +157,28 @@ func TestWSHubRegisterRefusesAtMaxClients(t *testing.T) {
 	}
 	hub.unregister(c)
 }
+
+// TestWSKeepaliveInvariants locks in the SEC4-003 resolution: the keepalive
+// constants must remain sane so zombie connections are closed inside the pong
+// window. If these get zeroed or reordered the read deadline regime collapses
+// and the denial-of-service path returns.
+func TestWSKeepaliveInvariants(t *testing.T) {
+	if wsPongWait <= 0 {
+		t.Fatalf("wsPongWait must be > 0, got %v", wsPongWait)
+	}
+	if wsWriteWait <= 0 {
+		t.Fatalf("wsWriteWait must be > 0, got %v", wsWriteWait)
+	}
+	if wsPingPeriod <= 0 {
+		t.Fatalf("wsPingPeriod must be > 0, got %v", wsPingPeriod)
+	}
+	// Ping period must be strictly less than pong wait: otherwise the server
+	// cannot send a ping in time to refresh the read deadline before it
+	// expires, and even a healthy client looks dead.
+	if wsPingPeriod >= wsPongWait {
+		t.Fatalf("wsPingPeriod (%v) must be < wsPongWait (%v)", wsPingPeriod, wsPongWait)
+	}
+	if wsWriteWait >= wsPongWait {
+		t.Fatalf("wsWriteWait (%v) must be < wsPongWait (%v) so writes do not outlive the read deadline", wsWriteWait, wsPongWait)
+	}
+}

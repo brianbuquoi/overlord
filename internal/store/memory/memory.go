@@ -197,6 +197,34 @@ func (m *MemoryStore) ClaimForReplay(_ context.Context, taskID string) (*broker.
 	return copyTask(task), nil
 }
 
+// DiscardDeadLetter atomically transitions a FAILED+dead-lettered task to
+// DISCARDED. Concurrent replay claims transition via a different predicate
+// (FAILED+DL=true → REPLAY_PENDING), so exactly one of {replay-claim,
+// discard} wins per task. A second discard on an already-discarded task
+// returns ErrTaskAlreadyDiscarded so idempotent retries stay observable.
+func (m *MemoryStore) DiscardDeadLetter(_ context.Context, taskID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	task, ok := m.tasks[taskID]
+	if !ok {
+		return store.ErrTaskNotFound
+	}
+	if !task.ExpiresAt.IsZero() && time.Now().After(task.ExpiresAt) {
+		return store.ErrTaskNotFound
+	}
+	if task.State == broker.TaskStateDiscarded {
+		return store.ErrTaskAlreadyDiscarded
+	}
+	if task.State != broker.TaskStateFailed || !task.RoutedToDeadLetter {
+		return store.ErrTaskNotDiscardable
+	}
+
+	task.State = broker.TaskStateDiscarded
+	task.UpdatedAt = time.Now()
+	return nil
+}
+
 // RollbackReplayClaim atomically transitions a REPLAY_PENDING task back to
 // FAILED+RoutedToDeadLetter=true so it becomes visible and replayable again
 // after a Submit failure.

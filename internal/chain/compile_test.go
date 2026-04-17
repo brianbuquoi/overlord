@@ -132,3 +132,104 @@ func TestCompile_InlineOutputSchemaOverridesDefault(t *testing.T) {
 // See TestExport_RoundTrip_InlineOutputSchema in run_test.go for the
 // end-to-end export round-trip of an inline output schema through a
 // scaffolded chain (so real fixture files exist on disk).
+
+// TestCompile_ReservedSchemaNamesRoundtripCleanly is the regression test
+// called out in CLAUDE.md: the three synthesized names (chain_text@v1,
+// chain_json@v1, chain_input_json@v1) are reserved for the chain
+// compiler, and compiling must produce each reserved name exactly once
+// per occurrence, with no accidental shadowing or collision between
+// compile runs.
+//
+// Collision safety today is structural — step/chain IDs live in a
+// different namespace than schema names, and workflow/chain authors
+// cannot declare schemas directly. This test locks that structural
+// contract in: a future change that introduced a second writer of the
+// reserved names, or that leaked schemas across compiles via a shared
+// registry, would fail this test.
+func TestCompile_ReservedSchemaNamesRoundtripCleanly(t *testing.T) {
+	// (1) A text-in / text-out chain must synthesize chain_text@v1 only.
+	textOnly, err := Compile(newTestChain())
+	if err != nil {
+		t.Fatalf("text chain compile: %v", err)
+	}
+	assertSchemaPresent(t, textOnly, textSchemaName, textSchemaVersion)
+	assertSchemaAbsent(t, textOnly, jsonSchemaName, jsonSchemaVersion)
+	assertSchemaAbsent(t, textOnly, inputJSONSchemaName, inputJSONSchemaVersion)
+
+	// (2) A json-out chain must synthesize chain_text@v1 AND chain_json@v1.
+	jsonOut := newTestChain()
+	jsonOut.Output = &Output{Type: "json"}
+	jsonOutCompiled, err := Compile(jsonOut)
+	if err != nil {
+		t.Fatalf("json-out chain compile: %v", err)
+	}
+	assertSchemaPresent(t, jsonOutCompiled, textSchemaName, textSchemaVersion)
+	assertSchemaPresent(t, jsonOutCompiled, jsonSchemaName, jsonSchemaVersion)
+	assertSchemaAbsent(t, jsonOutCompiled, inputJSONSchemaName, inputJSONSchemaVersion)
+
+	// (3) A json-in chain must synthesize chain_input_json@v1 on the
+	//     first stage's input plus chain_text@v1 for inter-step wire.
+	jsonIn := newTestChain()
+	jsonIn.Input = &Input{Type: "json"}
+	jsonInCompiled, err := Compile(jsonIn)
+	if err != nil {
+		t.Fatalf("json-in chain compile: %v", err)
+	}
+	assertSchemaPresent(t, jsonInCompiled, textSchemaName, textSchemaVersion)
+	assertSchemaPresent(t, jsonInCompiled, inputJSONSchemaName, inputJSONSchemaVersion)
+
+	// (4) Two compiles must not share schemas — the compiler returns a
+	//     fresh registry each time so an accidental global sink cannot
+	//     introduce cross-compile collisions. Mutating one compile's
+	//     schema bytes must not leak into another compile.
+	a, err := Compile(newTestChain())
+	if err != nil {
+		t.Fatalf("compile a: %v", err)
+	}
+	b, err := Compile(newTestChain())
+	if err != nil {
+		t.Fatalf("compile b: %v", err)
+	}
+	keyA := schemaKey(textSchemaName, textSchemaVersion)
+	if &a.Schemas == &b.Schemas {
+		t.Fatal("two compiles returned the same Schemas map pointer — cross-compile state sharing")
+	}
+	if a.Registry == b.Registry {
+		t.Fatal("two compiles returned the same registry pointer — cross-compile state sharing")
+	}
+	a.Schemas[keyA] = []byte(`{"mutated":true}`)
+	if string(b.Schemas[keyA]) == `{"mutated":true}` {
+		t.Fatal("mutating one compile's schema bytes leaked into another compile")
+	}
+
+	// (5) The compiled config.Config.SchemaRegistry must reference ONLY
+	//     the reserved names. If a future change lets users declare
+	//     arbitrary schemas directly on a chain, this assertion must be
+	//     updated deliberately — silently widening the registry would
+	//     break the "reserved names are compiler-private" invariant.
+	for _, entry := range jsonInCompiled.Config.SchemaRegistry {
+		switch entry.Name {
+		case textSchemaName, jsonSchemaName, inputJSONSchemaName:
+			// allowed
+		default:
+			t.Errorf("unexpected schema name in compiled SchemaRegistry: %q (only the three reserved chain_* names are expected)", entry.Name)
+		}
+	}
+}
+
+func assertSchemaPresent(t *testing.T, c *Compiled, name, version string) {
+	t.Helper()
+	if _, err := c.Registry.Lookup(name, version); err != nil {
+		t.Errorf("registry lookup for %s@%s: %v", name, version, err)
+	}
+	if _, ok := c.Schemas[schemaKey(name, version)]; !ok {
+		t.Errorf("Schemas map missing %s@%s", name, version)
+	}
+}
+
+func assertSchemaAbsent(t *testing.T, c *Compiled, name, version string) {
+	t.Helper()
+	if _, err := c.Registry.Lookup(name, version); err == nil {
+		t.Errorf("registry unexpectedly contains %s@%s", name, version)
+	}
+}

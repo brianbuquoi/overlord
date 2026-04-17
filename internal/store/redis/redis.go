@@ -519,6 +519,57 @@ return 'OK'
 
 var rollbackReplayClaim = redis.NewScript(rollbackReplayClaimScript)
 
+// discardDeadLetterScript atomically transitions a FAILED+dead-lettered
+// task to DISCARDED, updating the per-state index. The state transition
+// is the claim token: concurrent callers whose task has already left the
+// FAILED+DL=true predicate (e.g. because a replay claimed it into
+// REPLAY_PENDING) receive NOT_DISCARDABLE rather than silently overwriting
+// the winning state.
+//
+// ALREADY_DISCARDED is distinguished so the HTTP API can continue to
+// surface the same 409 ALREADY_DISCARDED response code for idempotent
+// retries.
+//
+//	KEYS[1] = task key
+//	ARGV[1] = updated_at timestamp (RFC3339Nano string)
+//	ARGV[2] = state index key prefix
+//	ARGV[3] = score for state index ZADD
+//
+// Returns: "OK" / "TASK_NOT_FOUND" / "ALREADY_DISCARDED" / "NOT_DISCARDABLE".
+const discardDeadLetterScript = `
+local data = redis.call('GET', KEYS[1])
+if not data then
+  return 'TASK_NOT_FOUND'
+end
+local task = cjson.decode(data)
+if task.state == 'DISCARDED' then
+  return 'ALREADY_DISCARDED'
+end
+if task.state ~= 'FAILED' or not task.routed_to_dead_letter then
+  return 'NOT_DISCARDABLE'
+end
+local prev_state = task.state
+task.state = 'DISCARDED'
+task.updated_at = ARGV[1]
+local newData = cjson.encode(task)
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl and tonumber(pttl) and tonumber(pttl) > 0 then
+  redis.call('SET', KEYS[1], newData, 'PX', tonumber(pttl))
+else
+  redis.call('SET', KEYS[1], newData)
+end
+redis.call('ZREM', ARGV[2] .. prev_state, task.id)
+redis.call('ZADD', ARGV[2] .. 'DISCARDED', tonumber(ARGV[3]), task.id)
+local pipeline_id = task.pipeline_id
+if pipeline_id and pipeline_id ~= '' then
+  redis.call('ZREM', ARGV[2] .. prev_state .. ':pipeline:' .. pipeline_id, task.id)
+  redis.call('ZADD', ARGV[2] .. 'DISCARDED:pipeline:' .. pipeline_id, tonumber(ARGV[3]), task.id)
+end
+return 'OK'
+`
+
+var discardDeadLetter = redis.NewScript(discardDeadLetterScript)
+
 // ClaimForReplay atomically transitions a FAILED+dead-lettered task to
 // REPLAY_PENDING and clears RoutedToDeadLetter. The state transition is the
 // claim token so concurrent callers each get ErrTaskNotReplayable after the
@@ -555,6 +606,43 @@ func (r *RedisStore) ClaimForReplay(ctx context.Context, taskID string) (*broker
 		return nil, fmt.Errorf("redis: claim for replay: unmarshal: %w", err)
 	}
 	return &task, nil
+}
+
+// DiscardDeadLetter atomically transitions a FAILED+dead-lettered task to
+// DISCARDED. The state transition is the claim token so concurrent
+// replay-vs-discard races cannot silently overwrite a winning replay's
+// state. ErrTaskAlreadyDiscarded is returned on a repeat call so the API
+// can preserve the ALREADY_DISCARDED response code for idempotent retries.
+func (r *RedisStore) DiscardDeadLetter(ctx context.Context, taskID string) error {
+	now := time.Now()
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	score := float64(now.UnixNano()) / 1e9
+	scoreStr := fmt.Sprintf("%f", score)
+
+	res, err := discardDeadLetter.Run(ctx, r.client,
+		[]string{r.taskKey(taskID)},
+		nowStr,
+		r.stateIndexPrefix(),
+		scoreStr,
+	).Result()
+	if err != nil {
+		return fmt.Errorf("redis: discard dead-letter: %w", err)
+	}
+	s, ok := res.(string)
+	if !ok {
+		return fmt.Errorf("redis: discard dead-letter: unexpected reply type %T", res)
+	}
+	switch s {
+	case "OK":
+		return nil
+	case "TASK_NOT_FOUND":
+		return store.ErrTaskNotFound
+	case "ALREADY_DISCARDED":
+		return store.ErrTaskAlreadyDiscarded
+	case "NOT_DISCARDABLE":
+		return store.ErrTaskNotDiscardable
+	}
+	return fmt.Errorf("redis: discard dead-letter: unexpected reply %q", s)
 }
 
 // RollbackReplayClaim atomically reverts a REPLAY_PENDING task to

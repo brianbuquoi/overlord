@@ -137,12 +137,15 @@ in docs/deployment.md.
 **Status:** Informational — no code change required. Document in deployment
 checklist.
 
-### SEC-013: Unbounded WebSocket client count
-**Location:** `internal/api/websocket.go` — `wsHub`
+### SEC-013: Unbounded WebSocket client count — RESOLVED
+**Location:** `internal/api/websocket.go` — `wsHub.register`
 **Severity:** Low
+**Status:** Resolved
 **Description:** No limit on total connected WebSocket clients. A large number of
 connections could consume significant memory via per-client send buffers.
-**Recommendation:** Add a maximum client count to the hub.
+**Resolution:** `wsHub.register` enforces a `maxWSClients = 512` cap; arrivals past
+the cap are rejected at registration with a 503-style close frame so legitimate
+clients see a clear signal rather than a hung socket.
 
 ### SEC-014: Token bucket cleanup goroutine leaks
 **Location:** `internal/api/ratelimit.go` — `cleanupLoop()`
@@ -169,15 +172,18 @@ processed with the wrong schema version.
 **Recommendation:** Document that `migrate run` should target quiesced pipelines, or add
 `--require-state DONE,FAILED` filter to only migrate terminal tasks.
 
-### SEC4-003: WebSocket connections lack ping/pong keepalive
-**Location:** `internal/api/websocket.go` — `readPump()`
+### SEC4-003: WebSocket connections lack ping/pong keepalive — RESOLVED
+**Location:** `internal/api/websocket.go` — `wsClient.readPump`, `wsClient.writePump`
 **Severity:** Medium
+**Status:** Resolved
 **Description:** No `SetReadDeadline`, `PingHandler`, or `PongHandler` configured on
 WebSocket connections. Zombie connections (client disconnects ungracefully) persist
 indefinitely, consuming a goroutine and send buffer per connection. Combined with
 SEC-013 (unbounded client count), this creates a resource exhaustion path.
-**Recommendation:** Add ping/pong with 60s deadline. Close connections that miss
-2 consecutive pong responses.
+**Resolution:** Each connection now runs with a `wsPongWait = 60s` read deadline
+refreshed on every pong; the write pump emits pings every `wsPingPeriod` (90% of
+`wsPongWait`) and every write is bounded by `wsWriteWait = 10s`. Dead peers are
+closed within `wsPongWait` of their last pong.
 
 ### SEC4-006: No config-level size limit on system_prompt
 **Location:** `internal/config/types.go` — `Agent.SystemPrompt`
@@ -230,13 +236,54 @@ the index is needed for live deployments upgrading from a prior version.
 `tasks:state:{STATE}:pipeline:{PIPELINE_ID}` key.
 **Status:** Open.
 
-### SEC4-010: IPv6 brute force tracking per /128 (not /64)
-**Location:** `internal/auth/auth.go` — `RecordFailure()`, `internal/api/middleware.go` — `clientIP()`
+### SEC4-008d: Dead-letter discard was TOCTOU / non-atomic — RESOLVED
+**Location:** `internal/api/handlers.go` — `handleDiscardDeadLetter`; `cmd/overlord/main.go` — `deadLetterDiscardCmd`; `internal/deadletter/service.go` — `DiscardAll`; `internal/store/{memory,redis,postgres}` — `DiscardDeadLetter`
 **Severity:** Medium
+**Status:** Resolved
+**Description:** SEC4-008/a/b/c closed the replay side of the dead-letter
+race (replay now claims atomically), but discard still used a
+read-check-write shape (`GetTask` / `ListTasks` → state check → unconditional
+`UpdateTask`). A concurrent replay that moved the task into `REPLAY_PENDING`
+could be silently overwritten by a late discard, leaving the task's audit
+state disagreeing with the replay outcome.
+**Resolution:** Added `Store.DiscardDeadLetter(ctx, taskID) error` across
+memory/redis/postgres as an atomic CAS (`FAILED && routed_to_dead_letter=true
+→ DISCARDED`). Sentinel errors `ErrTaskNotDiscardable` and
+`ErrTaskAlreadyDiscarded` let the HTTP API preserve the
+`NOT_DEAD_LETTERED` / `ALREADY_DISCARDED` response codes while remaining
+race-safe. API handler, CLI discard command, and bulk `DiscardAll` all
+route through the new primitive. Regression coverage is in the store
+conformance suite (`TestMemoryStoreConformance/DiscardDeadLetter_*`,
+including `_LosesToReplayClaim` which is the direct race reproducer).
+
+### SEC4-016: Starter workflow scaffold omitted .gitignore and .env.example — RESOLVED
+**Location:** `internal/scaffold/templates/starter/`
+**Severity:** Low
+**Status:** Resolved
+**Description:** The default `overlord init` starter is the beginner
+path and explicitly documents switching to real providers via environment
+variables, but it was the only first-party scaffold excluded from the
+`.gitignore` / `.env.example` safety contract. A distracted user had no
+scaffolded place to stage provider secrets and no default gitignore rule
+for `.env` or `*.overlord-init-bak` backup files.
+**Resolution:** Starter template now ships the same credential-hygiene
+artefacts the strict templates carry; the scaffold safety-file tests in
+`internal/scaffold/templates_test.go` (gitignore contract + env-example
+placeholder check) iterate over `ListTemplates()` rather than only the
+strict subset, so a regression that drops either file from starter fails
+the suite.
+
+### SEC4-010: IPv6 brute force tracking per /128 (not /64) — RESOLVED
+**Location:** `internal/auth/auth.go` — `normalizeIP`
+**Severity:** Medium
+**Status:** Resolved
 **Description:** BruteForceTracker tracks IPv6 addresses as full /128 strings. An
 attacker with a /64 block has 2^64 distinct IPs. At 100k IP cap, the tracker
 overflows quickly, after which new IPs fail open.
-**Recommendation:** Normalize IPv6 to /64 prefix before tracking.
+**Resolution:** `normalizeIP` masks IPv6 addresses to /64 before they are used as
+map keys in the failures table, so every address inside a /64 aggregates into one
+counter and an attacker holding a /64 prefix cannot bypass the threshold by rotating
+through its addresses.
 
 ### SEC3-001: RecordSuccess resets brute force window indefinitely — RESOLVED
 **Location:** `internal/auth/auth.go` — `RecordSuccess()` method
@@ -384,7 +431,7 @@ without a total count.
 | SEC-015 | Chain-adapter envelope bypass via placeholder substitution | High | Resolved |
 | SEC-016 | Broker swallowed store errors + Postgres requeue duplicate-key | High | Resolved |
 | SEC-012 | Redis UpdateTask not atomic | Medium | Resolved |
-| SEC-013 | Unbounded WebSocket client count | Low | Open |
+| SEC-013 | Unbounded WebSocket client count | Low | Resolved |
 | SEC-014 | Token bucket cleanup goroutine leak | Low | Open |
 | SEC-015 | No DisallowUnknownFields | Informational | Accepted |
 | SEC-016 | Path param validation adequate | Informational | Confirmed |
@@ -392,7 +439,7 @@ without a total count.
 | SEC2-005 | Migration lacks live broker guard | Medium | Open |
 | SEC2-NEW-002 | Metrics endpoint on shared port | Informational | Informational |
 | SEC3-001 | RecordSuccess resets brute force window | Medium | Resolved |
-| SEC4-003 | WebSocket lacks ping/pong keepalive | Medium | Open |
+| SEC4-003 | WebSocket lacks ping/pong keepalive | Medium | Resolved |
 | SEC4-004 | No max length on path parameters | Low | Accepted |
 | SEC4-005 | No length limit on query filter params | Low | Accepted |
 | SEC4-006 | No config-level system_prompt size limit | Medium | Open |
@@ -400,8 +447,9 @@ without a total count.
 | SEC4-008 | Replay dead-letter phantom PENDING | High | Resolved |
 | SEC4-008b | Concurrent replay semantics: N-winner read-only claim | Medium | Resolved |
 | SEC4-008c | Replay claim consumed before Submit succeeds strands task (FAILED+DL=false) | High | Resolved |
+| SEC4-008d | Dead-letter discard was TOCTOU / non-atomic vs concurrent replay | Medium | Resolved |
 | SEC4-009 | UpdateTask allows arbitrary state transitions | Low | Accepted |
-| SEC4-010 | IPv6 brute force tracking per /128 | Medium | Open |
+| SEC4-010 | IPv6 brute force tracking per /128 | Medium | Resolved |
 | SEC4-011 | CI build missing -trimpath | Low | Accepted |
 | SEC4-012 | Agent API keys not zeroed | Low | Accepted |
 | SEC4-013 | math/rand/v2 for retry jitter | Informational | Accepted |
@@ -416,6 +464,7 @@ without a total count.
 | KG-003 | ListTasks total-count over-reports with certain filters | Low | Open |
 | KG-004 | Redis state index not pipeline-scoped for bulk ops | Medium | Resolved |
 | KG-005 | Redis 2D state×pipeline index not backfilled | Low | Open |
+| SEC4-016 | Starter workflow scaffold omitted .gitignore / .env.example | Low | Resolved |
 
 ---
 
