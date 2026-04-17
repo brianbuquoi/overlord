@@ -1246,7 +1246,7 @@ func validateCmd() *cobra.Command {
 				return fmt.Errorf("validation errors:\n%s", strings.Join(errs, "\n"))
 			}
 
-			fmt.Println("config valid")
+			fmt.Fprintln(cmd.OutOrStdout(), "config valid")
 			return nil
 		},
 	}
@@ -1328,11 +1328,12 @@ func healthCmd() *cobra.Command {
 			wg.Wait()
 
 			// Print table.
-			fmt.Printf("%-20s %-12s %-30s %s\n", "AGENT ID", "PROVIDER", "MODEL", "STATUS")
-			fmt.Printf("%-20s %-12s %-30s %s\n", "--------", "--------", "-----", "------")
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "%-20s %-12s %-30s %s\n", "AGENT ID", "PROVIDER", "MODEL", "STATUS")
+			fmt.Fprintf(out, "%-20s %-12s %-30s %s\n", "--------", "--------", "-----", "------")
 			anyUnhealthy := false
 			for _, r := range results {
-				fmt.Printf("%-20s %-12s %-30s %s\n", r.id, r.provider, r.model, r.status)
+				fmt.Fprintf(out, "%-20s %-12s %-30s %s\n", r.id, r.provider, r.model, r.status)
 				if r.status != "ok" {
 					anyUnhealthy = true
 				}
@@ -1387,12 +1388,13 @@ func migrateListCmd() *cobra.Command {
 			all := reg.ListAll()
 
 			if len(all) == 0 {
-				fmt.Println("No migrations registered.")
+				fmt.Fprintln(cmd.OutOrStdout(), "No migrations registered.")
 				return nil
 			}
 
-			fmt.Printf("%-25s %-10s %-10s %s\n", "SCHEMA", "FROM", "TO", "PATH EXISTS")
-			fmt.Printf("%-25s %-10s %-10s %s\n", "------", "----", "--", "-----------")
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "%-25s %-10s %-10s %s\n", "SCHEMA", "FROM", "TO", "PATH EXISTS")
+			fmt.Fprintf(out, "%-25s %-10s %-10s %s\n", "------", "----", "--", "-----------")
 
 			for _, m := range all {
 				// Check if a path exists from this migration's FromVersion to
@@ -1409,7 +1411,7 @@ func migrateListCmd() *cobra.Command {
 						break
 					}
 				}
-				fmt.Printf("%-25s %-10s %-10s %s\n", m.SchemaName(), m.FromVersion(), m.ToVersion(), pathExists)
+				fmt.Fprintf(out, "%-25s %-10s %-10s %s\n", m.SchemaName(), m.FromVersion(), m.ToVersion(), pathExists)
 			}
 			return nil
 		},
@@ -1435,7 +1437,7 @@ func migrateRunCmd() *cobra.Command {
 		Use:   "run",
 		Short: "Migrate task payloads from one schema version to another",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMigration(configPath, pipelineID, schemaName, fromVer, toVer, dryRun, batchSize)
+			return runMigration(cmd.OutOrStdout(), configPath, pipelineID, schemaName, fromVer, toVer, dryRun, batchSize)
 		},
 	}
 
@@ -1467,7 +1469,7 @@ func migrateValidateCmd() *cobra.Command {
 		Use:   "validate",
 		Short: "Validate that all tasks can be migrated without errors",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMigration(configPath, pipelineID, schemaName, fromVer, toVer, true, 100)
+			return runMigration(cmd.OutOrStdout(), configPath, pipelineID, schemaName, fromVer, toVer, true, 100)
 		},
 	}
 
@@ -1484,7 +1486,7 @@ func migrateValidateCmd() *cobra.Command {
 	return cmd
 }
 
-func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dryRun bool, batchSize int) error {
+func runMigration(out io.Writer, configPath, pipelineID, schemaName, fromVer, toVer string, dryRun bool, batchSize int) error {
 	logger := newLogger()
 
 	cfg, err := loadConfig(configPath)
@@ -1513,18 +1515,18 @@ func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dry
 		return err
 	}
 	if len(steps) == 0 {
-		fmt.Println("Source and target versions are the same. Nothing to do.")
+		fmt.Fprintln(out, "Source and target versions are the same. Nothing to do.")
 		return nil
 	}
 
-	fmt.Printf("Migration path: %s", fromVer)
+	fmt.Fprintf(out, "Migration path: %s", fromVer)
 	for _, s := range steps {
-		fmt.Printf(" → %s", s.ToVersion())
+		fmt.Fprintf(out, " → %s", s.ToVersion())
 	}
-	fmt.Println()
+	fmt.Fprintln(out)
 
 	if dryRun {
-		fmt.Println("DRY RUN — no changes will be written.")
+		fmt.Fprintln(out, "DRY RUN — no changes will be written.")
 	}
 
 	ctx := context.Background()
@@ -1559,7 +1561,7 @@ func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dry
 			newPayload, err := migReg.Chain(ctx, schemaName, fromVer, toVer, task.Payload)
 			if err != nil {
 				failed++
-				fmt.Printf("FAIL task %s: %v\n", task.ID, err)
+				fmt.Fprintf(out, "FAIL task %s: %v\n", task.ID, err)
 				continue
 			}
 
@@ -1570,7 +1572,7 @@ func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dry
 				valErr2 := validator.ValidateOutput(schemaName, schemaVersion, schemaVersion, newPayload)
 				if valErr2 != nil {
 					failed++
-					fmt.Printf("FAIL task %s: migrated payload fails validation: %v\n", task.ID, valErr)
+					fmt.Fprintf(out, "FAIL task %s: migrated payload fails validation: %v\n", task.ID, valErr)
 					continue
 				}
 			}
@@ -1589,7 +1591,7 @@ func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dry
 
 				if err := st.UpdateTask(ctx, task.ID, update); err != nil {
 					failed++
-					fmt.Printf("FAIL task %s: store update failed: %v\n", task.ID, err)
+					fmt.Fprintf(out, "FAIL task %s: store update failed: %v\n", task.ID, err)
 					continue
 				}
 			}
@@ -1600,7 +1602,7 @@ func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dry
 				if dryRun {
 					verb = "Would migrate"
 				}
-				fmt.Printf("%s %d tasks...\n", verb, migrated)
+				fmt.Fprintf(out, "%s %d tasks...\n", verb, migrated)
 			}
 		}
 
@@ -1611,7 +1613,7 @@ func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dry
 	}
 
 	if total == 0 {
-		fmt.Println("No tasks found matching the specified schema and version.")
+		fmt.Fprintln(out, "No tasks found matching the specified schema and version.")
 		return nil
 	}
 
@@ -1619,11 +1621,11 @@ func runMigration(configPath, pipelineID, schemaName, fromVer, toVer string, dry
 	if dryRun {
 		verb = "Would migrate"
 	}
-	fmt.Printf("%s %d/%d tasks", verb, migrated, total)
+	fmt.Fprintf(out, "%s %d/%d tasks", verb, migrated, total)
 	if failed > 0 {
-		fmt.Printf(" (%d failed)", failed)
+		fmt.Fprintf(out, " (%d failed)", failed)
 	}
-	fmt.Println()
+	fmt.Fprintln(out)
 
 	if failed > 0 {
 		return fmt.Errorf("%d tasks failed migration", failed)

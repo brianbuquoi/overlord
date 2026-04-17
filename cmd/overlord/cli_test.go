@@ -100,6 +100,13 @@ func TestCLI_Validate_ValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate should succeed, got: %v", err)
 	}
+	// User-facing CLI output must go through Cobra's writer so tests can
+	// capture it and callers can redirect. Previously the `validate`
+	// command printed "config valid" via fmt.Println (os.Stdout) and this
+	// buffer was empty.
+	if !strings.Contains(stdout.String(), "config valid") {
+		t.Errorf("validate output should be captured via Cobra writer; got stdout=%q", stdout.String())
+	}
 }
 
 func TestCLI_Validate_MissingSchemaFile(t *testing.T) {
