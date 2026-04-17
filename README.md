@@ -230,6 +230,23 @@ make test-integration   # requires Docker (Redis + Postgres via compose)
 make check              # tests + go vet + staticcheck
 ```
 
+## Roadmap
+
+The following improvements are being tracked for future releases.
+See [KNOWN_GAPS.md](KNOWN_GAPS.md) for a full list of known
+limitations and their current status.
+
+- **Authentication improvements** — Token revocation without restart,
+  per-pipeline key scoping, and OAuth/OIDC integration.
+- **Horizontal scaling improvements** — EventBus federation across
+  instances so WebSocket clients receive events regardless of which
+  instance processed the task.
+- **Metrics port separation** — Serve `/metrics` on a dedicated port
+  to simplify network-level access control in production.
+- **Hot-reload subprocess reuse** — Currently, all plugin subprocesses
+  are restarted on SIGHUP even if their configuration is unchanged.
+  Reusing subprocesses for unchanged agents is planned.
+
 ## Security
 
 Found a vulnerability? See [SECURITY.md](SECURITY.md) for responsible
