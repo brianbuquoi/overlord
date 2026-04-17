@@ -351,13 +351,14 @@ func TestDiscardAll_PartialFailure(t *testing.T) {
 	ids := seed(t, b, mstore.Memory(), 5)
 	failSet := map[string]struct{}{ids[0]: {}, ids[1]: {}}
 	mem := mstore.Memory()
-	mstore.OnUpdateTask = func(ctx context.Context, taskID string, update broker.TaskUpdate) error {
-		if update.State != nil && *update.State == broker.TaskStateDiscarded {
-			if _, bad := failSet[taskID]; bad {
-				return mock.ErrInjected
-			}
+	// DiscardAll now routes each per-task operation through the atomic
+	// DiscardDeadLetter primitive (SEC4-008d), so inject the fault at
+	// that entry point rather than at UpdateTask.
+	mstore.OnDiscardDeadLetter = func(ctx context.Context, taskID string) error {
+		if _, bad := failSet[taskID]; bad {
+			return mock.ErrInjected
 		}
-		return mem.UpdateTask(ctx, taskID, update)
+		return mem.DiscardDeadLetter(ctx, taskID)
 	}
 
 	result, err := svc.DiscardAll(context.Background(), "test-pipeline", 0, nil)

@@ -389,6 +389,59 @@ func (p *PostgresStore) RollbackReplayClaim(ctx context.Context, taskID string) 
 	return store.ErrTaskNotReplayPending
 }
 
+// DiscardDeadLetter atomically transitions a FAILED+dead-lettered task to
+// DISCARDED via a conditional UPDATE ... RETURNING. The predicate is the
+// claim token: once a concurrent replay flips the task to REPLAY_PENDING,
+// the discard's UPDATE matches zero rows and returns ErrTaskNotDiscardable
+// instead of silently overwriting the replayed state.
+//
+// Already-discarded tasks are distinguished from genuinely wrong-state
+// tasks so the HTTP API can preserve the ALREADY_DISCARDED response code
+// (an idempotent retry) vs the NOT_DEAD_LETTERED code (a real state
+// mismatch).
+func (p *PostgresStore) DiscardDeadLetter(ctx context.Context, taskID string) error {
+	query := fmt.Sprintf(`WITH attempted AS (
+		UPDATE %s
+		SET state = 'DISCARDED',
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND state = 'FAILED'
+		  AND routed_to_dead_letter = true
+		RETURNING id
+	),
+	current_state AS (
+		SELECT state FROM %s WHERE id = $1
+	)
+	SELECT attempted.id, current_state.state AS _current_state
+	FROM attempted
+	FULL OUTER JOIN current_state ON true`, p.table, p.table)
+
+	var gotID, currentState *string
+	err := p.pool.QueryRow(ctx, query, taskID).Scan(&gotID, &currentState)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.ErrTaskNotFound
+		}
+		return fmt.Errorf("postgres: discard dead-letter: %w", err)
+	}
+	if gotID != nil {
+		return nil
+	}
+	// attempted side NULL: the row exists but did not satisfy the claim
+	// predicate. Distinguish "already discarded" from "in some other state"
+	// so the caller can surface the right response code.
+	if currentState != nil && *currentState == string(broker.TaskStateDiscarded) {
+		return store.ErrTaskAlreadyDiscarded
+	}
+	if currentState == nil {
+		// FULL OUTER JOIN with both sides empty means the row truly
+		// does not exist. pgx.ErrNoRows should have already fired, but
+		// fall through defensively.
+		return store.ErrTaskNotFound
+	}
+	return store.ErrTaskNotDiscardable
+}
+
 func derefString(p *string) string {
 	if p == nil {
 		return ""

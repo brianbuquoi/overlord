@@ -2146,23 +2146,20 @@ func deadLetterDiscardCmd() *cobra.Command {
 				return err
 			}
 
-			task, err := b.GetTask(cmd.Context(), taskID)
-			if err != nil {
-				return fmt.Errorf("task %q not found: %w", taskID, err)
-			}
-			if task.State == broker.TaskStateDiscarded {
+			err = b.Store().DiscardDeadLetter(cmd.Context(), taskID)
+			switch {
+			case err == nil:
+				fmt.Fprintln(cmd.OutOrStdout(), "Discarded.")
+				return nil
+			case errors.Is(err, store.ErrTaskNotFound):
+				return fmt.Errorf("task %q not found", taskID)
+			case errors.Is(err, store.ErrTaskAlreadyDiscarded):
 				return fmt.Errorf("task %q is already discarded", taskID)
-			}
-			if !task.RoutedToDeadLetter || task.State != broker.TaskStateFailed {
-				return fmt.Errorf("task %q is not in dead-letter state (state: %s)", taskID, task.State)
-			}
-
-			state := broker.TaskStateDiscarded
-			if err := b.Store().UpdateTask(cmd.Context(), taskID, broker.TaskUpdate{State: &state}); err != nil {
+			case errors.Is(err, store.ErrTaskNotDiscardable):
+				return fmt.Errorf("task %q is not in dead-letter state", taskID)
+			default:
 				return fmt.Errorf("discard failed: %w", err)
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), "Discarded.")
-			return nil
 		},
 	}
 

@@ -469,32 +469,19 @@ func (s *Server) handleDiscardDeadLetter(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	task, err := s.broker.Store().GetTask(r.Context(), taskID)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			writeError(w, http.StatusNotFound, "task not found", "TASK_NOT_FOUND")
-			return
-		}
-		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to fetch task", "GET_TASK_FAILED", err)
-		return
-	}
-
-	if task.State == broker.TaskStateDiscarded {
+	err := s.broker.Store().DiscardDeadLetter(r.Context(), taskID)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
+	case errors.Is(err, store.ErrTaskNotFound):
+		writeError(w, http.StatusNotFound, "task not found", "TASK_NOT_FOUND")
+	case errors.Is(err, store.ErrTaskAlreadyDiscarded):
 		writeError(w, http.StatusConflict, "task is already discarded", "ALREADY_DISCARDED")
-		return
-	}
-	if !task.RoutedToDeadLetter || task.State != broker.TaskStateFailed {
+	case errors.Is(err, store.ErrTaskNotDiscardable):
 		writeError(w, http.StatusConflict, "task is not in dead-letter state", "NOT_DEAD_LETTERED")
-		return
-	}
-
-	state := broker.TaskStateDiscarded
-	if err := s.broker.Store().UpdateTask(r.Context(), taskID, broker.TaskUpdate{State: &state}); err != nil {
+	default:
 		s.writeInternalError(w, r, http.StatusInternalServerError, "failed to discard task", "DISCARD_FAILED", err)
-		return
 	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
 }
 
 func (s *Server) handleReplayAllDeadLetter(w http.ResponseWriter, r *http.Request) {

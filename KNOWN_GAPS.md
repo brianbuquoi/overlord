@@ -236,6 +236,43 @@ the index is needed for live deployments upgrading from a prior version.
 `tasks:state:{STATE}:pipeline:{PIPELINE_ID}` key.
 **Status:** Open.
 
+### SEC4-008d: Dead-letter discard was TOCTOU / non-atomic — RESOLVED
+**Location:** `internal/api/handlers.go` — `handleDiscardDeadLetter`; `cmd/overlord/main.go` — `deadLetterDiscardCmd`; `internal/deadletter/service.go` — `DiscardAll`; `internal/store/{memory,redis,postgres}` — `DiscardDeadLetter`
+**Severity:** Medium
+**Status:** Resolved
+**Description:** SEC4-008/a/b/c closed the replay side of the dead-letter
+race (replay now claims atomically), but discard still used a
+read-check-write shape (`GetTask` / `ListTasks` → state check → unconditional
+`UpdateTask`). A concurrent replay that moved the task into `REPLAY_PENDING`
+could be silently overwritten by a late discard, leaving the task's audit
+state disagreeing with the replay outcome.
+**Resolution:** Added `Store.DiscardDeadLetter(ctx, taskID) error` across
+memory/redis/postgres as an atomic CAS (`FAILED && routed_to_dead_letter=true
+→ DISCARDED`). Sentinel errors `ErrTaskNotDiscardable` and
+`ErrTaskAlreadyDiscarded` let the HTTP API preserve the
+`NOT_DEAD_LETTERED` / `ALREADY_DISCARDED` response codes while remaining
+race-safe. API handler, CLI discard command, and bulk `DiscardAll` all
+route through the new primitive. Regression coverage is in the store
+conformance suite (`TestMemoryStoreConformance/DiscardDeadLetter_*`,
+including `_LosesToReplayClaim` which is the direct race reproducer).
+
+### SEC4-016: Starter workflow scaffold omitted .gitignore and .env.example — RESOLVED
+**Location:** `internal/scaffold/templates/starter/`
+**Severity:** Low
+**Status:** Resolved
+**Description:** The default `overlord init` starter is the beginner
+path and explicitly documents switching to real providers via environment
+variables, but it was the only first-party scaffold excluded from the
+`.gitignore` / `.env.example` safety contract. A distracted user had no
+scaffolded place to stage provider secrets and no default gitignore rule
+for `.env` or `*.overlord-init-bak` backup files.
+**Resolution:** Starter template now ships the same credential-hygiene
+artefacts the strict templates carry; the scaffold safety-file tests in
+`internal/scaffold/templates_test.go` (gitignore contract + env-example
+placeholder check) iterate over `ListTemplates()` rather than only the
+strict subset, so a regression that drops either file from starter fails
+the suite.
+
 ### SEC4-010: IPv6 brute force tracking per /128 (not /64) — RESOLVED
 **Location:** `internal/auth/auth.go` — `normalizeIP`
 **Severity:** Medium
@@ -410,6 +447,7 @@ without a total count.
 | SEC4-008 | Replay dead-letter phantom PENDING | High | Resolved |
 | SEC4-008b | Concurrent replay semantics: N-winner read-only claim | Medium | Resolved |
 | SEC4-008c | Replay claim consumed before Submit succeeds strands task (FAILED+DL=false) | High | Resolved |
+| SEC4-008d | Dead-letter discard was TOCTOU / non-atomic vs concurrent replay | Medium | Resolved |
 | SEC4-009 | UpdateTask allows arbitrary state transitions | Low | Accepted |
 | SEC4-010 | IPv6 brute force tracking per /128 | Medium | Resolved |
 | SEC4-011 | CI build missing -trimpath | Low | Accepted |
@@ -426,6 +464,7 @@ without a total count.
 | KG-003 | ListTasks total-count over-reports with certain filters | Low | Open |
 | KG-004 | Redis state index not pipeline-scoped for bulk ops | Medium | Resolved |
 | KG-005 | Redis 2D state×pipeline index not backfilled | Low | Open |
+| SEC4-016 | Starter workflow scaffold omitted .gitignore / .env.example | Low | Resolved |
 
 ---
 

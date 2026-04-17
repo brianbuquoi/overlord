@@ -627,6 +627,96 @@ func RunConformanceTests(t *testing.T, factory func() store.Store) {
 		}
 	})
 
+	// SEC4-008d: DiscardDeadLetter is the atomic CAS that replaces the
+	// old read-check-write discard shape. Conformance coverage runs
+	// against every backend — memory, Redis, Postgres — so the race the
+	// audit flagged cannot come back through any implementation.
+
+	t.Run("DiscardDeadLetter_HappyPath", func(t *testing.T) {
+		t.Parallel()
+		s := factory()
+		ctx := context.Background()
+		task := seedDeadLettered(t, s, "stage-discard-happy-"+uuid.New().String())
+
+		if err := s.DiscardDeadLetter(ctx, task.ID); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+		got, err := s.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != broker.TaskStateDiscarded {
+			t.Errorf("state: got %s, want DISCARDED", got.State)
+		}
+	})
+
+	t.Run("DiscardDeadLetter_NotFound", func(t *testing.T) {
+		t.Parallel()
+		s := factory()
+		err := s.DiscardDeadLetter(context.Background(), "nonexistent-"+uuid.New().String())
+		if err != store.ErrTaskNotFound {
+			t.Errorf("got %v, want ErrTaskNotFound", err)
+		}
+	})
+
+	t.Run("DiscardDeadLetter_AlreadyDiscarded", func(t *testing.T) {
+		t.Parallel()
+		s := factory()
+		ctx := context.Background()
+		task := seedDeadLettered(t, s, "stage-discard-idem-"+uuid.New().String())
+		if err := s.DiscardDeadLetter(ctx, task.ID); err != nil {
+			t.Fatalf("first discard: %v", err)
+		}
+		err := s.DiscardDeadLetter(ctx, task.ID)
+		if err != store.ErrTaskAlreadyDiscarded {
+			t.Errorf("second discard: got %v, want ErrTaskAlreadyDiscarded", err)
+		}
+	})
+
+	t.Run("DiscardDeadLetter_LosesToReplayClaim", func(t *testing.T) {
+		t.Parallel()
+		s := factory()
+		ctx := context.Background()
+		task := seedDeadLettered(t, s, "stage-discard-vs-replay-"+uuid.New().String())
+
+		// Replay claims first — the winner.
+		if _, err := s.ClaimForReplay(ctx, task.ID); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		// Discard arrives after the claim: the atomic CAS rejects it
+		// so the REPLAY_PENDING state is preserved.
+		err := s.DiscardDeadLetter(ctx, task.ID)
+		if err != store.ErrTaskNotDiscardable {
+			t.Errorf("discard after replay claim: got %v, want ErrTaskNotDiscardable", err)
+		}
+		got, err := s.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != broker.TaskStateReplayPending {
+			t.Errorf("state: got %s, want REPLAY_PENDING (replay must still own the task)", got.State)
+		}
+	})
+
+	t.Run("DiscardDeadLetter_NotDiscardableWhenNotDeadLettered", func(t *testing.T) {
+		t.Parallel()
+		s := factory()
+		ctx := context.Background()
+		// Seed FAILED but NOT dead-lettered by doing a direct UpdateTask
+		// after a normal enqueue.
+		task := newTask("p", "stage-discard-notDL-"+uuid.New().String())
+		if err := s.EnqueueTask(ctx, task.StageID, task); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		failed := broker.TaskStateFailed
+		if err := s.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &failed}); err != nil {
+			t.Fatalf("set FAILED: %v", err)
+		}
+		if err := s.DiscardDeadLetter(ctx, task.ID); err != store.ErrTaskNotDiscardable {
+			t.Errorf("discard on FAILED (not DL): got %v, want ErrTaskNotDiscardable", err)
+		}
+	})
+
 	t.Run("UpdateTaskAllFields", func(t *testing.T) {
 		t.Parallel()
 		s := factory()

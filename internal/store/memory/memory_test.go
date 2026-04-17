@@ -530,3 +530,161 @@ func TestClaimForReplay_TransitionsToReplayPending(t *testing.T) {
 		t.Errorf("stored state: got %s want REPLAY_PENDING", stored.State)
 	}
 }
+
+// SEC4-008d regression coverage. DiscardDeadLetter is the atomic claim
+// that replaces the old read-check-write discard shape; the tests below
+// pin the new contract (not found / already discarded / not discardable /
+// happy path) and the replay-vs-discard mutual exclusion that motivated
+// the audit finding.
+
+func TestDiscardDeadLetter_HappyPath(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DiscardDeadLetter(ctx, task.ID); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	stored, err := m.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.State != broker.TaskStateDiscarded {
+		t.Errorf("state: got %s want DISCARDED", stored.State)
+	}
+}
+
+func TestDiscardDeadLetter_NotFound(t *testing.T) {
+	m := New()
+	if err := m.DiscardDeadLetter(context.Background(), "missing"); err != store.ErrTaskNotFound {
+		t.Fatalf("got %v, want ErrTaskNotFound", err)
+	}
+}
+
+func TestDiscardDeadLetter_AlreadyDiscarded(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DiscardDeadLetter(ctx, task.ID); err != nil {
+		t.Fatalf("first discard: %v", err)
+	}
+	// Second discard must return ErrTaskAlreadyDiscarded so the HTTP API
+	// can distinguish an idempotent retry from a lost-race state mismatch.
+	if err := m.DiscardDeadLetter(ctx, task.ID); err != store.ErrTaskAlreadyDiscarded {
+		t.Fatalf("second discard: got %v, want ErrTaskAlreadyDiscarded", err)
+	}
+}
+
+func TestDiscardDeadLetter_NotDiscardableWhenNotDeadLettered(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	// PENDING task — not discardable.
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DiscardDeadLetter(ctx, task.ID); err != store.ErrTaskNotDiscardable {
+		t.Fatalf("PENDING: got %v, want ErrTaskNotDiscardable", err)
+	}
+
+	// FAILED but not dead-lettered — also not discardable.
+	failed := broker.TaskStateFailed
+	m.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &failed})
+	if err := m.DiscardDeadLetter(ctx, task.ID); err != store.ErrTaskNotDiscardable {
+		t.Fatalf("FAILED (not DL): got %v, want ErrTaskNotDiscardable", err)
+	}
+}
+
+// TestDiscardDeadLetter_LosesToReplayClaim is the direct SEC4-008d
+// regression: a discard that arrives after a successful replay claim
+// must fail with ErrTaskNotDiscardable rather than silently overwriting
+// the task's REPLAY_PENDING / REPLAYED state. This was the race the
+// audit flagged — the prior read-check-write discard could walk on a
+// winning replay's outcome.
+func TestDiscardDeadLetter_LosesToReplayClaim(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replay claims first — this is the winner.
+	if _, err := m.ClaimForReplay(ctx, task.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Discard arrives after the claim and must NOT silently overwrite
+	// the REPLAY_PENDING state. The atomic CAS rejects it.
+	if err := m.DiscardDeadLetter(ctx, task.ID); err != store.ErrTaskNotDiscardable {
+		t.Fatalf("discard after replay claim: got %v, want ErrTaskNotDiscardable", err)
+	}
+	stored, err := m.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.State != broker.TaskStateReplayPending {
+		t.Errorf("state after lost discard: got %s want REPLAY_PENDING (replay must still own the task)", stored.State)
+	}
+}
+
+// TestDiscardDeadLetter_ConcurrentExactlyOneWins drives a horde of
+// goroutines at the same dead-lettered task: exactly one sees nil,
+// everyone else sees ErrTaskAlreadyDiscarded. Double-discards never
+// silently pass.
+func TestDiscardDeadLetter_ConcurrentExactlyOneWins(t *testing.T) {
+	m := New()
+	ctx := context.Background()
+	task := newTask("p1", "s1")
+	task.State = broker.TaskStateFailed
+	task.RoutedToDeadLetter = true
+	if err := m.EnqueueTask(ctx, "s1", task); err != nil {
+		t.Fatal(err)
+	}
+
+	const N = 32
+	results := make(chan error, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- m.DiscardDeadLetter(ctx, task.ID)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	winners, already, other := 0, 0, 0
+	for err := range results {
+		switch err {
+		case nil:
+			winners++
+		case store.ErrTaskAlreadyDiscarded:
+			already++
+		default:
+			other++
+			t.Errorf("unexpected error from concurrent discard: %v", err)
+		}
+	}
+	if winners != 1 {
+		t.Errorf("winners: got %d want 1", winners)
+	}
+	if already != N-1 {
+		t.Errorf("already-discarded: got %d want %d", already, N-1)
+	}
+	if other != 0 {
+		t.Errorf("unexpected-error count: got %d want 0", other)
+	}
+}

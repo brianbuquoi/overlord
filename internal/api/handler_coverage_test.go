@@ -245,6 +245,7 @@ type failingStore struct {
 	failEnqueue  bool
 	failClaim    bool
 	failRollback bool
+	failDiscard  bool
 
 	// If non-nil, GetTask returns this task (used so handleDiscardDeadLetter
 	// gets past the initial GetTask lookup and into the UpdateTask path).
@@ -316,6 +317,12 @@ func (f *failingStore) RollbackReplayClaim(_ context.Context, _ string) error {
 	}
 	return nil
 }
+func (f *failingStore) DiscardDeadLetter(_ context.Context, _ string) error {
+	if f.failDiscard {
+		return errors.New(internalLeakMarker + " discard exploded")
+	}
+	return nil
+}
 
 // newTestServerWithStore builds a Server whose broker uses the given Store.
 // Agents are healthy stubs; registry is empty; logger is the default.
@@ -335,16 +342,6 @@ func newTestServerWithStore(t *testing.T, st broker.Store) *Server {
 }
 
 func TestHandler_WriteError_NoInternalDetails(t *testing.T) {
-	// Build a reusable dead-lettered task template used by handlers that
-	// GetTask before the failing op (DiscardDeadLetter's UpdateTask path).
-	deadLetterTask := &broker.Task{
-		ID:                 "dl-task-1",
-		PipelineID:         "test-pipeline",
-		StageID:            "intake",
-		State:              broker.TaskStateFailed,
-		RoutedToDeadLetter: true,
-	}
-
 	// Claim-successful task used to drive handleReplayDeadLetter past the
 	// ClaimForReplay step so we can observe the Submit/EnqueueTask failure
 	// arm (REPLAY_SUBMIT_FAILED).
@@ -390,24 +387,17 @@ func TestHandler_WriteError_NoInternalDetails(t *testing.T) {
 			expectCode:   "LIST_DEAD_LETTER_FAILED",
 		},
 		{
-			// GetTask succeeds and returns a dead-lettered task; UpdateTask
-			// (the discard write) then fails → DISCARD_FAILED.
+			// DiscardDeadLetter (the atomic SEC4-008d primitive) returns a
+			// non-sentinel error → DISCARD_FAILED. Previously this handler
+			// did GetTask + UpdateTask separately; it now delegates to a
+			// single CAS call so there's no longer a GET_TASK_FAILED path
+			// through the discard handler.
 			name:         "DISCARD_FAILED",
 			method:       http.MethodPost,
 			path:         "/v1/dead-letter/dl-task-1/discard",
-			store:        &failingStore{getTaskResult: deadLetterTask, failUpdate: true},
+			store:        &failingStore{failDiscard: true},
 			expectStatus: http.StatusInternalServerError,
 			expectCode:   "DISCARD_FAILED",
-		},
-		{
-			// GetTask fails with a non-"not found" error inside the discard
-			// handler → GET_TASK_FAILED from that handler.
-			name:         "GET_TASK_FAILED_via_discard",
-			method:       http.MethodPost,
-			path:         "/v1/dead-letter/dl-task-1/discard",
-			store:        &failingStore{failGet: true},
-			expectStatus: http.StatusInternalServerError,
-			expectCode:   "GET_TASK_FAILED",
 		},
 		{
 			// ClaimForReplay returns a non-sentinel error → REPLAY_FAILED.

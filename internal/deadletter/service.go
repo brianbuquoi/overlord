@@ -8,10 +8,12 @@ package deadletter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/brianbuquoi/overlord/internal/broker"
+	"github.com/brianbuquoi/overlord/internal/store"
 )
 
 // DefaultMaxTasks is the per-call ceiling applied when the caller passes
@@ -183,12 +185,18 @@ func (s *Service) replayOne(ctx context.Context, task *broker.Task) (string, err
 // pipelineID may be empty to discard across all pipelines.
 // maxTasks caps the total number of tasks processed; use 0 for DefaultMaxTasks.
 // onProgress is called after each task is processed (may be nil).
+//
+// Each individual discard goes through Store.DiscardDeadLetter so a task
+// a concurrent replay claimed between our list page and our write fails
+// cleanly with ErrTaskNotDiscardable instead of silently overwriting the
+// winning replay's state. Tasks that are already DISCARDED (e.g. because
+// a parallel bulk discard raced us) are counted as processed for the
+// caller's idempotent-retry shape.
 func (s *Service) DiscardAll(ctx context.Context, pipelineID string, maxTasks int, onProgress ProgressFunc) (BulkResult, error) {
 	ceiling := clampMax(maxTasks)
 
 	deadLetter := true
 	failedState := broker.TaskStateFailed
-	discarded := broker.TaskStateDiscarded
 	filter := broker.TaskFilter{
 		State:              &failedState,
 		RoutedToDeadLetter: &deadLetter,
@@ -200,9 +208,8 @@ func (s *Service) DiscardAll(ctx context.Context, pipelineID string, maxTasks in
 
 	count := 0
 	truncated := false
-	// failedIDs tracks task IDs that failed to update so a reappearance
-	// on a subsequent page (because discard did not remove them from the
-	// filter) is not retried or double-counted.
+	// failedIDs tracks task IDs that failed to discard so a reappearance
+	// on a subsequent page is not retried or double-counted.
 	failedIDs := make(map[string]struct{})
 
 	for count < ceiling {
@@ -222,7 +229,27 @@ func (s *Service) DiscardAll(ctx context.Context, pipelineID string, maxTasks in
 			if _, already := failedIDs[task.ID]; already {
 				continue
 			}
-			if err := s.store.UpdateTask(ctx, task.ID, broker.TaskUpdate{State: &discarded}); err != nil {
+			err := s.store.DiscardDeadLetter(ctx, task.ID)
+			switch {
+			case err == nil, errors.Is(err, store.ErrTaskAlreadyDiscarded):
+				// Count already-discarded as processed — a concurrent
+				// bulk discard won this task, so the caller's aggregate
+				// still reflects reality.
+				count++
+				progressed = true
+				if onProgress != nil {
+					onProgress(task.ID, "", nil)
+				}
+			case errors.Is(err, store.ErrTaskNotDiscardable):
+				// Task left the dead-letter state between our list and
+				// our discard (most likely a concurrent replay claim).
+				// Not a user-facing error — skip without counting.
+				s.logger.Debug("discard-all: task left dead-letter state before discard",
+					"task_id", task.ID,
+					"pipeline_id", task.PipelineID,
+				)
+				failedIDs[task.ID] = struct{}{}
+			default:
 				s.logger.Warn("discard-all: failed to discard task",
 					"task_id", task.ID,
 					"pipeline_id", task.PipelineID,
@@ -232,12 +259,6 @@ func (s *Service) DiscardAll(ctx context.Context, pipelineID string, maxTasks in
 				if onProgress != nil {
 					onProgress(task.ID, "", err)
 				}
-				continue
-			}
-			count++
-			progressed = true
-			if onProgress != nil {
-				onProgress(task.ID, "", nil)
 			}
 		}
 		if !progressed {
