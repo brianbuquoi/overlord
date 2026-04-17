@@ -191,14 +191,18 @@ refreshed on every pong; the write pump emits pings every `wsPingPeriod` (90% of
 `wsPongWait`) and every write is bounded by `wsWriteWait = 10s`. Dead peers are
 closed within `wsPongWait` of their last pong.
 
-### SEC4-006: No config-level size limit on system_prompt
-**Location:** `internal/config/types.go` — `Agent.SystemPrompt`
+### SEC4-006: No config-level size limit on system_prompt — RESOLVED
+**Location:** `internal/config/config.go` — `validateAgents`, constant `MaxSystemPromptBytes`
 **Severity:** Medium
-**Description:** System prompts can be arbitrarily large in YAML config. A very
-large prompt (100MB+) would be loaded, concatenated with envelope-wrapped output,
-and sent to the LLM API without any guardrail.
-**Recommendation:** Enforce max system_prompt length (e.g., 512KB) during config
-validation.
+**Status:** Resolved
+**Description:** System prompts could be arbitrarily large in YAML config. A
+very large prompt (100 MB+) would be loaded, concatenated with envelope-wrapped
+output, and sent to the LLM API without any guardrail.
+**Resolution:** `validateAgents` now enforces `MaxSystemPromptBytes = 512 KiB`.
+Configs that exceed the cap fail `config.Validate` with an error naming the
+offending agent and the SEC4-006 identifier so operators can look up the
+rationale. Regression coverage is in
+`internal/config/agent_validation_test.go`.
 
 ### SEC4-007: Plugin file paths not validated against directory traversal — RESOLVED
 **Location:** `internal/plugin/loader.go` — `resolvePaths()`
@@ -448,7 +452,7 @@ without a total count.
 | SEC4-003 | WebSocket lacks ping/pong keepalive | Medium | Resolved |
 | SEC4-004 | No max length on path parameters | Low | Accepted |
 | SEC4-005 | No length limit on query filter params | Low | Accepted |
-| SEC4-006 | No config-level system_prompt size limit | Medium | Open |
+| SEC4-006 | No config-level system_prompt size limit | Medium | Resolved |
 | SEC4-007 | Plugin paths not traversal-checked | Medium | Resolved |
 | SEC4-008 | Replay dead-letter phantom PENDING | High | Resolved |
 | SEC4-008b | Concurrent replay semantics: N-winner read-only claim | Medium | Resolved |
