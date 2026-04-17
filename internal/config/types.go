@@ -283,6 +283,28 @@ type onSuccessRouteYAML struct {
 	Stage     string `yaml:"stage"`
 }
 
+// MarshalYAML emits on_success in the form it was declared in: a bare
+// string for static routes, a routing block for conditional routes.
+// Without this method, yaml.v3 falls back to the default struct
+// encoding and leaks internal field names (Static, Routes,
+// IsConditional) into the exported YAML, which then fails to re-load
+// because UnmarshalYAML does not accept that shape. The chain-mode
+// exporter and the pipelines command both rely on round-trippable
+// YAML; adding MarshalYAML is the narrow fix for both.
+func (o OnSuccessConfig) MarshalYAML() (interface{}, error) {
+	if !o.IsConditional {
+		return o.Static, nil
+	}
+	routes := make([]onSuccessRouteYAML, 0, len(o.Routes))
+	for _, r := range o.Routes {
+		routes = append(routes, onSuccessRouteYAML{
+			Condition: r.RawExpr,
+			Stage:     r.Stage,
+		})
+	}
+	return onSuccessYAML{Routes: routes, Default: o.Default}, nil
+}
+
 // UnmarshalYAML handles both string and mapping forms of on_success.
 func (o *OnSuccessConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// Try string first (backward compatible form).
