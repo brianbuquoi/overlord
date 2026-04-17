@@ -5,10 +5,15 @@ test-unit:
 
 test-integration:
 	docker compose -f docker-compose.test.yml up -d --wait
+	@# The go test exit status must win. The previous shape ended with
+	@# `; docker compose down`, which overwrote the go test status and
+	@# silently masked failing integration runs (audit: false-green
+	@# integration gate). A trap runs teardown on exit while preserving
+	@# whatever status go test returned.
+	@trap 'docker compose -f docker-compose.test.yml down' EXIT; \
 	REDIS_URL=redis://localhost:6379 \
 	DATABASE_URL=postgres://postgres:postgres@localhost:5432/overlord_test?sslmode=disable \
-	go test -race -tags integration ./... ; \
-	docker compose -f docker-compose.test.yml down
+	go test -race -tags integration ./...
 
 test-all: test-unit test-integration
 
