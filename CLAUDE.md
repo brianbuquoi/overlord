@@ -158,6 +158,15 @@ The sanitizer strips known injection patterns before wrapping. Sanitizer
 warnings are attached to the task metadata — the pipeline continues, but
 warnings are logged and observable via the API.
 
+Chain mode's step adapter extends the same contract to in-prompt
+placeholder substitution. `{{input}}` / `{{prev}}` / `{{steps.<id>.output}}`
+values are sanitized and wrapped via `sanitize.WrapInline` before being
+substituted into a step's prompt, so the downstream model sees the same
+`[SYSTEM CONTEXT ...]` delimiters around in-prompt prior output that the
+broker's outer envelope provides for the prior-stage task payload.
+Substituting raw prior output into the prompt (as earlier versions did)
+defeats the envelope — never regress this invariant.
+
 ### Schema versioning is first-class in YAML
 Schemas are declared in a top-level `schema_registry` block with explicit
 version strings. Stages reference schemas by name + version. The YAML config

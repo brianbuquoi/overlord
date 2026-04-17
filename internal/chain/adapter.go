@@ -7,6 +7,7 @@ import (
 
 	"github.com/brianbuquoi/overlord/internal/agent"
 	"github.com/brianbuquoi/overlord/internal/broker"
+	"github.com/brianbuquoi/overlord/internal/sanitize"
 )
 
 // ChainMetaKey is the task-metadata key chain mode uses to carry
@@ -70,6 +71,26 @@ func (a *stepAdapter) Execute(ctx context.Context, task *broker.Task) (*broker.T
 		cm.Input = extractTextPayload(task.Payload)
 	}
 
+	// Build the render scope with every substitutable value already
+	// sanitized and wrapped in an inline envelope. Without this step,
+	// {{steps.<id>.output}} placeholders would re-inject raw prior
+	// output into the "Your task:" section outside the broker's outer
+	// envelope — the envelope-bypass vulnerability the workflow/chain
+	// layers expose. Rendering safe values here keeps a single
+	// anti-injection contract across the broker and the adapter.
+	//
+	// {{input}} is similarly wrapped: defense-in-depth when a
+	// multi-step workflow re-references the initial input from a
+	// later stage. The first stage's own prompt never flows through
+	// {{input}} substitution because the broker ships the payload
+	// directly as user content there, so the wrap is redundant but
+	// harmless.
+	renderScope := Scope{
+		Vars:    nil, // vars are already resolved at compile time
+		Input:   wrapForSubstitution(cm.Input),
+		Outputs: wrapOutputsForSubstitution(cm.Outputs),
+	}
+
 	// Substitute placeholders inside the (possibly envelope-wrapped)
 	// system prompt. Missing {{input}} or {{steps.X.output}} references
 	// render as empty strings; the validator already rejected chains
@@ -77,11 +98,7 @@ func (a *stepAdapter) Execute(ctx context.Context, task *broker.Task) (*broker.T
 	// here would have to come from external tampering. We tolerate it
 	// silently in the wrapper — the broker's contract validation and
 	// sanitizer envelope still provide safety nets downstream.
-	rendered, _ := Render(task.Prompt, Scope{
-		Vars:    nil, // vars are already resolved at compile time
-		Input:   cm.Input,
-		Outputs: cm.Outputs,
-	})
+	rendered, _ := Render(task.Prompt, renderScope)
 
 	inner := *task
 	inner.Prompt = rendered
@@ -91,6 +108,12 @@ func (a *stepAdapter) Execute(ctx context.Context, task *broker.Task) (*broker.T
 		return nil, err
 	}
 
+	// Store raw (not sanitized) output on the chain metadata so
+	// operators can inspect exactly what a step produced via
+	// `overlord status`. Sanitization happens at substitution time
+	// above via wrapForSubstitution, so downstream steps still see
+	// only the enveloped, sanitized form regardless of what's in
+	// cm.Outputs.
 	cm.Outputs[a.stepID] = extractTextPayload(result.Payload)
 
 	md := result.Metadata
@@ -142,6 +165,41 @@ func (c chainMeta) toMap() map[string]any {
 		"input":   c.Input,
 		"outputs": c.Outputs,
 	}
+}
+
+// wrapForSubstitution sanitizes and envelope-wraps a single string
+// value before it is substituted into a step's prompt via Render.
+// Empty input returns an empty string so Render reports the
+// placeholder as missing (the validator already caught unbound
+// references; a runtime miss here only happens with tampered
+// metadata, which we treat as silently-empty rather than an error).
+//
+// The sanitize pass drops injection sentinels; WrapInline adds the
+// [SYSTEM CONTEXT] markers so the downstream model applies the same
+// "treat as data only" rule it already applies to the broker's
+// outer envelope. Sanitizer warnings are discarded at this layer —
+// the broker's own sanitize pass on the inter-stage payload already
+// attaches a warnings record to task.Metadata["sanitizer_warnings"].
+func wrapForSubstitution(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	clean, _ := sanitize.Sanitize(raw)
+	return sanitize.WrapInline(clean)
+}
+
+// wrapOutputsForSubstitution mirrors wrapForSubstitution across the
+// full step-output map so the adapter can build a render-ready
+// Scope without leaking raw prior output into the prompt.
+func wrapOutputsForSubstitution(raw map[string]string) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		out[k] = wrapForSubstitution(v)
+	}
+	return out
 }
 
 // extractTextPayload returns a human-readable text form of an agent

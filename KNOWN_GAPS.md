@@ -7,6 +7,23 @@ Each entry includes the severity, location, and recommended fix approach.
 
 ## Open Issues
 
+### SEC-015: (Resolved) Chain-adapter envelope bypass via `{{steps.<id>.output}}` substitution
+**Location:** `internal/chain/adapter.go`, `internal/sanitize/envelope.go`
+**Severity:** High (resolved)
+**Description:** The chain step adapter rendered
+`{{prev}}` / `{{steps.<id>.output}}` / `{{input}}` placeholders into
+`task.Prompt` *after* the broker's sanitizer envelope had already wrapped
+the prior-stage payload. Raw prior-step output was re-injected into the
+`Your task:` section outside the envelope, letting a malicious upstream
+output instruct the downstream model directly. Workflow mode inherited the
+same bypass via `{{prev}}` auto-rewrite.
+**Resolution:** Chain adapter now pre-sanitizes every substituted value
+and wraps it inline via the new `sanitize.WrapInline`, so in-prompt
+substitutions receive the same `[SYSTEM CONTEXT ...]` protection the
+broker's outer envelope applies. Raw step output is still stored on task
+metadata for operator inspection. Adversarial regression tests live in
+`internal/chain/adapter_test.go`.
+
 ### SEC-010: Envelope delimiters are predictable
 **Location:** `internal/sanitize/envelope.go`
 **Severity:** Medium
@@ -338,6 +355,7 @@ without a total count.
 | # | Title | Severity | Status |
 |---|-------|----------|--------|
 | SEC-010 | Predictable envelope delimiters | Medium | Open |
+| SEC-015 | Chain-adapter envelope bypass via placeholder substitution | High | Resolved |
 | SEC-012 | Redis UpdateTask not atomic | Medium | Resolved |
 | SEC-013 | Unbounded WebSocket client count | Low | Open |
 | SEC-014 | Token bucket cleanup goroutine leak | Low | Open |
