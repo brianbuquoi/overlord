@@ -162,6 +162,15 @@ Workflow users have a parallel command: `overlord export --advanced
 commands emit the same shape and share the same
 `chain.Export` / `workflow.Export` implementation.
 
+Export rewrites `{{input}}` and adjacent-step
+`{{steps.<prior>.output}}` placeholders into strict-runtime
+equivalents so a real-provider run of the exported project
+produces the same prompts the chain runtime does. Two patterns
+cannot be lowered and cause export to fail with a clear error:
+`{{input}}` on non-first steps, and `{{steps.<X>.output}}` where
+`<X>` is not the immediately preceding step. See
+[docs/advanced.md](advanced.md) for the details.
+
 ## Internals
 
 Chain mode preserves the full strict runtime:

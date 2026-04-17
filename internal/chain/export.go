@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -29,6 +31,36 @@ type ExportFiles struct {
 	Fixtures map[string][]byte
 }
 
+// ExportLoweringError is returned by Export when a chain's prompt
+// contains a placeholder that cannot be statically lowered into the
+// strict-mode form. The audit found that without lowering, the
+// exported config carries literal `{{steps.<id>.output}}` / `{{input}}`
+// text in `config.Agent.SystemPrompt`, which real-provider adapters
+// (anthropic, openai, etc.) then send to the model verbatim — the
+// strict-mode broker does not apply the chain step adapter's
+// runtime substitution. Export stops loudly in that case rather
+// than producing a config that behaves differently from the
+// workflow/chain runtime.
+//
+// The two lowerable patterns are (a) `{{input}}` on the first step,
+// and (b) `{{steps.<prior>.output}}` where <prior> is the
+// immediately preceding step. Everything else — `{{input}}` on a
+// non-first step, or `{{steps.<X>.output}}` referring to a
+// non-adjacent step — cannot be expressed in the strict runtime
+// without adding a per-task metadata lookup layer.
+type ExportLoweringError struct {
+	StepID      string // step whose prompt holds the un-lowerable reference
+	Placeholder string // the offending `{{...}}` text, verbatim
+	Reason      string // human-readable explanation
+}
+
+func (e *ExportLoweringError) Error() string {
+	return fmt.Sprintf(
+		"export: step %q prompt contains %s that cannot be lowered into the strict config: %s",
+		e.StepID, e.Placeholder, e.Reason,
+	)
+}
+
 // Export emits the pipeline YAML and schema JSON files that a chain
 // would compile to. The resulting files are a valid full-pipeline
 // config — running `overlord exec --config overlord.yaml ...` against
@@ -40,8 +72,27 @@ type ExportFiles struct {
 // out, conditional routing, split infra config, retry budgets,
 // explicit schemas) as the workflow matures, and keep running on the
 // existing runtime.
+//
+// Before emitting the YAML, Export lowers every step's system prompt
+// from the chain-runtime form (with `{{input}}` /
+// `{{steps.<id>.output}}` placeholders) into the strict-runtime form
+// (no placeholders; adjacent-step references are subsumed by the
+// broker's envelope wrapper). Non-adjacent step references are
+// refused with ExportLoweringError — those workflows must either be
+// restructured to be linear + adjacent or stay on the workflow
+// surface.
 func Export(compiled *Compiled) (*ExportFiles, error) {
-	yamlBytes, err := renderPipelineYAML(compiled)
+	// Lower the compiled config before rendering so the exported
+	// YAML never contains `{{...}}` templates that strict-mode
+	// adapters would ship to the LLM verbatim. The lowering runs on
+	// a cloned config so the in-memory record used by the current
+	// chain/workflow broker is unaffected.
+	lowered, err := loweredForExport(compiled)
+	if err != nil {
+		return nil, err
+	}
+
+	yamlBytes, err := renderPipelineYAML(lowered)
 	if err != nil {
 		return nil, err
 	}
@@ -63,6 +114,125 @@ func Export(compiled *Compiled) (*ExportFiles, error) {
 		Schemas:  schemas,
 		Fixtures: fixtures,
 	}, nil
+}
+
+// loweredForExport returns a clone of compiled with every
+// chain-generated agent's SystemPrompt rewritten to its
+// strict-runtime equivalent: no `{{input}}` or
+// `{{steps.<id>.output}}` placeholders. The live `compiled.Config`
+// is left untouched so the currently-running chain broker's agents
+// continue to render the dynamic form.
+//
+// Non-chain agents in the config (e.g. ones a caller added via a
+// hand-rolled `Compiled`) are preserved as-is so this function
+// composes with future extensions.
+//
+// Returns ExportLoweringError when a prompt references a
+// non-adjacent step or carries `{{input}}` on a non-first step.
+func loweredForExport(compiled *Compiled) (*Compiled, error) {
+	if compiled == nil || compiled.Config == nil {
+		return compiled, nil
+	}
+	var steps []Step
+	if compiled.Chain != nil {
+		steps = compiled.Chain.Steps
+	}
+	stepIdx := make(map[string]int, len(steps))
+	for i, st := range steps {
+		stepIdx[st.ID] = i
+	}
+
+	cfgCopy := *compiled.Config
+	// Shallow-clone the Agents slice so mutations below don't leak
+	// into the live config. Agent fields we don't touch share state
+	// with the original (safe — they're immutable after compile).
+	loweredAgents := make([]config.Agent, len(cfgCopy.Agents))
+	for i, a := range cfgCopy.Agents {
+		loweredAgents[i] = a
+		stepI, isChainAgent := stepIdx[a.ID]
+		if !isChainAgent {
+			continue
+		}
+		priorID := ""
+		if stepI > 0 {
+			priorID = steps[stepI-1].ID
+		}
+		lowered, err := lowerStepPrompt(a.ID, a.SystemPrompt, priorID, stepI == 0)
+		if err != nil {
+			return nil, err
+		}
+		loweredAgents[i].SystemPrompt = lowered
+	}
+	cfgCopy.Agents = loweredAgents
+
+	cloneRecord := *compiled
+	cloneRecord.Config = &cfgCopy
+	return &cloneRecord, nil
+}
+
+// chainPlaceholderRE matches the two placeholder forms the chain
+// compiler leaves in step system prompts at compile time. `{{vars.*}}`
+// is already resolved at compile time so it never reaches the
+// lowering pass.
+var chainPlaceholderRE = regexp.MustCompile(`\{\{\s*(input|steps\.[A-Za-z0-9._-]+\.output)\s*\}\}`)
+
+// lowerStepPrompt rewrites prompt so every remaining `{{input}}` /
+// `{{steps.<id>.output}}` reference is either (a) replaced by a
+// natural-language narration pointing at the broker's envelope
+// wrapper + user-message content, or (b) reported as an
+// ExportLoweringError when the reference cannot be preserved in the
+// strict runtime.
+func lowerStepPrompt(stepID, prompt, priorStepID string, isFirst bool) (string, error) {
+	var loweringErr *ExportLoweringError
+	lowered := chainPlaceholderRE.ReplaceAllStringFunc(prompt, func(match string) string {
+		if loweringErr != nil {
+			// Bail early — regexp.ReplaceAllStringFunc has no short-
+			// circuit so we fall through and let the outer caller
+			// surface the first error.
+			return match
+		}
+		m := chainPlaceholderRE.FindStringSubmatch(match)
+		if len(m) < 2 {
+			return match
+		}
+		ref := m[1]
+		switch {
+		case ref == "input":
+			if isFirst {
+				return "(see user-provided input)"
+			}
+			loweringErr = &ExportLoweringError{
+				StepID:      stepID,
+				Placeholder: match,
+				Reason: "`{{input}}` is only lowerable on the first step; " +
+					"the strict runtime does not propagate the original user input to later stages. " +
+					"Rewrite the prompt to read from the prior-stage payload, or stay on the workflow surface.",
+			}
+			return match
+		case strings.HasPrefix(ref, "steps."):
+			target := strings.TrimSuffix(strings.TrimPrefix(ref, "steps."), ".output")
+			if target == priorStepID {
+				return "(see prior stage output above in the system context)"
+			}
+			loweringErr = &ExportLoweringError{
+				StepID:      stepID,
+				Placeholder: match,
+				Reason: fmt.Sprintf(
+					"references step %q which is not the immediately preceding step. "+
+						"The strict runtime's envelope only carries the prior stage's output; "+
+						"non-adjacent step references need the workflow/chain step adapter. "+
+						"Restructure the workflow to be linear/adjacent, or stay on the workflow surface.",
+					target,
+				),
+			}
+			return match
+		}
+		return match
+	})
+	if loweringErr != nil {
+		return "", loweringErr
+	}
+	return lowered, nil
 }
 
 // collectFixtures reads every mock-fixture file referenced by an agent

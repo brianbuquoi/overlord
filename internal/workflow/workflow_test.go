@@ -199,6 +199,45 @@ runtime:
 	}
 }
 
+// TestExport_WorkflowLowersPrevPlaceholder covers Fix 3 end-to-end:
+// a workflow authored with `{{prev}}` compiles through the chain
+// layer and exports into a strict-mode project whose pipeline YAML
+// contains no `{{...}}` placeholders. Without the lowering pass,
+// real-provider adapters running the exported project would send
+// literal `{{steps.step_1.output}}` to the LLM.
+func TestExport_WorkflowLowersPrevPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "fixtures", "draft.json"), `{"text": "d"}`)
+	writeFile(t, filepath.Join(dir, "fixtures", "review.json"), `{"text": "r"}`)
+	file, err := Parse([]byte(simpleWorkflow), "workflow.yaml")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c, err := Compile(file, dir)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	files, err := Export(c)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	yaml := string(files.Pipeline)
+	if strings.Contains(yaml, "{{prev}}") {
+		t.Errorf("exported YAML still carries `{{prev}}`:\n%s", yaml)
+	}
+	if strings.Contains(yaml, "{{steps.") {
+		t.Errorf("exported YAML still carries `{{steps.*}}`:\n%s", yaml)
+	}
+	if strings.Contains(yaml, "{{input}}") {
+		t.Errorf("exported YAML still carries `{{input}}`:\n%s", yaml)
+	}
+	// Narration for adjacent-step placeholder must survive so the
+	// prompt keeps a natural connection to the envelope content.
+	if !strings.Contains(yaml, "prior stage output") {
+		t.Errorf("exported YAML missing narration for the adjacent-step placeholder:\n%s", yaml)
+	}
+}
+
 // TestExport verifies workflow export produces files a strict
 // overlord project would consume. We don't re-test the full
 // round-trip (chain_test.go covers that) — just that Export returns

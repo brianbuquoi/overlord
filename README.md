@@ -189,6 +189,25 @@ budgets, or whatever else the strict surface supports. Your
 workflow YAML remains the source for the simple version — `export
 --advanced` is not a destructive migration.
 
+### Limits of compile-time lowering
+
+Export rewrites `{{input}}` and `{{prev}}` / `{{steps.<prior>.output}}`
+into strict-runtime equivalents: the broker's envelope wrapper
+already delivers the prior stage's sanitized output to the
+downstream model, and first-stage `{{input}}` becomes narration
+pointing at the user-supplied payload. Two patterns **cannot** be
+lowered and cause export to fail with a clear error:
+
+- `{{input}}` on a step other than the first — the strict runtime
+  does not propagate the original user input to later stages.
+- `{{steps.<X>.output}}` where `<X>` is not the immediately
+  preceding step — the envelope only carries the adjacent prior
+  output; non-adjacent step references need per-task metadata the
+  strict runtime does not maintain.
+
+Workflows that hit these patterns must either be restructured to
+linear-adjacent form or stay on the workflow surface.
+
 See [docs/advanced.md](docs/advanced.md) for the strict-config
 reference (`schema_registry`, `pipelines`, `agents`, `stores`,
 `auth`, `dashboard`, fan-out, conditional routing, retry budgets,
