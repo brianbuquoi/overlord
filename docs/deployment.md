@@ -31,8 +31,13 @@ pipelines:
 Run:
 
 ```bash
-overlord run --config config.yaml
+overlord serve --config config.yaml
 ```
+
+`overlord serve` is the long-running service command. `overlord run`
+exists for one-shot local workflow runs and is not meant as a
+production entry point — use `overlord serve` for any deployment that
+expects to stay up.
 
 ### Multi-Instance
 
@@ -72,41 +77,67 @@ Run on each host:
 
 ```bash
 # All instances use the same config and DATABASE_URL
-overlord run --config config.yaml
+overlord serve --config config.yaml
 ```
 
 ## Multi-Instance Configuration
 
 ### Postgres Setup
 
-Create the tasks table before starting any instances. Apply the SQL manually:
+Create the tasks table before starting any instances. The canonical
+schema — matching what the Postgres store conformance tests create,
+and what the live Postgres store code reads — is:
 
 ```sql
 CREATE TABLE IF NOT EXISTS overlord_tasks (
-    id                    TEXT PRIMARY KEY,
-    pipeline_id           TEXT NOT NULL,
-    stage_id              TEXT NOT NULL,
-    input_schema_name     TEXT NOT NULL DEFAULT '',
-    input_schema_version  TEXT NOT NULL DEFAULT '',
-    output_schema_name    TEXT NOT NULL DEFAULT '',
-    output_schema_version TEXT NOT NULL DEFAULT '',
-    payload               JSONB,
-    metadata              JSONB,
-    state                 TEXT NOT NULL DEFAULT 'PENDING',
-    attempts              INTEGER NOT NULL DEFAULT 0,
-    max_attempts          INTEGER NOT NULL DEFAULT 1,
-    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at            TIMESTAMPTZ
+    id                      TEXT PRIMARY KEY,
+    pipeline_id             TEXT NOT NULL,
+    stage_id                TEXT NOT NULL,
+    input_schema_name       TEXT NOT NULL DEFAULT '',
+    input_schema_version    TEXT NOT NULL DEFAULT '',
+    output_schema_name      TEXT NOT NULL DEFAULT '',
+    output_schema_version   TEXT NOT NULL DEFAULT '',
+    payload                 JSONB,
+    metadata                JSONB,
+    state                   TEXT NOT NULL DEFAULT 'PENDING',
+    attempts                INTEGER NOT NULL DEFAULT 0,
+    max_attempts            INTEGER NOT NULL DEFAULT 1,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at              TIMESTAMPTZ,
+    routed_to_dead_letter   BOOLEAN NOT NULL DEFAULT FALSE,
+    cross_stage_transitions INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_stage_state_created
     ON overlord_tasks (stage_id, state, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_dead_letter
+    ON overlord_tasks (state, routed_to_dead_letter)
+    WHERE routed_to_dead_letter = TRUE;
+```
+
+If you are upgrading an older deployment that predates the
+`routed_to_dead_letter` / `cross_stage_transitions` columns, apply
+them with `ALTER TABLE`:
+
+```sql
+ALTER TABLE overlord_tasks
+    ADD COLUMN IF NOT EXISTS routed_to_dead_letter   BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS cross_stage_transitions INTEGER NOT NULL DEFAULT 0;
 ```
 
 The `(stage_id, state, created_at)` index is critical for dequeue
-performance. Without it, the `FOR UPDATE SKIP LOCKED` query degrades to a
-sequential scan under load.
+performance — without it, the `FOR UPDATE SKIP LOCKED` query degrades
+to a sequential scan under load. The partial
+`(state, routed_to_dead_letter)` index keeps dead-letter listing cheap.
+
+**About `overlord migrate`.** The `migrate` subcommand handles task
+*payload* schema migrations, not SQL schema setup. It is the tool for
+re-shaping stored task payloads when a pipeline's JSON schema version
+changes; it does not create or alter Postgres tables. SQL schema
+setup is a one-time `CREATE TABLE` that you run with `psql` (or any
+migration tool you already use) before the first instance starts.
 
 ### Concurrency Tuning
 
@@ -247,7 +278,7 @@ services:
 
   overlord-1:
     image: overlord:latest
-    command: run --config /etc/overlord/config.yaml
+    command: serve --config /etc/overlord/config.yaml --bind 0.0.0.0 --allow-insecure-transport
     environment:
       # sslmode=disable is safe here because postgres is on the same Docker
       # network. For production across networks, use sslmode=require or
@@ -266,7 +297,7 @@ services:
 
   overlord-2:
     image: overlord:latest
-    command: run --config /etc/overlord/config.yaml
+    command: serve --config /etc/overlord/config.yaml --bind 0.0.0.0 --allow-insecure-transport
     environment:
       # sslmode=disable is safe here — same Docker network. See overlord-1 comment.
       DATABASE_URL: postgres://overlord:${POSTGRES_PASSWORD}@postgres:5432/overlord?sslmode=disable
@@ -298,17 +329,33 @@ volumes:
   caddy_data:
 ```
 
-**Caddyfile** (load balancer):
+**Caddyfile** (load balancer with TLS termination):
 
 ```
-:80 {
+# TLS termination happens here — bearer keys MUST NOT be sent to
+# Overlord over plaintext HTTP. Replace overlord.example.com with
+# your real hostname (Caddy auto-provisions a certificate via Let's
+# Encrypt) or use a local-TLS directive for self-hosted CAs.
+overlord.example.com {
     reverse_proxy overlord-1:8080 overlord-2:8080 {
         lb_policy round_robin
         health_uri /v1/health
         health_interval 10s
     }
 }
+
+# Redirect all plaintext requests so clients cannot accidentally
+# ship bearer keys in the clear.
+http://overlord.example.com {
+    redir https://{host}{uri} permanent
+}
 ```
+
+When auth is enabled, the compose file above passes
+`--allow-insecure-transport` to each Overlord container because TLS
+terminates at Caddy, not at Overlord. Without that flag, Overlord
+would refuse to start on the non-loopback bind — see
+[Bearer tokens require TLS](#bearer-tokens-require-tls) below.
 
 ## Authentication
 
@@ -326,7 +373,7 @@ volumes:
 
 ### Bind address
 
-Use `--bind` to control which address `overlord run` listens on.
+Use `--bind` to control which address `overlord serve` listens on.
 Accepts either a bare host (`--bind 0.0.0.0`) combined with `--port`,
 or a full `host:port` string (`--bind 10.0.0.5:8080`). Defaults to
 `127.0.0.1`. The `OVERLORD_BIND` environment variable sets the flag
@@ -334,13 +381,14 @@ default.
 
 ```bash
 # Loopback-only (default) — safest; external clients cannot reach the API.
-overlord run --config overlord.yaml
+overlord serve --config overlord.yaml
 
-# Listen on all interfaces. Requires auth.enabled=true OR --allow-public-noauth.
-overlord run --config overlord.yaml --bind 0.0.0.0
+# Listen on all interfaces. Requires auth.enabled=true AND a TLS
+# terminator upstream (see next section), or --allow-public-noauth.
+overlord serve --config overlord.yaml --bind 0.0.0.0
 
 # Opt-in to the dangerous combo (bind public + auth off). Logs a warning.
-overlord run --config overlord.yaml --bind 0.0.0.0 --allow-public-noauth
+overlord serve --config overlord.yaml --bind 0.0.0.0 --allow-public-noauth
 ```
 
 When `--bind` resolves to a non-loopback address and `auth.enabled=false`,
@@ -348,6 +396,35 @@ startup fails with:
 
 > refusing to start: bind=<addr> is non-loopback and auth.enabled=false —
 > enable auth or pass --allow-public-noauth
+
+### Bearer tokens require TLS
+
+Overlord does not terminate TLS. When auth is enabled, bearer keys
+flow over whatever transport the client uses to reach the listener —
+on a non-loopback HTTP bind, that is plaintext. Anyone on the wire
+can capture or replay the key.
+
+Startup enforces this:
+
+> refusing to start: bind=<addr> is non-loopback with auth.enabled=true
+> but Overlord does not terminate TLS — front this listener with an
+> HTTPS reverse proxy or local TLS terminator, then pass
+> `--allow-insecure-transport` to acknowledge that transport encryption
+> is handled upstream
+
+The flag name is deliberately uncomfortable: it exists to acknowledge
+"bearer keys are on the plaintext wire between the proxy and Overlord"
+when the proxy handles TLS. Do not set it on a listener that is
+directly reachable from outside the host boundary.
+
+Production deployments should:
+
+1. Terminate TLS at a reverse proxy (Caddy, nginx, HAProxy, envoy,
+   cloud load balancer, etc.) — the Caddy example above is the
+   reference shape.
+2. Keep the Overlord→proxy hop on a private network or localhost.
+3. Pass `--allow-insecure-transport` only when the operator owns the
+   transport between the terminator and Overlord.
 
 ### Enabling auth
 
@@ -420,6 +497,22 @@ the mon key will succeed on A but fail on B.
 `/metrics` is exempt from authentication per SEC2-NEW-002. Restrict access
 to `/metrics` at the network or reverse proxy level in production. See the
 [Security Hardening](#security-hardening) section below.
+
+### Critical metrics for operators
+
+Three series are worth watching on every deployment:
+
+| Metric                                  | What it means                                                                                                          |
+|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| `overlord_broker_store_errors_total`    | Non-zero means the broker tried to persist a state transition and the store refused. Sustained growth means tasks are stuck mid-transition or the store is failing — both are fail-closed per SEC-016, but the task remains in a non-terminal state until the next opportunity. Alert on any increase. The `operation` label distinguishes `update_task`, `requeue_task`, and `enqueue_task`. |
+| `overlord_dead_letter_tasks_total`      | How many tasks have fully exhausted retries and landed in the dead-letter queue. A steady-state DLQ is fine; a rising one means upstream provider failures or contract mismatches need investigation — use `overlord dead-letter list` to triage. |
+| `overlord_task_duration_seconds`        | Histogram of end-to-end task latency. Long tails typically mean a retry storm or a stuck stage. Pair with agent-level duration metrics to attribute.                                                                                           |
+
+The `broker_store_errors_total` counter is new since the
+fail-closed store-write fix (SEC-016). Operators migrating from a
+pre-SEC-016 build should add an alert rule on this series before
+cutting over — it is the signal that a previously-silent
+persistence failure is now visible.
 
 ## Security Hardening
 

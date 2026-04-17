@@ -164,6 +164,7 @@ func serveCmd() *cobra.Command {
 	var port string
 	var bindFlag string
 	var allowPublicNoauth bool
+	var allowInsecureTransport bool
 
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -206,23 +207,25 @@ Examples:
 					effectiveBind = compiled.Runtime.Bind
 				}
 				return runServerFromConfig(cmd, serverArgs{
-					configPath:        effectiveConfig,
-					port:              port,
-					bindFlag:          effectiveBind,
-					allowPublicNoauth: allowPublicNoauth,
-					hotReload:         false,
-					compiledCfg:       compiled.Config,
-					compiledRegistry:  compiled.Registry,
-					baseDir:           basePath,
+					configPath:             effectiveConfig,
+					port:                   port,
+					bindFlag:               effectiveBind,
+					allowPublicNoauth:      allowPublicNoauth,
+					allowInsecureTransport: allowInsecureTransport,
+					hotReload:              false,
+					compiledCfg:            compiled.Config,
+					compiledRegistry:       compiled.Registry,
+					baseDir:                basePath,
 				})
 			}
 
 			return runServerFromConfig(cmd, serverArgs{
-				configPath:        effectiveConfig,
-				port:              port,
-				bindFlag:          bindFlag,
-				allowPublicNoauth: allowPublicNoauth,
-				hotReload:         true,
+				configPath:             effectiveConfig,
+				port:                   port,
+				bindFlag:               bindFlag,
+				allowPublicNoauth:      allowPublicNoauth,
+				allowInsecureTransport: allowInsecureTransport,
+				hotReload:              true,
 			})
 		},
 	}
@@ -231,6 +234,7 @@ Examples:
 	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port")
 	cmd.Flags().StringVar(&bindFlag, "bind", envOrDefault("OVERLORD_BIND", ""), "HTTP bind address (host or host:port)")
 	cmd.Flags().BoolVar(&allowPublicNoauth, "allow-public-noauth", false, "explicitly allow non-loopback bind with auth disabled")
+	cmd.Flags().BoolVar(&allowInsecureTransport, "allow-insecure-transport", false, "acknowledge that auth is enabled but TLS terminates upstream of Overlord")
 	return cmd
 }
 

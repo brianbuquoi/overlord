@@ -322,6 +322,7 @@ func runCmd() *cobra.Command {
 	var port string
 	var bindFlag string
 	var allowPublicNoauth bool
+	var allowInsecureTransport bool
 
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -359,11 +360,12 @@ Examples:
 
 			// Legacy / strict-pipeline path — start the full server.
 			return runServerFromConfig(cmd, serverArgs{
-				configPath:        effectiveConfig,
-				port:              port,
-				bindFlag:          bindFlag,
-				allowPublicNoauth: allowPublicNoauth,
-				hotReload:         true,
+				configPath:             effectiveConfig,
+				port:                   port,
+				bindFlag:               bindFlag,
+				allowPublicNoauth:      allowPublicNoauth,
+				allowInsecureTransport: allowInsecureTransport,
+				hotReload:              true,
 			})
 		},
 	}
@@ -377,6 +379,7 @@ Examples:
 	cmd.Flags().StringVar(&port, "port", envOrDefault("OVERLORD_PORT", "8080"), "HTTP server port (pipeline-mode only)")
 	cmd.Flags().StringVar(&bindFlag, "bind", envOrDefault("OVERLORD_BIND", ""), "HTTP bind address (pipeline-mode only)")
 	cmd.Flags().BoolVar(&allowPublicNoauth, "allow-public-noauth", false, "explicitly allow non-loopback bind with auth disabled (pipeline-mode only)")
+	cmd.Flags().BoolVar(&allowInsecureTransport, "allow-insecure-transport", false, "acknowledge that auth is enabled but TLS terminates upstream of Overlord (pipeline-mode only)")
 	return cmd
 }
 
@@ -384,10 +387,11 @@ Examples:
 // shape) and `overlord serve`. Extracted into a struct so the server
 // loop can be re-entered without each caller re-stating the flag set.
 type serverArgs struct {
-	configPath        string
-	port              string
-	bindFlag          string
-	allowPublicNoauth bool
+	configPath             string
+	port                   string
+	bindFlag               string
+	allowPublicNoauth      bool
+	allowInsecureTransport bool
 	// hotReload controls whether a SIGHUP triggers config.Watch-driven
 	// reload. Workflow-compiled configs live in memory only — no file
 	// to watch — so the serve path sets this to false; the legacy
@@ -534,6 +538,13 @@ func runServerFromConfig(cmd *cobra.Command, a serverArgs) error {
 		cancel()
 		return fmt.Errorf(
 			"refusing to start: bind=%s is non-loopback and auth.enabled=false — enable auth or pass --allow-public-noauth (see %s)",
+			bindAddr, authGuardrailDocURL,
+		)
+	}
+	if shouldRefuseInsecureTransport(cfg, bindAddr, a.allowInsecureTransport) {
+		cancel()
+		return fmt.Errorf(
+			"refusing to start: bind=%s is non-loopback with auth.enabled=true but Overlord does not terminate TLS — front this listener with an HTTPS reverse proxy or local TLS terminator, then pass --allow-insecure-transport to acknowledge that transport encryption is handled upstream (see %s)",
 			bindAddr, authGuardrailDocURL,
 		)
 	}
@@ -759,6 +770,31 @@ func shouldRefusePublicNoauth(cfg *config.Config, bindAddr string, allow bool) b
 		return false
 	}
 	if cfg.Auth.Enabled {
+		return false
+	}
+	if allow {
+		return false
+	}
+	return !isLoopbackHost(bindHost(bindAddr))
+}
+
+// shouldRefuseInsecureTransport returns true when the bind address is
+// non-loopback AND auth is enabled AND the operator did not opt in
+// via --allow-insecure-transport. Overlord does not terminate TLS;
+// operators who enable auth on a public listener ship bearer keys
+// over plaintext unless TLS is terminated upstream (a reverse proxy
+// or local TLS terminator). The audit reproduced the footgun: the
+// documented sample deployments pointed a plaintext :80 proxy at an
+// auth-enabled Overlord, exposing bearer keys to anyone on the wire.
+//
+// The opt-in name (allow-insecure-transport) is deliberately
+// uncomfortable — it signals "I acknowledge keys are on the wire"
+// rather than suggesting it is an ordinary operational toggle.
+func shouldRefuseInsecureTransport(cfg *config.Config, bindAddr string, allow bool) bool {
+	if cfg == nil {
+		return false
+	}
+	if !cfg.Auth.Enabled {
 		return false
 	}
 	if allow {

@@ -188,6 +188,47 @@ func TestRefusePublicNoauth(t *testing.T) {
 	}
 }
 
+// TestRefuseInsecureTransport asserts the bearer-over-plaintext
+// guardrail: when auth is enabled and the bind is non-loopback,
+// Overlord refuses to start unless the operator explicitly opts in
+// via --allow-insecure-transport. This is the companion to
+// TestRefusePublicNoauth; the two guardrails together cover the
+// matrix of (loopback, public) × (auth on, auth off).
+func TestRefuseInsecureTransport(t *testing.T) {
+	cases := []struct {
+		name        string
+		bindAddr    string
+		authEnabled bool
+		allow       bool
+		wantRefuse  bool
+	}{
+		// Loopback is safe regardless — keys never leave the box.
+		{"loopback + auth on", "127.0.0.1:8080", true, false, false},
+		{"loopback + auth off", "127.0.0.1:8080", false, false, false},
+		// Public + auth enabled is the exact footgun the audit
+		// reproduced: bearer keys flow over plaintext HTTP.
+		{"public + auth on (danger)", "0.0.0.0:8080", true, false, true},
+		{"public + auth on + allow", "0.0.0.0:8080", true, true, false},
+		{"LAN + auth on (danger)", "10.0.0.5:8080", true, false, true},
+		{"LAN + auth on + allow", "10.0.0.5:8080", true, true, false},
+		// Implicit all-interfaces bind must be treated as public.
+		{"implicit all-interfaces + auth on (danger)", ":8080", true, false, true},
+		// Public + auth off is the OTHER guardrail's concern;
+		// this one must not double-fire.
+		{"public + auth off", "0.0.0.0:8080", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Auth: config.APIAuthConfig{Enabled: tc.authEnabled}}
+			got := shouldRefuseInsecureTransport(cfg, tc.bindAddr, tc.allow)
+			if got != tc.wantRefuse {
+				t.Errorf("shouldRefuseInsecureTransport(bind=%q, authOn=%v, allow=%v) = %v, want %v",
+					tc.bindAddr, tc.authEnabled, tc.allow, got, tc.wantRefuse)
+			}
+		})
+	}
+}
+
 // TestIsLoopbackHost covers the loopback classifier directly.
 func TestIsLoopbackHost(t *testing.T) {
 	cases := []struct {
