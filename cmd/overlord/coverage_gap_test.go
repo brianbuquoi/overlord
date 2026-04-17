@@ -253,6 +253,29 @@ func TestCLI_MigrateSubcommands(t *testing.T) {
 	}
 }
 
+// TestCLI_MigrateRun_HasAllowLiveFlag is the SEC2-005 contract guard.
+// The audit's resolution requires `migrate run` to default to
+// terminal-only and expose an explicit --allow-live opt-in. A silent
+// removal of the flag (or a default flip back to live-first) would
+// trip this test.
+func TestCLI_MigrateRun_HasAllowLiveFlag(t *testing.T) {
+	root := rootCmd()
+	runCmd, _, err := root.Find([]string{"migrate", "run"})
+	if err != nil || runCmd == nil {
+		t.Fatalf("migrate run command not found: %v", err)
+	}
+	flag := runCmd.Flags().Lookup("allow-live")
+	if flag == nil {
+		t.Fatal("migrate run must expose --allow-live for SEC2-005")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--allow-live must default to false (terminal-only is the safe path); got default %q", flag.DefValue)
+	}
+	if !strings.Contains(runCmd.Long, "SEC2-005") {
+		t.Errorf("migrate run Long help must cite SEC2-005 so operators can find the rationale; got:\n%s", runCmd.Long)
+	}
+}
+
 // =============================================================================
 // Section 7 supplement — Dead-letter subcommands exist
 // =============================================================================
